@@ -112,6 +112,8 @@ def _cuda_timed_loop(run, device: torch.device, iters: int) -> list[float]:
         return list(do_bench(run, return_mode='all'))
     except ImportError:
         pass
+    except (AssertionError, TypeError):
+        pass  # triton < 3.2 has no return_mode='all'
 
     cache = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=device)
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
