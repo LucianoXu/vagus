@@ -7,6 +7,10 @@ class ShortConv(nn.Module):
 
     def __init__(self, dim: int, kernel: int):
         super().__init__()
+
+        assert dim > 0
+        assert kernel > 0
+
         self.kernel = kernel
         self.conv = nn.Conv1d(dim, dim, kernel, groups=dim, bias=False)
 
