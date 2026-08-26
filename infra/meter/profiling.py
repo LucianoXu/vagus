@@ -14,7 +14,8 @@ from typing import Callable, Optional
 
 from torch.profiler import ProfilerActivity, profile
 
-from .core import synchronize, infer_device
+from ..utils import infer_device
+from .core import synchronize
 
 
 def profile_variants(

@@ -39,6 +39,8 @@ def main():
     p.add_argument('--heads', type=int, default=8)
     p.add_argument('--seq', type=int, default=2048)
     p.add_argument('--head-dim', type=int, default=64)
+    p.add_argument('--offset', type=int, default=0,
+                   help='RoPE position offset (decode-style continuation)')
     p.add_argument('--dtype', choices=DTYPES, default='fp32')
     p.add_argument('--device', default=None)
     p.add_argument('--warmup', type=int, default=10)
@@ -52,28 +54,29 @@ def main():
 
     rope = RoPE(dim=args.heads * args.head_dim,
                 head_dim=args.head_dim,
-                context_len=args.seq).to(device=device, dtype=dtype)
+                context_len=args.seq + args.offset).to(device=device, dtype=dtype)
     x = torch.randn(args.batch, args.heads, args.seq, args.head_dim,
                     device=device, dtype=dtype)
-    print(f'x: {tuple(x.shape)} {args.dtype} on {device}')
+    print(f'x: {tuple(x.shape)} {args.dtype} on {device}, offset={args.offset}')
 
     variants = {
         'eager': rope,
         'compiled': torch.compile(rope),
     }
     if HAS_TRITON and device.type == 'cuda':
-        variants['triton'] = lambda t: rope_triton(t, rope.mcos, rope.msin)
+        variants['triton'] = lambda t, off=0: rope_triton(
+            t, rope.mcos[off:off + t.shape[-2]], rope.msin[off:off + t.shape[-2]])
     else:
         reason = ('triton not installed' if not HAS_TRITON
                   else f'triton needs cuda, device is {device.type}')
         print(f'[meter] skipping triton variant: {reason}')
 
     with torch.no_grad():
-        compare(variants, (x,), warmup=args.warmup, iters=args.iters)
+        compare(variants, (x, args.offset), warmup=args.warmup, iters=args.iters)
 
         if args.profile:
             from infra.meter import profile_variants
-            profile_variants(variants, (x,),
+            profile_variants(variants, (x, args.offset),
                              out_dir=str(ROOT / 'stignore-meter'))
 
 

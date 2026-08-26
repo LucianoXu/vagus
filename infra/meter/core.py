@@ -20,6 +20,8 @@ from typing import Callable, Optional
 
 import torch
 
+from ..utils import infer_device
+
 
 @dataclass
 class BenchResult:
@@ -54,13 +56,6 @@ def _empty_cache(device: torch.device):
         empty = getattr(torch.mps, 'empty_cache', None)
         if empty is not None:
             empty()
-
-
-def infer_device(args, kwargs) -> torch.device:
-    for v in list(args) + list((kwargs or {}).values()):
-        if isinstance(v, torch.Tensor):
-            return v.device
-    return torch.device('cpu')
 
 
 class _MemProbe:

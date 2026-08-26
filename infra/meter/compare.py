@@ -8,7 +8,8 @@ from typing import Callable, Optional
 
 import torch
 
-from .core import BenchResult, bench, infer_device
+from ..utils import infer_device
+from .core import BenchResult, bench
 
 
 def _fmt_mem(nbytes: Optional[int], exact: bool) -> str:

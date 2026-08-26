@@ -11,17 +11,20 @@ class RoPE(nn.Module):
     mcos: torch.Tensor
     msin: torch.Tensor
 
-    def __init__(self, dim: int, head_dim: int, context_len: int):
+    def __init__(self, dim: int, head_dim: int, context_len: int,
+                 base: float = 10000.0):
         super().__init__()
 
         assert dim % head_dim == 0
         assert head_dim > 0
         assert head_dim % 2 == 0
         assert context_len > 0
+        assert base > 1
 
         self.dim = dim
         self.context_len = context_len
         self.head_dim = head_dim
+        self.base = base
 
         self.arm_dim = self.head_dim // 2
 
@@ -41,7 +44,7 @@ class RoPE(nn.Module):
 
             # phase must be computed in float32
             idxk = torch.arange(0, self.arm_dim, device=device, dtype=torch.float32) / self.arm_dim
-            phase = torch.outer(torch.arange(0, L, device=device, dtype=torch.float32), torch.pow(10000, -idxk,))
+            phase = torch.outer(torch.arange(0, L, device=device, dtype=torch.float32), torch.pow(self.base, -idxk,))
 
             # mcos : (L, dim/2)
             self.register_buffer('mcos', torch.cos(phase).to(dtype), persistent=False)
@@ -52,18 +55,18 @@ class RoPE(nn.Module):
             self.prepared_L = L
 
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, offset: int = 0):
 
         assert x.shape[-1] == self.head_dim
         
         # x : (..., l, d)
 
-        if x.shape[-2] > self.prepared_L:
+        if x.shape[-2] + offset > self.prepared_L:
             raise ValueError("Context length exceeded. Please call RoPE.prepare_m to enlarge.")
 
         # slice the matrix
-        mcos = self.mcos[:x.shape[-2], ...]
-        msin = self.msin[:x.shape[-2], ...]
+        mcos = self.mcos[offset : x.shape[-2] + offset, ...]
+        msin = self.msin[offset : x.shape[-2] + offset, ...]
 
         x = x.reshape(*x.shape[:-1], x.shape[-1] // 2, 2)
         x = x * mcos[..., None] + torch.stack((-x[..., 1], x[..., 0]), dim=-1) * msin[..., None]

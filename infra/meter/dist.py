@@ -15,7 +15,8 @@ from typing import Callable, Optional
 
 import torch.distributed as dist
 
-from .core import BenchResult, bench, infer_device
+from ..utils import infer_device
+from .core import BenchResult, bench
 
 
 def dist_bench(
