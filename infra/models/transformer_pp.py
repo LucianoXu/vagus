@@ -99,7 +99,7 @@ class TransformerPP(nn.Module):
             dim: int,
             head_dim: int,
             context_len: int,
-            n_layers: int,
+            layer_count: int,
             ffn_hidden_dim: int | None = None,
             kv_head_count: int | None = None,
             rmsnorm_eps: float = 1e-6,
@@ -113,7 +113,7 @@ class TransformerPP(nn.Module):
             dim=dim,
             head_dim=head_dim,
             context_len=context_len,
-            n_layers=n_layers,
+            layer_count=layer_count,
             ffn_hidden_dim=ffn_hidden_dim,
             kv_head_count=kv_head_count,
             rmsnorm_eps=rmsnorm_eps,
@@ -132,9 +132,9 @@ class TransformerPP(nn.Module):
                 kv_head_count=kv_head_count,
                 rmsnorm_eps=rmsnorm_eps,
                 rope=self.rope,
-                layer_count=n_layers   # total depth for the 1/sqrt(2L)
+                layer_count=layer_count   # total depth for the 1/sqrt(2L)
             )                          # residual scaling, same for every layer
-            for _ in range(n_layers)
+            for _ in range(layer_count)
         ])
         self.rms_head = RMSNorm(dim, rmsnorm_eps)
         self.head = nn.Linear(
@@ -149,8 +149,16 @@ class TransformerPP(nn.Module):
         else:
             nn.init.normal_(self.head.weight, std=0.02)
 
+    @classmethod
+    def from_config(cls, config: dict) -> "TransformerPP":
+        '''Rebuild from the dict stored in self.config
+        (e.g. saved alongside a state_dict in a checkpoint).'''
+        return cls(**config)
+
     def compile_blocks(self):
-        '''Regional compilation, a post-construction runtime action'''
+        '''Regional compilation, a post-construction runtime action.
+        Compiles each block's forward; decode_step stays eager (see the
+        SoftmaxAttention docstring for what compiling it would take).'''
         for blk in self.blocks:
             blk.compile()
 
