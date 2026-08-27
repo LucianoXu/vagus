@@ -77,7 +77,7 @@ def main():
         if args.profile:
             from infra.meter import profile_variants
             profile_variants(variants, (x, args.offset),
-                             out_dir=str(ROOT / 'stignore-meter'))
+                             out_dir=str(ROOT / 'runs' / 'profiles'))
 
 
 if __name__ == '__main__':

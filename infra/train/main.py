@@ -86,6 +86,15 @@ class TrainConfig:
     context_len: int = 2048              # loader window; model may allow more
     batch_size: int = 8                  # per-rank micro-batch
     grad_accum_steps: int = 1
+    # Declared hardware layout. The loader's data order depends on
+    # world_size (rank-interleaved slices), so the card count is part of
+    # the recipe: launching with a different world size is a different
+    # experiment and is refused at startup.
+    world_size: int = 1
+    # Declared invariant: world * batch_size * grad_accum * context_len
+    # must equal this when set. Catches editing one factor and forgetting
+    # the others.
+    global_batch_tokens: int | None = None
     train_tokens: int = 1_000_000_000    # stop condition (global tokens)
     seed: int = 42
 
@@ -100,7 +109,7 @@ class TrainConfig:
     tf32: bool = True
 
     # observability / archival
-    out_root: str = 'stignore-runs'
+    out_root: str = 'runs'
     log_interval: int = 10               # steps: loss/lr/throughput scalars
     slow_interval: int = 100             # steps: param-norm scalars
     permanent_ckpt_interval: int | None = None   # steps; None = only final
@@ -109,7 +118,20 @@ class TrainConfig:
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> 'TrainConfig':
+        '''A train recipe may reference a model recipe (a yaml holding only
+        model_name/model_args) via `model_recipe: <path relative to this
+        file>`; the two must not both define the model. The resolved config
+        written into the run dir always carries the merged result.'''
+        path = Path(path)
         raw = yaml.load(open(path, encoding='utf-8'), _YamlLoader) or {}
+        if 'model_recipe' in raw:
+            mpath = (path.parent / raw.pop('model_recipe')).resolve()
+            model = yaml.load(open(mpath, encoding='utf-8'), _YamlLoader) or {}
+            if not set(model) <= {'model_name', 'model_args'}:
+                raise ValueError(f'{mpath} is not a pure model recipe')
+            if set(model) & set(raw):
+                raise ValueError('model defined in both train and model recipe')
+            raw |= model
         return cls(**raw)   # unknown keys -> loud TypeError
 
 
@@ -275,6 +297,20 @@ def train(config: TrainConfig):
     rank, world, device, is_dist = setup_distributed(config)
     is_main = rank == 0
 
+    if world != config.world_size:
+        raise ValueError(
+            f'launched with world_size={world} but the recipe declares '
+            f'world_size={config.world_size}. The data order depends on the '
+            f'card count, so this would be a different experiment; edit the '
+            f'recipe deliberately if the new layout is intended.')
+    declared = (config.world_size * config.batch_size
+                * config.grad_accum_steps * config.context_len)
+    if config.global_batch_tokens is not None \
+            and declared != config.global_batch_tokens:
+        raise ValueError(
+            f'world*batch*accum*ctx = {declared:,} does not match the declared '
+            f'global_batch_tokens = {config.global_batch_tokens:,}')
+
     def log(*a):
         if is_main:
             print(f'[{datetime.now().strftime("%H:%M:%S")}]', *a, flush=True)
@@ -329,7 +365,9 @@ def train(config: TrainConfig):
             'torch': torch.__version__,
             'config': asdict(config),
             'data': {
-                'dir': str(config.data_dir),
+                # witnessed fact: the physical location actually read on
+                # this machine (config may hold a symlinked relative name)
+                'dir': str(Path(config.data_dir).resolve()),
                 'source': store.manifest['source'],
                 'tokenizer': {k: store.manifest['tokenizer'][k] for k in ('id', 'sha256')},
                 'total_tokens': store.total_tokens,

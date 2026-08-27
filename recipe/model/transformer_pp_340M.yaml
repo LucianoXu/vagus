@@ -1,0 +1,22 @@
+# Transformer++ 340M — the standard small benchmark shape of the
+# linear-attention line (Mamba Table 12 "350M" / GLA / DeltaNet / flame
+# configs/transformer_340M.json all agree on 24 x 1024).
+#
+# tie_embedding: the published 340M checkpoints (fla-hub/gla-340M-15B,
+# fla-hub/transformer-340M-10B) tie input/output embeddings — that is what
+# makes the parameter count "340M" (~341M tied; ~374M untied). flame's
+# newer json unties; we follow the published-paper convention.
+
+model_name: TransformerPP
+model_args:
+  vocab_size: 32000        # mistral32k tokenizer
+  dim: 1024
+  head_dim: 64             # 16 heads (Mamba Table 12 and flame; fla-hub
+                           # transformer-340M-10B used 32x32 — minor variance)
+  context_len: 2048
+  layer_count: 24
+  ffn_hidden_dim: 2816     # llama SwiGLU sizing: 8/3*dim -> multiple of 256
+  kv_head_count: null      # MHA; no GQA at this scale
+  rmsnorm_eps: 1.0e-6
+  rope_base: 10000
+  tie_embedding: true

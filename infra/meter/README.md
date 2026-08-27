@@ -42,7 +42,7 @@ the vault to a CUDA machine to get all three.
 `compare` answers "how fast"; `profile_variants` answers "where does the time
 go" over the same variants/inputs harness: per-op tables printed to stdout and
 a Chrome trace per variant (open in chrome://tracing or ui.perfetto.dev),
-written to `stignore-meter/` so traces never enter vault sync.
+written to `runs/profiles/` (git-ignored).
 
 ```sh
 python infra/meter/examples/bench_rope.py --device mps --profile

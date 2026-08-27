@@ -19,10 +19,10 @@ SAMPLES = ("10BT", "100BT", "350BT")
 
 
 def _default_dest() -> Path:
-    # <repo-root>/stignore-data: stays out of Syncthing per the vault
-    # convention. Valid under the editable install only, which is how this
-    # repo is used; pass dest explicitly on cluster storage.
-    return Path(__file__).resolve().parents[2] / "stignore-data" / "fineweb-edu"
+    # <repo-root>/data: git-ignored; on shared-storage machines bind it
+    # by symlinking data/ to the real location. Valid under the editable
+    # install only, which is how this repo is used.
+    return Path(__file__).resolve().parents[2] / "data" / "fineweb-edu"
 
 
 def download(

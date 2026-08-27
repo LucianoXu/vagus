@@ -1,0 +1,54 @@
+# Transformer++ 340M baseline on FineWeb-Edu, 15B tokens.
+#
+# Training recipe follows the published GLA / DeltaNet 340M@15B protocol
+# (arXiv:2312.06635, arXiv:2406.06484, verified 2026-08-28):
+#   global batch 0.5M tokens @ ctx 2048, AdamW peak lr 3e-4 with initial/
+#   final lr 3e-5 (cosine, min_ratio 0.1), warmup 0.5B tokens (~3.3%),
+#   weight decay 0.01, grad clip 1.0. betas (0.9, 0.95) per the
+#   Transformer++ recipe (Mamba App. E.2) / torchtitan default.
+# Known variant, not used here: flame's current 340M example runs ctx 4096
+# varlen with lr 1e-3, wd 0.1, AdamW eps 1e-15.
+
+run_name: tpp-340M-fwe15B
+model_recipe: ../model/transformer_pp_340M.yaml
+
+data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+data_shards: null          # all 20 shards (16.7B tokens); 15B => 0.9 epoch.
+                           # future held-out eval: prepare shard #21+.
+
+context_len: 2048
+# Hardware layout is part of the recipe (data order depends on it):
+# 4 GPUs, single node. global batch = 4 * 16 * 4 * 2048 = 0.5M tokens,
+# asserted at startup via global_batch_tokens.
+world_size: 4
+batch_size: 16             # per-rank micro-batch
+grad_accum_steps: 4
+global_batch_tokens: 524288
+train_tokens: 15_000_000_000
+seed: 42
+
+optimizer_name: adamw
+optimizer_args:
+  lr: 3e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.01
+
+schedule_name: cosine
+schedule_args:
+  warmup: 0.0333           # 0.5B / 15B tokens
+  min_ratio: 0.1           # 3e-5 initial/final
+
+grad_clip: 1.0
+z_loss: null               # benchmark recipe: off
+
+device: auto
+dtype: bfloat16
+compile: true
+tf32: true
+
+out_root: runs
+log_interval: 10
+slow_interval: 100
+permanent_ckpt_interval: 5000
+recent_ckpt_minutes: 30
+peak_tflops: 312           # A100 bf16 dense; only feeds the MFU metric
