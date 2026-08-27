@@ -41,5 +41,8 @@ dev = [
     "tensorboard>=2.16",
 ]
 
+[project.scripts]
+vagus-train = "infra.train.main:main"
+
 [tool.hatch.build.targets.wheel]
 packages = ["infra"]

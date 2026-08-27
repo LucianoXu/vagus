@@ -1,8 +1,26 @@
 
+import subprocess
+from pathlib import Path
 from typing import Iterator
 
 import torch
 from torch import nn
+
+
+def git_state() -> dict:
+    '''Commit + dirty flag of the vagus repo, for pinning code identity
+    into data manifests and run metadata.'''
+    root = Path(__file__).resolve().parents[1]
+    try:
+        commit = subprocess.run(
+            ['git', 'rev-parse', 'HEAD'], cwd=root,
+            capture_output=True, text=True, check=True).stdout.strip()
+        dirty = bool(subprocess.run(
+            ['git', 'status', '--porcelain'], cwd=root,
+            capture_output=True, text=True, check=True).stdout.strip())
+        return {'commit': commit, 'dirty': dirty}
+    except Exception:
+        return {'commit': None, 'dirty': None}
 
 
 def _iter_tensors(obj) -> Iterator[torch.Tensor]:

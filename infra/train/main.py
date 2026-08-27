@@ -1,0 +1,519 @@
+# Pretraining entry point.
+#
+# Design contract:
+# - model/optimizer/schedule are picked by name + args dict, fed to
+#   factories, so swapping architectures or optimizers is config-only.
+# - resume is the primary path and fresh start its special case: the run
+#   directory holds everything (resolved config, witnessed metadata,
+#   tensorboard events, checkpoints), and restarting the same command
+#   continues exactly (loader state + RNG + optimizer restored).
+# - stop condition is a token budget; the schedule lives on progress
+#   fractions, so batch-size changes rescale rather than deform it.
+# - no validation loop (sub-epoch regime: every batch is unseen data);
+#   fresh-data train loss + its EMA is the generalization signal.
+
+import argparse
+import json
+import math
+import os
+import re
+import signal
+import time
+from contextlib import nullcontext
+from dataclasses import dataclass, field, asdict
+from datetime import datetime
+from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
+
+import numpy as np
+import torch
+import torch.distributed as dist
+import yaml
+from torch import nn
+from torch.nn import functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+from ..dataset.loader import TokenStore, WindowLoader
+from ..models.transformer_pp import TransformerPP
+from ..utils import git_state
+from .schedule import build_schedule
+
+MODELS = {'TransformerPP': TransformerPP}
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+# YAML 1.1 parses `1e-4` (no dot) as a *string*; with args now passed
+# through as plain dicts there is no dataclass layer to coerce it back.
+# Register the full float form as an implicit resolver once, globally.
+_FLOAT_RE = re.compile(r'''^[-+]?(
+    (\d+(\.\d*)?|\.\d+)([eE][-+]?\d+)? | \d+[eE][-+]?\d+
+    )$''', re.X)
+
+
+class _YamlLoader(yaml.SafeLoader):
+    pass
+
+
+_YamlLoader.add_implicit_resolver(
+    'tag:yaml.org,2002:float', _FLOAT_RE, list('-+0123456789.'))
+
+
+@dataclass
+class TrainConfig:
+    run_name: str
+    data_dir: str
+
+    # model: name selects the class, args go verbatim into its constructor
+    model_name: str = 'TransformerPP'
+    model_args: dict = field(default_factory=dict)
+
+    # optimizer (adamw: lr/betas/weight_decay; decay group = matrices,
+    # no-decay group = everything of dim < 2)
+    optimizer_name: str = 'adamw'
+    optimizer_args: dict = field(default_factory=lambda: dict(
+        lr=3.0e-4, betas=(0.9, 0.95), weight_decay=0.1))
+
+    schedule_name: str = 'cosine'
+    schedule_args: dict = field(default_factory=lambda: dict(
+        warmup=0.01, min_ratio=0.05))
+
+    # data / budget
+    data_shards: list | None = None      # subset by shard file name
+    context_len: int = 2048              # loader window; model may allow more
+    batch_size: int = 8                  # per-rank micro-batch
+    grad_accum_steps: int = 1
+    train_tokens: int = 1_000_000_000    # stop condition (global tokens)
+    seed: int = 42
+
+    # loss shaping
+    grad_clip: float | None = 1.0
+    z_loss: float | None = None
+
+    # system
+    device: str = 'auto'                 # ignored under torchrun
+    dtype: str = 'bfloat16'              # autocast dtype; 'float32' disables
+    compile: bool = True
+    tf32: bool = True
+
+    # observability / archival
+    out_root: str = 'stignore-runs'
+    log_interval: int = 10               # steps: loss/lr/throughput scalars
+    slow_interval: int = 100             # steps: param-norm scalars
+    permanent_ckpt_interval: int | None = None   # steps; None = only final
+    recent_ckpt_minutes: float = 30.0
+    peak_tflops: float | None = None     # per-device; enables MFU logging
+
+    @classmethod
+    def from_yaml(cls, path: str | Path) -> 'TrainConfig':
+        raw = yaml.load(open(path, encoding='utf-8'), _YamlLoader) or {}
+        return cls(**raw)   # unknown keys -> loud TypeError
+
+
+# ---------------------------------------------------------------------------
+# Factories
+# ---------------------------------------------------------------------------
+
+def build_model(name: str, args: dict) -> nn.Module:
+    return MODELS[name](**args)
+
+
+def build_optimizer(name: str, model, args: dict) -> torch.optim.Optimizer:
+    groups = model.param_groups()
+    if name == 'adamw':
+        args = dict(args)
+        wd = args.pop('weight_decay', 0.0)
+        if 'betas' in args:
+            args['betas'] = tuple(args['betas'])
+        param_groups = [
+            {'params': groups['muon'] + groups['adamw_decay'],
+             'weight_decay': wd, 'name': 'decay'},
+            {'params': groups['adamw_no_decay'],
+             'weight_decay': 0.0, 'name': 'no_decay'},
+        ]
+        opt = torch.optim.AdamW(param_groups, **args,
+                                fused=torch.cuda.is_available())
+    else:
+        raise KeyError(f"unknown optimizer '{name}'")
+    for g in opt.param_groups:
+        g['base_lr'] = g['lr']   # schedule multiplies this every step
+    return opt
+
+
+# ---------------------------------------------------------------------------
+# Metrics: modular hooks, each fn(ctx) -> dict of scalars. FAST runs every
+# log_interval, SLOW every slow_interval. Add/remove by editing the lists.
+# Defaults follow the marin hero-run dashboard, minus MoE-specific items.
+# ---------------------------------------------------------------------------
+
+def metric_core(c) -> dict:
+    out = {'loss': c.loss, 'loss_ema': c.loss_ema, 'lr': c.lr,
+           'grad_norm': c.grad_norm, 'tokens': c.tokens_seen}
+    if c.prev_grad_norm:
+        out['grad_norm_step_ratio'] = c.grad_norm / c.prev_grad_norm
+    if c.z_loss_val is not None:
+        out['z_loss'] = c.z_loss_val
+    return out
+
+
+def metric_throughput(c) -> dict:
+    out = {'tokens_per_s': c.tokens_per_s, 'step_ms': c.step_ms}
+    if c.peak_tflops:
+        # PaLM-style estimate: 6N per token plus attention matmuls
+        flops_per_tok = 6 * c.param_count + c.attn_flops_per_tok
+        achieved = flops_per_tok * c.tokens_per_s / c.world_size
+        out['mfu'] = achieved / (c.peak_tflops * 1e12)
+    if c.device_type == 'cuda':
+        out['max_mem_gb'] = torch.cuda.max_memory_allocated() / 1e9
+    return out
+
+
+def metric_param_norms(c) -> dict:
+    '''Per-optimizer-group L2 norms (marin: constant/drifting norms are a
+    health signal), plus the embedding norm on its own.'''
+    out = {}
+    for g in c.optimizer.param_groups:
+        sq = sum(float(p.detach().float().pow(2).sum()) for p in g['params'])
+        out[f"pnorm/{g['name']}"] = math.sqrt(sq)
+    emb = getattr(c.model, 'embedding', None)
+    if emb is not None:
+        out['pnorm/embedding'] = float(emb.weight.detach().float().norm())
+    return out
+
+
+FAST_METRICS = [metric_core, metric_throughput]
+SLOW_METRICS = [metric_param_norms]
+
+
+# ---------------------------------------------------------------------------
+# Distributed / environment
+# ---------------------------------------------------------------------------
+
+def setup_distributed(config: TrainConfig):
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ['RANK'])
+        world = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        dist.init_process_group(backend='nccl')
+        torch.cuda.set_device(local_rank)
+        return rank, world, torch.device(f'cuda:{local_rank}'), True
+
+    if config.device != 'auto':
+        device = torch.device(config.device)
+    elif torch.cuda.is_available():
+        device = torch.device('cuda')
+    elif torch.backends.mps.is_available():
+        device = torch.device('mps')
+    else:
+        device = torch.device('cpu')
+    return 0, 1, device, False
+
+
+def unwrap(model: nn.Module) -> nn.Module:
+    model = getattr(model, '_orig_mod', model)
+    model = getattr(model, 'module', model)
+    return model
+
+
+_STOP = False
+
+
+def _stop_handler(_signum, _frame):
+    global _STOP
+    _STOP = True
+
+
+# ---------------------------------------------------------------------------
+# Checkpointing: sparse permanent (ckpt-STEP.pt, kept) + rolling recent
+# (recent.pt + recent-prev.pt, time-based) — both atomic via tmp+rename.
+# ---------------------------------------------------------------------------
+
+def save_checkpoint(run_dir: Path, kind: str, step: int, tokens_seen: int,
+                    model, optimizer, loader, config: TrainConfig):
+    state = {
+        'step': step,
+        'tokens_seen': tokens_seen,
+        'model_name': config.model_name,
+        'model_args': config.model_args,
+        'model': unwrap(model).state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'loader': loader.state_dict(),
+        'rng': {
+            'torch': torch.get_rng_state(),
+            'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            'numpy': np.random.get_state(),
+        },
+        'config': asdict(config),
+    }
+    path = run_dir / ('recent.pt' if kind == 'recent' else f'ckpt-{step:08d}.pt')
+    tmp = path.with_name(path.name + '.tmp')
+    torch.save(state, tmp)
+    if kind == 'recent' and path.exists():
+        os.replace(path, run_dir / 'recent-prev.pt')
+    os.replace(tmp, path)
+    return path
+
+
+def find_resume(run_dir: Path) -> Path | None:
+    for name in ('recent.pt', 'recent-prev.pt'):
+        if (run_dir / name).exists():
+            return run_dir / name
+    ckpts = sorted(run_dir.glob('ckpt-*.pt'))
+    return ckpts[-1] if ckpts else None
+
+
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+
+def train(config: TrainConfig):
+    global _STOP
+    _STOP = False   # train() is library-callable; don't inherit a prior run's signal
+    rank, world, device, is_dist = setup_distributed(config)
+    is_main = rank == 0
+
+    def log(*a):
+        if is_main:
+            print(f'[{datetime.now().strftime("%H:%M:%S")}]', *a, flush=True)
+
+    signal.signal(signal.SIGTERM, _stop_handler)
+    signal.signal(signal.SIGUSR1, _stop_handler)
+
+    torch.manual_seed(config.seed)          # same init on every rank
+    np.random.seed(config.seed)
+    if config.tf32 and device.type == 'cuda':
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+    code = git_state()
+    commit8 = (code['commit'] or 'nogit')[:8]
+    run_dir = Path(config.out_root) / f'{config.run_name}-{commit8}'
+    resume_from = find_resume(run_dir) if run_dir.exists() else None
+    if run_dir.exists() and resume_from is None and any(run_dir.iterdir()):
+        raise FileExistsError(
+            f'{run_dir} exists without checkpoints; refusing a silent overwrite')
+
+    # data
+    store = TokenStore(config.data_dir, shards=config.data_shards)
+    loader = WindowLoader(store, config.context_len, config.batch_size,
+                          seed=config.seed, rank=rank, world_size=world)
+    tokens_per_step = world * config.batch_size * config.grad_accum_steps * config.context_len
+    steps_total = int(config.train_tokens) // tokens_per_step
+    assert steps_total > 0
+
+    # model + optimizer + schedule
+    model = build_model(config.model_name, config.model_args).to(device)
+    param_count = sum(p.numel() for p in model.parameters())
+    optimizer = build_optimizer(config.optimizer_name, model, config.optimizer_args)
+    sched = build_schedule(config.schedule_name, config.schedule_args)
+
+    log(f'run {run_dir.name} | device {device} x{world} | '
+        f'{param_count:,} params | data {store.total_tokens:,} tokens '
+        f'({len(store.entries)} shards)')
+    log(f'plan: {steps_total:,} steps x {tokens_per_step:,} tokens/step '
+        f'= {steps_total * tokens_per_step / 1e9:.2f}B tokens '
+        f'({steps_total * tokens_per_step / store.total_tokens:.2f} epochs)')
+
+    if is_main and resume_from is None:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / 'config.yaml').write_text(
+            yaml.safe_dump(asdict(config), sort_keys=False))
+        (run_dir / 'meta.json').write_text(json.dumps({
+            'created': datetime.now().astimezone().isoformat(timespec='seconds'),
+            'code': code,
+            'world_size': world,
+            'device': str(device),
+            'torch': torch.__version__,
+            'config': asdict(config),
+            'data': {
+                'dir': str(config.data_dir),
+                'source': store.manifest['source'],
+                'tokenizer': {k: store.manifest['tokenizer'][k] for k in ('id', 'sha256')},
+                'total_tokens': store.total_tokens,
+                'shards': [e['file'] for e in store.entries],
+            },
+            'derived': {
+                'steps_total': steps_total,
+                'tokens_per_step': tokens_per_step,
+                'param_count': param_count,
+                'params_by_group': {k: sum(p.numel() for p in v)
+                                    for k, v in unwrap(model).param_groups().items()},  # type: ignore
+                'windows': loader.window_count,
+                'batches_per_epoch': loader.batches_per_epoch,
+            },
+        }, indent=2))
+        log(f'fresh run: wrote config.yaml + meta.json')
+
+    step, tokens_seen = 0, 0
+    if resume_from is not None:
+        state = torch.load(resume_from, map_location=device, weights_only=False)
+        assert state['config']['model_args'] == config.model_args, \
+            'checkpoint model_args differ from config'
+        unwrap(model).load_state_dict(state['model'])
+        optimizer.load_state_dict(state['optimizer'])
+        loader.load_state_dict(state['loader'])
+        torch.set_rng_state(state['rng']['torch'].cpu())
+        if state['rng']['cuda'] is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all([s.cpu() for s in state['rng']['cuda']])
+        np.random.set_state(state['rng']['numpy'])
+        step, tokens_seen = state['step'], state['tokens_seen']
+        log(f'resumed from {resume_from.name} at step {step:,} '
+            f'({tokens_seen/1e9:.3f}B tokens)')
+
+    if config.compile:
+        t0 = time.perf_counter()
+        if hasattr(model, 'compile_blocks'):
+            model.compile_blocks()  # type: ignore
+        else:
+            model = cast(nn.Module, torch.compile(model))
+        log(f'compile requested ({time.perf_counter() - t0:.1f}s setup; '
+            f'first step pays the real cost)')
+    if is_dist:
+        model = DDP(model, device_ids=[device.index], output_device=device.index)
+
+    amp_dtype = {'bfloat16': torch.bfloat16, 'float16': torch.float16,
+                 'float32': torch.float32}[config.dtype]
+    autocast = (torch.autocast(device.type, dtype=amp_dtype)
+                if amp_dtype is not torch.float32 else nullcontext())
+    assert amp_dtype is not torch.float16, 'fp16 (GradScaler) path not implemented'
+
+    writer = None
+    if is_main:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            writer = SummaryWriter(run_dir / 'tb')
+            writer.add_text('meta', f'```json\n{(run_dir / "meta.json").read_text()}\n```')
+        except Exception as e:   # tensorboard absent on the bare cluster env
+            log(f'[warn] tensorboard unavailable ({e}); scalars not logged')
+
+    margs = config.model_args
+    ctx = SimpleNamespace(
+        model=unwrap(model), optimizer=optimizer, world_size=world,
+        device_type=device.type, param_count=param_count,
+        peak_tflops=config.peak_tflops,
+        attn_flops_per_tok=(12 * margs['layer_count'] * margs['dim'] * config.context_len
+                            if {'layer_count', 'dim'} <= margs.keys() else 0),
+        loss=0.0, loss_ema=None, lr=0.0, grad_norm=0.0, prev_grad_norm=0.0,
+        z_loss_val=None, tokens_seen=0, tokens_per_s=0.0, step_ms=0.0)
+
+    batches = iter(loader)
+    model.train()
+    last_recent = time.time()
+    t_step = time.perf_counter()
+    log('training...')
+
+    try:
+        while step < steps_total:
+            step += 1
+            progress = step / steps_total
+            mult = sched(progress)
+            for g in optimizer.param_groups:
+                g['lr'] = g['base_lr'] * mult
+
+            optimizer.zero_grad(set_to_none=True)
+            loss_acc = torch.zeros((), device=device)
+            zloss_acc = torch.zeros((), device=device)
+            for micro in range(config.grad_accum_steps):
+                x, y = next(batches)
+                x = x.to(device, non_blocking=True)
+                y = y.to(device, non_blocking=True)
+                sync = (model.no_sync()  # type: ignore
+                        if is_dist and micro < config.grad_accum_steps - 1
+                        else nullcontext())
+                with sync, autocast:
+                    logits = model(x)
+                    loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]),
+                                           y.reshape(-1))
+                    total = loss
+                    if config.z_loss:
+                        z = torch.logsumexp(logits, dim=-1)
+                        zl = config.z_loss * z.pow(2).mean()
+                        total = loss + zl
+                        zloss_acc += zl.detach()
+                    (total / config.grad_accum_steps).backward()
+                loss_acc += loss.detach()
+
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), config.grad_clip or float('inf'))
+            optimizer.step()
+            tokens_seen += tokens_per_step
+
+            stop = _STOP
+            if is_dist:
+                flag = torch.tensor(float(stop), device=device)
+                dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+                stop = bool(flag.item())
+
+            if step % config.log_interval == 0 or step == steps_total or stop:
+                if is_dist:
+                    dist.all_reduce(loss_acc, op=dist.ReduceOp.AVG)
+                    dist.all_reduce(zloss_acc, op=dist.ReduceOp.AVG)
+                now = time.perf_counter()
+                ctx.loss = loss_acc.item() / config.grad_accum_steps
+                ctx.loss_ema = (ctx.loss if ctx.loss_ema is None
+                                else 0.9 * ctx.loss_ema + 0.1 * ctx.loss)
+                ctx.prev_grad_norm, ctx.grad_norm = ctx.grad_norm, float(grad_norm)
+                ctx.z_loss_val = (zloss_acc.item() / config.grad_accum_steps
+                                  if config.z_loss else None)
+                ctx.lr = optimizer.param_groups[0]['lr']
+                ctx.tokens_seen = tokens_seen
+                ctx.step_ms = (now - t_step) / config.log_interval * 1e3
+                ctx.tokens_per_s = tokens_per_step * config.log_interval / (now - t_step)
+                t_step = now
+
+                scalars = {}
+                for fn in FAST_METRICS:
+                    scalars |= fn(ctx)
+                if step % config.slow_interval == 0:
+                    for fn in SLOW_METRICS:
+                        scalars |= fn(ctx)
+                if writer is not None:
+                    for k, v in scalars.items():
+                        writer.add_scalar(k, v, step)
+                if step % (config.log_interval * 10) == 0 or step == steps_total:
+                    log(f'step {step:>7,}/{steps_total:,} | loss {ctx.loss:.4f} '
+                        f'(ema {ctx.loss_ema:.4f}) | lr {ctx.lr:.2e} | '
+                        f'gnorm {ctx.grad_norm:.2f} | {ctx.tokens_per_s/1e6:.2f} Mtok/s')
+
+            if is_main and config.permanent_ckpt_interval \
+                    and step % config.permanent_ckpt_interval == 0 and step < steps_total:
+                p = save_checkpoint(run_dir, 'permanent', step, tokens_seen,
+                                    model, optimizer, loader, config)
+                log(f'permanent checkpoint: {p.name}')
+            if is_main and time.time() - last_recent > config.recent_ckpt_minutes * 60:
+                save_checkpoint(run_dir, 'recent', step, tokens_seen,
+                                model, optimizer, loader, config)
+                last_recent = time.time()
+                log(f'recent checkpoint at step {step:,}')
+
+            if stop:
+                log(f'stop signal received at step {step:,}; checkpointing and exiting')
+                break
+
+        if is_main:
+            kind = 'recent' if _STOP else 'permanent'
+            p = save_checkpoint(run_dir, kind, step, tokens_seen,
+                                model, optimizer, loader, config)
+            log(f'final {kind} checkpoint: {p.name} | '
+                f'{tokens_seen/1e9:.3f}B tokens seen')
+    finally:
+        if writer is not None:
+            writer.close()
+        if is_dist:
+            dist.destroy_process_group()   # no barrier: see job 27725880
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('config', help='path to a TrainConfig yaml')
+    args = ap.parse_args()
+    print(f'[config] loading {args.config} '
+          f'(sci-notation resolver active: bare 1e-4 parses as float)')
+    train(TrainConfig.from_yaml(args.config))
+
+
+if __name__ == '__main__':
+    main()

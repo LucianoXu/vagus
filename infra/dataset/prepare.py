@@ -17,13 +17,14 @@ import hashlib
 import importlib
 import json
 import os
-import subprocess
 import time
 from array import array
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+
+from ..utils import git_state
 
 FORMAT = "vagus-tokens-v1"
 
@@ -42,20 +43,6 @@ def _atomic_write(path: Path, write_fn):
     with open(tmp, 'wb') as f:
         write_fn(f)
     os.replace(tmp, path)
-
-
-def _git_state() -> dict:
-    root = Path(__file__).resolve().parents[2]
-    try:
-        commit = subprocess.run(
-            ['git', 'rev-parse', 'HEAD'], cwd=root,
-            capture_output=True, text=True, check=True).stdout.strip()
-        dirty = bool(subprocess.run(
-            ['git', 'status', '--porcelain'], cwd=root,
-            capture_output=True, text=True, check=True).stdout.strip())
-        return {'commit': commit, 'dirty': dirty}
-    except Exception:
-        return {'commit': None, 'dirty': None}
 
 
 def _tokenize_file(tok, src: Path, batch_rows: int):
@@ -126,7 +113,7 @@ def prepare(
             'shards': [],
             'total_tokens': 0,
             'total_docs': 0,
-            'code': _git_state(),
+            'code': git_state(),
         }
 
     done = {s['source'] for s in manifest['shards']
