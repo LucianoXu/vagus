@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vagus"
+version = "0.1.0"
+description = "LM training arsenal: components, models, data pipeline, training and measurement infra"
+authors = [{ name = "Yingte Xu", email = "lucianoxu2018@gmail.com" }]
+requires-python = ">=3.12"
+dependencies = [
+    # numpy floor 1.24: the MPCDF pytorch container ships 1.24, and the code
+    # deliberately stays compatible with it (see circle_slice in tmp/transformer).
+    "numpy>=1.24",
+    "pyyaml>=6.0",
+    # torch floor 2.7: torch.compiler.config.dynamic_sources, used for
+    # compiling decode_step (see SoftmaxAttention docstring).
+    "torch>=2.7",
+    "tqdm>=4.66",
+]
+
+# NOT declared here, on purpose:
+# - triton, flash_attn: CUDA-only, unresolvable on macOS. Import-guarded at
+#   their use sites (infra/meter/examples); on GPU boxes they come from the
+#   cluster module or a manual install.
+# - On MPCDF the training env is the site pytorch module, not this uv env;
+#   uv manages the laptop / login-node / any full-control machine.
+
+[project.optional-dependencies]
+# data preparation (download + tokenize), runs only on full-env machines;
+# the training side reads finished shards with numpy/torch alone
+prep = [
+    "datasets>=3.1",
+    "tokenizers>=0.22",
+]
+
+[dependency-groups]
+# local development conveniences; uv sync installs this group by default
+dev = [
+    "ipykernel>=6.29",
+    "tensorboard>=2.16",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["infra"]

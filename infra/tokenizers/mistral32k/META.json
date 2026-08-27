@@ -1,0 +1,17 @@
+{
+  "id": "mistral32k",
+  "file": "tokenizer.json",
+  "sha256": "fc4f0bd70b3709312d9d1d9e5ba674794b6bc5abc17429897a540f93882f25fc",
+  "source_repo": "fla-hub/transformer-1.3B-100B",
+  "source_revision": "d6f66f4181fa669e5863327815b44533e3a395e7",
+  "source_file": "tokenizer.json",
+  "fetched": "2026-08-27",
+  "vocab_size": 32000,
+  "special_tokens": {"unk": 0, "bos": 1, "eos": 2},
+  "conventions": {
+    "add_bos": true,
+    "add_eos": false,
+    "note": "BOS baked into the post_processor: plain encode() prepends <s>; packed streams use BOS as the document separator."
+  },
+  "lineage": "Mistral-7B-v0.1 vocab+merges verbatim (verified identical), serialized in the legacy LlamaTokenizer scheme (Prepend/Replace normalizer, no Metaspace). NOT byte-identical in behavior to mistralai/Mistral-7B-v0.1@main current serialization on whitespace edge cases (leading spaces, whitespace-only strings). This exact file is the flame framework default (--model.tokenizer_path fla-hub/transformer-1.3B-100B), i.e. the fla-org linear-attention benchmark line."
+}
