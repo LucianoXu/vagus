@@ -45,7 +45,8 @@ def make_variant(kind, h, w, t, device, chunk_rows=4096):
         # (grad flows back to fp32 through the cast); kernel manages its
         # own precision internally, no autocast wrapper needed
         h.grad = w.grad = None
-        loss = _liger_flce(w.to(torch.bfloat16), h.reshape(-1, h.shape[-1]),
+        loss = _liger_flce(w.to(torch.bfloat16),
+                           h.reshape(-1, h.shape[-1]).to(torch.bfloat16),
                            t.reshape(-1))
         loss.backward()
         return loss.detach()
