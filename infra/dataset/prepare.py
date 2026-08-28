@@ -16,7 +16,6 @@
 import hashlib
 import importlib
 import json
-import os
 import time
 from array import array
 from datetime import datetime
@@ -24,7 +23,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ..utils import git_state
+from ..utils import atomic_write, git_state
 
 FORMAT = "vagus-tokens-v1"
 
@@ -35,14 +34,6 @@ def _sha256(path: Path) -> str:
         while chunk := f.read(1 << 24):
             h.update(chunk)
     return h.hexdigest()
-
-
-def _atomic_write(path: Path, write_fn):
-    '''Write via tmp + rename, keeping "file present == file complete".'''
-    tmp = path.with_name(path.name + '.tmp')
-    with open(tmp, 'wb') as f:
-        write_fn(f)
-    os.replace(tmp, path)
 
 
 def _tokenize_file(tok, src: Path, batch_rows: int):
@@ -129,8 +120,8 @@ def prepare(
 
         shard = out_dir / f'{src.stem}.npy'
         idx = out_dir / f'{src.stem}.idx.npy'
-        _atomic_write(shard, lambda f: np.save(f, tokens))
-        _atomic_write(idx, lambda f: np.save(f, offsets))
+        atomic_write(shard, lambda f: np.save(f, tokens))
+        atomic_write(idx, lambda f: np.save(f, offsets))
 
         entry = {
             'file': shard.name,
@@ -144,16 +135,16 @@ def prepare(
                               if s['source'] != src.name] + [entry]
         manifest['shards'].sort(key=lambda s: s['source'])
         _update_totals(manifest, sources)
-        _atomic_write(manifest_path,
-                      lambda f: f.write(json.dumps(manifest, indent=2).encode()))
+        atomic_write(manifest_path,
+                     lambda f: f.write(json.dumps(manifest, indent=2).encode()))
 
         dt = time.perf_counter() - t0
         print(f"{src.name}: {entry['tokens']:,} tokens, {entry['docs']:,} docs "
               f"in {dt:.0f}s ({entry['tokens']/dt/1e6:.1f} Mtok/s)")
 
     _update_totals(manifest, sources)
-    _atomic_write(manifest_path,
-                  lambda f: f.write(json.dumps(manifest, indent=2).encode()))
+    atomic_write(manifest_path,
+                 lambda f: f.write(json.dumps(manifest, indent=2).encode()))
     return manifest_path
 
 

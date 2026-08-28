@@ -1,10 +1,22 @@
 
+import os
 import subprocess
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 import torch
 from torch import nn
+
+
+def atomic_write(path: str | Path, write_fn: Callable) -> None:
+    '''Write via tmp + os.replace, keeping the invariant both the data
+    pipeline and checkpointing rely on: a file at `path` is either absent
+    or complete, never partial. write_fn receives the open binary handle.'''
+    path = Path(path)
+    tmp = path.with_name(path.name + '.tmp')
+    with open(tmp, 'wb') as f:
+        write_fn(f)
+    os.replace(tmp, path)
 
 
 def git_state() -> dict:

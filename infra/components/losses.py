@@ -57,11 +57,26 @@ def chunked_cross_entropy(
 
 def make_ce(impl: str, *, z_loss: float = 0.0, chunk_rows: int = 4096,
             compute_dtype: torch.dtype | None = torch.bfloat16):
-    '''Factory for the fused loss path: fn(hidden, head_weight, targets) ->
-    mean CE with the z-loss term folded in. impl 'chunked' is the
-    dependency-free fallback; 'liger' (CUDA/Triton) trades ~1.3x loss-path
-    time for ~96% of its peak memory (bench_ce.py). The 'full' logits path
-    is not built here — it needs logits, which fused losses never create.'''
+    '''Factory for the loss path: fn(hidden, head_weight, targets) -> mean
+    CE with the z-loss term folded in (for every impl — the reported loss
+    is always the combined objective).
+
+    'full' materialises the logits (reference path, fastest, largest
+    peak); 'chunked' is the dependency-free fused fallback; 'liger'
+    (CUDA/Triton) trades ~1.3x loss-path time for ~96% of its peak memory.
+    The three are numerically interchangeable at bf16-rounding level —
+    measured in meter/examples/bench_ce.py.'''
+    if impl == 'full':
+        def full_fn(hidden, weight, targets):
+            # identical to head(hidden) + F.cross_entropy: autocast runs
+            # the matmul in bf16 and upcasts the CE internals to fp32
+            logits = F.linear(hidden, weight)
+            loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]),
+                                   targets.reshape(-1))
+            if z_loss:
+                loss = loss + z_loss * torch.logsumexp(logits, dim=-1).pow(2).mean()
+            return loss
+        return full_fn
     if impl == 'chunked':
         def chunked_fn(hidden, weight, targets):
             return chunked_cross_entropy(hidden, weight, targets,

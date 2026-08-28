@@ -14,7 +14,6 @@
 
 import argparse
 import json
-import math
 import os
 import re
 import signal
@@ -23,7 +22,6 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
-from types import SimpleNamespace
 from typing import cast
 
 import numpy as np
@@ -31,16 +29,15 @@ import torch
 import torch.distributed as dist
 import yaml
 from torch import nn
-from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from ..components.losses import make_ce
 from ..dataset.loader import TokenStore, WindowLoader
-from ..models.transformer_pp import TransformerPP
-from ..utils import git_state
+from ..models import build_model
+from ..optimizer import build_optimizer
+from ..utils import atomic_write, git_state
+from .metrics import FAST_METRICS, SLOW_METRICS, MetricCtx, Monitor
 from .schedule import build_schedule
-
-MODELS = {'TransformerPP': TransformerPP}
 
 
 # ---------------------------------------------------------------------------
@@ -101,14 +98,11 @@ class TrainConfig:
 
     # loss shaping
     grad_clip: float | None = 1.0
-    z_loss: float | None = None
-    # cross-entropy path. 'liger': fused Triton kernel (CUDA-only), logits
-    # never materialise (~-5.5GB peak at 340M shapes for ~+3% step time).
-    # 'chunked': dependency-free fused fallback (slower). 'full': plain
-    # logits path; the only impl with a separate z_loss scalar in TB (the
-    # fused ones fold the z term into the loss). See bench_ce.py numbers.
-    # Models used with fused impls must support forward(x, return_hidden=
-    # True) and expose head.weight.
+    z_loss: float | None = None          # folded into the reported loss
+    # cross-entropy path (losses.make_ce): 'liger' fused Triton kernel
+    # (CUDA-only, ~-5.5GB peak at 340M shapes for ~+3% step time),
+    # 'chunked' dependency-free fused fallback, 'full' plain logits path.
+    # Numerically interchangeable at bf16 rounding (bench_ce.py).
     ce_impl: str = 'liger'
     ce_chunk_rows: int = 4096            # 'chunked' only
 
@@ -143,81 +137,6 @@ class TrainConfig:
                 raise ValueError('model defined in both train and model recipe')
             raw |= model
         return cls(**raw)   # unknown keys -> loud TypeError
-
-
-# ---------------------------------------------------------------------------
-# Factories
-# ---------------------------------------------------------------------------
-
-def build_model(name: str, args: dict) -> nn.Module:
-    return MODELS[name](**args)
-
-
-def build_optimizer(name: str, model, args: dict) -> torch.optim.Optimizer:
-    groups = model.param_groups()
-    if name == 'adamw':
-        args = dict(args)
-        wd = args.pop('weight_decay', 0.0)
-        if 'betas' in args:
-            args['betas'] = tuple(args['betas'])
-        param_groups = [
-            {'params': groups['muon'] + groups['adamw_decay'],
-             'weight_decay': wd, 'name': 'decay'},
-            {'params': groups['adamw_no_decay'],
-             'weight_decay': 0.0, 'name': 'no_decay'},
-        ]
-        opt = torch.optim.AdamW(param_groups, **args,
-                                fused=torch.cuda.is_available())
-    else:
-        raise KeyError(f"unknown optimizer '{name}'")
-    for g in opt.param_groups:
-        g['base_lr'] = g['lr']   # schedule multiplies this every step
-    return opt
-
-
-# ---------------------------------------------------------------------------
-# Metrics: modular hooks, each fn(ctx) -> dict of scalars. FAST runs every
-# log_interval, SLOW every slow_interval. Add/remove by editing the lists.
-# Defaults follow the marin hero-run dashboard, minus MoE-specific items.
-# ---------------------------------------------------------------------------
-
-def metric_core(c) -> dict:
-    out = {'loss': c.loss, 'loss_ema': c.loss_ema, 'lr': c.lr,
-           'grad_norm': c.grad_norm, 'tokens': c.tokens_seen}
-    if c.prev_grad_norm:
-        out['grad_norm_step_ratio'] = c.grad_norm / c.prev_grad_norm
-    if c.z_loss_val is not None:
-        out['z_loss'] = c.z_loss_val
-    return out
-
-
-def metric_throughput(c) -> dict:
-    out = {'tokens_per_s': c.tokens_per_s, 'step_ms': c.step_ms}
-    if c.peak_tflops:
-        # PaLM-style estimate: 6N per token plus attention matmuls
-        flops_per_tok = 6 * c.param_count + c.attn_flops_per_tok
-        achieved = flops_per_tok * c.tokens_per_s / c.world_size
-        out['mfu'] = achieved / (c.peak_tflops * 1e12)
-    if c.device_type == 'cuda':
-        out['max_mem_gb'] = torch.cuda.max_memory_allocated() / 1e9
-    return out
-
-
-def metric_param_norms(c) -> dict:
-    '''Per-optimizer-group L2 norms (marin: constant/drifting norms are a
-    health signal), plus the embedding norm on its own.'''
-    out = {}
-    for g in c.optimizer.param_groups:
-        sq = sum(float(p.detach().float().pow(2).sum()) for p in g['params'])
-        out[f"pnorm/{g['name']}"] = math.sqrt(sq)
-    emb = getattr(c.model, 'embedding', None)
-    if emb is not None:
-        out['pnorm/embedding'] = float(emb.weight.detach().float().norm())
-    return out
-
-
-FAST_METRICS = [metric_core, metric_throughput]
-SLOW_METRICS = [metric_param_norms]
 
 
 # ---------------------------------------------------------------------------
@@ -281,11 +200,11 @@ def save_checkpoint(run_dir: Path, kind: str, step: int, tokens_seen: int,
         'config': asdict(config),
     }
     path = run_dir / ('recent.pt' if kind == 'recent' else f'ckpt-{step:08d}.pt')
-    tmp = path.with_name(path.name + '.tmp')
-    torch.save(state, tmp)
+    # rotate before writing: if the write crashes, recent.pt is absent but
+    # recent-prev.pt survives, and find_resume falls through to it
     if kind == 'recent' and path.exists():
         os.replace(path, run_dir / 'recent-prev.pt')
-    os.replace(tmp, path)
+    atomic_write(path, lambda f: torch.save(state, f))
     return path
 
 
@@ -313,8 +232,10 @@ def train(config: TrainConfig):
             f'world_size={config.world_size}. The data order depends on the '
             f'card count, so this would be a different experiment; edit the '
             f'recipe deliberately if the new layout is intended.')
+    
     declared = (config.world_size * config.batch_size
                 * config.grad_accum_steps * config.context_len)
+    
     if config.global_batch_tokens is not None \
             and declared != config.global_batch_tokens:
         raise ValueError(
@@ -428,37 +349,40 @@ def train(config: TrainConfig):
                 if amp_dtype is not torch.float32 else nullcontext())
     assert amp_dtype is not torch.float16, 'fp16 (GradScaler) path not implemented'
 
-    writer = None
-    if is_main:
-        try:
-            from torch.utils.tensorboard import SummaryWriter
-            writer = SummaryWriter(run_dir / 'tb')
-            writer.add_text('meta', f'```json\n{(run_dir / "meta.json").read_text()}\n```')
-        except Exception as e:   # tensorboard absent on the bare cluster env
-            log(f'[warn] tensorboard unavailable ({e}); scalars not logged')
-
     margs = config.model_args
-    ctx = SimpleNamespace(
+    ctx = MetricCtx(
         model=unwrap(model), optimizer=optimizer, world_size=world,
         device_type=device.type, param_count=param_count,
         peak_tflops=config.peak_tflops,
         attn_flops_per_tok=(12 * margs['layer_count'] * margs['dim'] * config.context_len
-                            if {'layer_count', 'dim'} <= margs.keys() else 0),
-        loss=0.0, loss_ema=None, lr=0.0, grad_norm=0.0, prev_grad_norm=0.0,
-        z_loss_val=None, tokens_seen=0, tokens_per_s=0.0, step_ms=0.0)
+                            if {'layer_count', 'dim'} <= margs.keys() else 0))
+    # constructed on every rank (its loss all-reduce is a collective);
+    # only rank 0 gets the tb writer, and log() is already rank-gated.
+    # models contribute architecture-specific hooks via the optional
+    # metric_hooks() convention (see metrics.py).
+    hooks = getattr(unwrap(model), 'metric_hooks', dict)()
+    monitor = Monitor(
+        ctx, tokens_per_step, steps_total,
+        log_interval=config.log_interval, slow_interval=config.slow_interval,
+        fast=FAST_METRICS + list(hooks.get('fast', [])),
+        slow=SLOW_METRICS + list(hooks.get('slow', [])),
+        tb_dir=run_dir / 'tb' if is_main else None,
+        meta_text=f'```json\n{(run_dir / "meta.json").read_text()}\n```'
+                  if is_main else None,
+        log_fn=log)
 
-    fused_ce = head_weight = None
-    if config.ce_impl != 'full':
-        head_weight = unwrap(model).head.weight  # type: ignore
-        fused_ce = make_ce(
-            config.ce_impl, z_loss=config.z_loss or 0.0,
-            chunk_rows=config.ce_chunk_rows,
-            compute_dtype=amp_dtype if amp_dtype is not torch.float32 else None)
+    # one uniform loss path: the model yields pre-head hidden states and
+    # the head projection lives inside the loss fn (for 'full' that is the
+    # same computation head() would have done)
+    head_weight = unwrap(model).head.weight  # type: ignore
+    ce_fn = make_ce(
+        config.ce_impl, z_loss=config.z_loss or 0.0,
+        chunk_rows=config.ce_chunk_rows,
+        compute_dtype=amp_dtype if amp_dtype is not torch.float32 else None)
 
     batches = iter(loader)
     model.train()
     last_recent = time.time()
-    t_step = time.perf_counter()
     log('training...')
 
     try:
@@ -471,7 +395,6 @@ def train(config: TrainConfig):
 
             optimizer.zero_grad(set_to_none=True)
             loss_acc = torch.zeros((), device=device)
-            zloss_acc = torch.zeros((), device=device)
             for micro in range(config.grad_accum_steps):
                 x, y = next(batches)
                 x = x.to(device, non_blocking=True)
@@ -480,22 +403,9 @@ def train(config: TrainConfig):
                         if is_dist and micro < config.grad_accum_steps - 1
                         else nullcontext())
                 with sync, autocast:
-                    if fused_ce is None:
-                        logits = model(x)
-                        loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]),
-                                               y.reshape(-1))
-                        total = loss
-                        if config.z_loss:
-                            z = torch.logsumexp(logits, dim=-1)
-                            zl = config.z_loss * z.pow(2).mean()
-                            total = loss + zl
-                            zloss_acc += zl.detach()
-                    else:
-                        hidden = model(x, return_hidden=True)
-                        # z term (if any) is folded in; `loss` here is the
-                        # combined objective, which is what gets logged
-                        loss = total = fused_ce(hidden, head_weight, y)
-                    (total / config.grad_accum_steps).backward()
+                    hidden = model(x, return_hidden=True)
+                    loss = ce_fn(hidden, head_weight, y)
+                    (loss / config.grad_accum_steps).backward()
                 loss_acc += loss.detach()
 
             grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -509,37 +419,9 @@ def train(config: TrainConfig):
                 dist.all_reduce(flag, op=dist.ReduceOp.MAX)
                 stop = bool(flag.item())
 
-            if step % config.log_interval == 0 or step == steps_total or stop:
-                if is_dist:
-                    dist.all_reduce(loss_acc, op=dist.ReduceOp.AVG)
-                    dist.all_reduce(zloss_acc, op=dist.ReduceOp.AVG)
-                now = time.perf_counter()
-                ctx.loss = loss_acc.item() / config.grad_accum_steps
-                ctx.loss_ema = (ctx.loss if ctx.loss_ema is None
-                                else 0.9 * ctx.loss_ema + 0.1 * ctx.loss)
-                ctx.prev_grad_norm, ctx.grad_norm = ctx.grad_norm, float(grad_norm)
-                ctx.z_loss_val = (zloss_acc.item() / config.grad_accum_steps
-                                  if config.z_loss and config.ce_impl == 'full'
-                                  else None)
-                ctx.lr = optimizer.param_groups[0]['lr']
-                ctx.tokens_seen = tokens_seen
-                ctx.step_ms = (now - t_step) / config.log_interval * 1e3
-                ctx.tokens_per_s = tokens_per_step * config.log_interval / (now - t_step)
-                t_step = now
-
-                scalars = {}
-                for fn in FAST_METRICS:
-                    scalars |= fn(ctx)
-                if step % config.slow_interval == 0:
-                    for fn in SLOW_METRICS:
-                        scalars |= fn(ctx)
-                if writer is not None:
-                    for k, v in scalars.items():
-                        writer.add_scalar(k, v, step)
-                if step % (config.log_interval * 10) == 0 or step == steps_total:
-                    log(f'step {step:>7,}/{steps_total:,} | loss {ctx.loss:.4f} '
-                        f'(ema {ctx.loss_ema:.4f}) | lr {ctx.lr:.2e} | '
-                        f'gnorm {ctx.grad_norm:.2f} | {ctx.tokens_per_s/1e6:.2f} Mtok/s')
+            monitor.observe(step, loss_acc / config.grad_accum_steps,
+                            grad_norm, tokens_seen,
+                            final=stop or step == steps_total)
 
             if is_main and config.permanent_ckpt_interval \
                     and step % config.permanent_ckpt_interval == 0 and step < steps_total:
@@ -563,8 +445,7 @@ def train(config: TrainConfig):
             log(f'final {kind} checkpoint: {p.name} | '
                 f'{tokens_seen/1e9:.3f}B tokens seen')
     finally:
-        if writer is not None:
-            writer.close()
+        monitor.close()
         if is_dist:
             dist.destroy_process_group()   # no barrier: see job 27725880
 
