@@ -1,0 +1,119 @@
+{
+  "run": {
+    "name": "tpp-340M-fwe15B-a0660ce7",
+    "purpose": "Transformer++ 340M baseline on FineWeb-Edu 15B (GLA/DeltaNet protocol) \u2014 first softmax-attention reference of the arsenal",
+    "code_commit": "a0660ce71fec09ba4b115dfbb89bb17c3d44d1f3",
+    "created": "2026-08-28T01:36:40+02:00",
+    "finished": "2026-08-28T20:37:08+02:00",
+    "elapsed": "19:01:37",
+    "slurm_jobs": {
+      "failed_oom_micro16_fullce": 29680266,
+      "completed": 29680332
+    },
+    "hardware": "1 node x 4x A100-SXM4-40GB (MPCDF Raven, partition gpu)",
+    "torch": "2.13.0+cu130"
+  },
+  "recipe": {
+    "run_name": "tpp-340M-fwe15B",
+    "data_dir": "data/tokenized/fineweb-edu-100BT-mistral32k",
+    "model_name": "TransformerPP",
+    "model_args": {
+      "vocab_size": 32000,
+      "dim": 1024,
+      "head_dim": 64,
+      "context_len": 2048,
+      "layer_count": 24,
+      "ffn_hidden_dim": 2816,
+      "kv_head_count": null,
+      "rmsnorm_eps": 1e-06,
+      "rope_base": 10000,
+      "tie_embedding": true
+    },
+    "optimizer_name": "adamw",
+    "optimizer_args": {
+      "lr": 0.0003,
+      "betas": [
+        0.9,
+        0.95
+      ],
+      "weight_decay": 0.01
+    },
+    "schedule_name": "cosine",
+    "schedule_args": {
+      "warmup": 0.0333,
+      "min_ratio": 0.1
+    },
+    "data_shards": null,
+    "context_len": 2048,
+    "batch_size": 8,
+    "grad_accum_steps": 8,
+    "world_size": 4,
+    "global_batch_tokens": 524288,
+    "train_tokens": 15000000000,
+    "seed": 42,
+    "grad_clip": 1.0,
+    "z_loss": null,
+    "device": "auto",
+    "dtype": "bfloat16",
+    "compile": true,
+    "tf32": true,
+    "out_root": "runs",
+    "log_interval": 10,
+    "slow_interval": 100,
+    "permanent_ckpt_interval": 5000,
+    "recent_ckpt_minutes": 30,
+    "peak_tflops": 312
+  },
+  "data": {
+    "dir": "/raven/ptmp/yinxu/vagus/data/tokenized/fineweb-edu-100BT-mistral32k",
+    "source": {
+      "repo_id": "HuggingFaceFW/fineweb-edu",
+      "revision": "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9",
+      "sample": "100BT"
+    },
+    "tokenizer": {
+      "id": "mistral32k",
+      "sha256": "fc4f0bd70b3709312d9d1d9e5ba674794b6bc5abc17429897a540f93882f25fc"
+    },
+    "total_tokens": 16665585972,
+    "shards": [
+      "000_00000.npy",
+      "000_00001.npy",
+      "000_00002.npy",
+      "000_00003.npy",
+      "000_00004.npy",
+      "000_00005.npy",
+      "000_00006.npy",
+      "000_00007.npy",
+      "000_00008.npy",
+      "000_00009.npy",
+      "001_00000.npy",
+      "001_00001.npy",
+      "001_00002.npy",
+      "001_00003.npy",
+      "001_00004.npy",
+      "001_00005.npy",
+      "001_00006.npy",
+      "001_00007.npy",
+      "001_00008.npy",
+      "001_00009.npy"
+    ]
+  },
+  "results": {
+    "steps": 28610,
+    "tokens_seen": 14999879680,
+    "final_loss": 2.5417,
+    "final_loss_ema": 2.515,
+    "mean_tokens_per_s": 218986.0,
+    "steady_mfu": "~0.50 (0.22-0.25 Mtok/s steady; fp32 CE path, micro 8)",
+    "notes": "loss in nats on mistral32k tokens; comparable only within this data+tokenizer+protocol coordinate system. pnorm/embedding grew 114.6 -> ~225 over the run (watched, benign)."
+  },
+  "archive": {
+    "primary": "selene:/data/vagus/runs/tpp-340M-fwe15B-a0660ce7/  (SHA256SUMS inside)",
+    "contents": "ckpt-{05000,10000,15000,20000,25000,28610}.pt (full training state), model-final.pt (slim weights+args), tb/, config.yaml, meta.json, slurm logs",
+    "transient": [
+      "raven:/ptmp/yinxu/vagus/runs/tpp-340M-fwe15B-a0660ce7/ (until ptmp purge)",
+      "mbp:assets/2-areas/vagus/runs/tpp-340M-fwe15B-a0660ce7/ (model-final.pt + config/meta only)"
+    ]
+  }
+}
