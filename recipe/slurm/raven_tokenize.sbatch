@@ -9,7 +9,9 @@
 #SBATCH --partition=general
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=144
+# cpus-per-task counts physical cores on raven (72/node); the allocation
+# still exposes all 144 hyperthreads to the task
+#SBATCH --cpus-per-task=72
 #SBATCH --mem=240000
 #SBATCH --time=24:00:00
 #SBATCH --output=runs/slurm-%x-%j.out
