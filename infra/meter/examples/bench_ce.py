@@ -60,9 +60,11 @@ def main():
               f'grad max rel diff: h {((h.grad-gh).abs().max()/gh.abs().max()).item():.2e}, '
               f'w {((w.grad-gw).abs().max()/gw.abs().max()).item():.2e}')
 
-        results = [bench(make_variant('full', h, w, t, device), name='full-logits'),
-                   bench(make_variant('chunked', h, w, t, device, 2048), name='chunked-2k'),
-                   bench(make_variant('chunked', h, w, t, device, 8192), name='chunked-8k')]
+        # device passed explicitly: the closures take no tensor args, so
+        # bench cannot infer it (and would fall back to the cpu path)
+        results = [bench(make_variant('full', h, w, t, device), name='full-logits', device=device),
+                   bench(make_variant('chunked', h, w, t, device, 2048), name='chunked-2k', device=device),
+                   bench(make_variant('chunked', h, w, t, device, 8192), name='chunked-8k', device=device)]
         for r in results:
             if r.error:
                 print(f'  {r.name:<12} FAILED: {r.error}')
