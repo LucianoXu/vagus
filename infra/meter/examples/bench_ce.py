@@ -14,6 +14,13 @@ from torch.nn import functional as F
 from infra.meter import bench
 from infra.components.losses import chunked_cross_entropy
 
+# CUDA/Triton-only, installed manually on GPU boxes (like triton/flash_attn)
+try:
+    from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
+    _liger_flce = LigerFusedLinearCrossEntropyLoss()
+except ImportError:
+    _liger_flce = None
+
 V = 32000
 
 
@@ -33,7 +40,17 @@ def make_variant(kind, h, w, t, device, chunk_rows=4096):
         loss.backward()
         return loss.detach()
 
-    return full if kind == 'full' else chunked
+    def liger():
+        # mirrors trainer integration: bf16 weight view of the fp32 master
+        # (grad flows back to fp32 through the cast); kernel manages its
+        # own precision internally, no autocast wrapper needed
+        h.grad = w.grad = None
+        loss = _liger_flce(w.to(torch.bfloat16), h.reshape(-1, h.shape[-1]),
+                           t.reshape(-1))
+        loss.backward()
+        return loss.detach()
+
+    return {'full': full, 'chunked': chunked, 'liger': liger}[kind]
 
 
 def main():
@@ -60,11 +77,22 @@ def main():
               f'grad max rel diff: h {((h.grad-gh).abs().max()/gh.abs().max()).item():.2e}, '
               f'w {((w.grad-gw).abs().max()/gw.abs().max()).item():.2e}')
 
+        if _liger_flce is not None:
+            try:
+                ll = make_variant('liger', h, w, t, device)()
+                print(f'liger loss {ll.item():.6f} | grad max rel diff: '
+                      f'h {((h.grad-gh).abs().max()/gh.abs().max()).item():.2e}, '
+                      f'w {((w.grad-gw).abs().max()/gw.abs().max()).item():.2e}')
+            except Exception as e:
+                print(f'liger correctness check failed: {type(e).__name__}: {e}')
+
         # device passed explicitly: the closures take no tensor args, so
         # bench cannot infer it (and would fall back to the cpu path)
         results = [bench(make_variant('full', h, w, t, device), name='full-logits', device=device),
                    bench(make_variant('chunked', h, w, t, device, 2048), name='chunked-2k', device=device),
                    bench(make_variant('chunked', h, w, t, device, 8192), name='chunked-8k', device=device)]
+        if _liger_flce is not None:
+            results.append(bench(make_variant('liger', h, w, t, device), name='liger-flce', device=device))
         for r in results:
             if r.error:
                 print(f'  {r.name:<12} FAILED: {r.error}')
