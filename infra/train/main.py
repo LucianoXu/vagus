@@ -34,6 +34,7 @@ from torch import nn
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from ..components.losses import make_ce
 from ..dataset.loader import TokenStore, WindowLoader
 from ..models.transformer_pp import TransformerPP
 from ..utils import git_state
@@ -101,6 +102,15 @@ class TrainConfig:
     # loss shaping
     grad_clip: float | None = 1.0
     z_loss: float | None = None
+    # cross-entropy path. 'liger': fused Triton kernel (CUDA-only), logits
+    # never materialise (~-5.5GB peak at 340M shapes for ~+3% step time).
+    # 'chunked': dependency-free fused fallback (slower). 'full': plain
+    # logits path; the only impl with a separate z_loss scalar in TB (the
+    # fused ones fold the z term into the loss). See bench_ce.py numbers.
+    # Models used with fused impls must support forward(x, return_hidden=
+    # True) and expose head.weight.
+    ce_impl: str = 'liger'
+    ce_chunk_rows: int = 4096            # 'chunked' only
 
     # system
     device: str = 'auto'                 # ignored under torchrun
@@ -437,6 +447,14 @@ def train(config: TrainConfig):
         loss=0.0, loss_ema=None, lr=0.0, grad_norm=0.0, prev_grad_norm=0.0,
         z_loss_val=None, tokens_seen=0, tokens_per_s=0.0, step_ms=0.0)
 
+    fused_ce = head_weight = None
+    if config.ce_impl != 'full':
+        head_weight = unwrap(model).head.weight  # type: ignore
+        fused_ce = make_ce(
+            config.ce_impl, z_loss=config.z_loss or 0.0,
+            chunk_rows=config.ce_chunk_rows,
+            compute_dtype=amp_dtype if amp_dtype is not torch.float32 else None)
+
     batches = iter(loader)
     model.train()
     last_recent = time.time()
@@ -462,15 +480,21 @@ def train(config: TrainConfig):
                         if is_dist and micro < config.grad_accum_steps - 1
                         else nullcontext())
                 with sync, autocast:
-                    logits = model(x)
-                    loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]),
-                                           y.reshape(-1))
-                    total = loss
-                    if config.z_loss:
-                        z = torch.logsumexp(logits, dim=-1)
-                        zl = config.z_loss * z.pow(2).mean()
-                        total = loss + zl
-                        zloss_acc += zl.detach()
+                    if fused_ce is None:
+                        logits = model(x)
+                        loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]),
+                                               y.reshape(-1))
+                        total = loss
+                        if config.z_loss:
+                            z = torch.logsumexp(logits, dim=-1)
+                            zl = config.z_loss * z.pow(2).mean()
+                            total = loss + zl
+                            zloss_acc += zl.detach()
+                    else:
+                        hidden = model(x, return_hidden=True)
+                        # z term (if any) is folded in; `loss` here is the
+                        # combined objective, which is what gets logged
+                        loss = total = fused_ce(hidden, head_weight, y)
                     (total / config.grad_accum_steps).backward()
                 loss_acc += loss.detach()
 
@@ -495,7 +519,8 @@ def train(config: TrainConfig):
                                 else 0.9 * ctx.loss_ema + 0.1 * ctx.loss)
                 ctx.prev_grad_norm, ctx.grad_norm = ctx.grad_norm, float(grad_norm)
                 ctx.z_loss_val = (zloss_acc.item() / config.grad_accum_steps
-                                  if config.z_loss else None)
+                                  if config.z_loss and config.ce_impl == 'full'
+                                  else None)
                 ctx.lr = optimizer.param_groups[0]['lr']
                 ctx.tokens_seen = tokens_seen
                 ctx.step_ms = (now - t_step) / config.log_interval * 1e3

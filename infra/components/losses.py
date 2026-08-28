@@ -13,6 +13,12 @@ import torch
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
+# CUDA/Triton-only, installed manually on GPU boxes (like triton/flash_attn)
+try:
+    from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
+except ImportError:
+    LigerFusedLinearCrossEntropyLoss = None
+
 
 def _chunk_loss_sum(h, weight, targets, z_coef):
     # bf16 matmul under autocast; the fp32 upcast is chunk-sized
@@ -47,3 +53,30 @@ def chunked_cross_entropy(
         assert part is not None
         total = total + part
     return total / n
+
+
+def make_ce(impl: str, *, z_loss: float = 0.0, chunk_rows: int = 4096,
+            compute_dtype: torch.dtype | None = torch.bfloat16):
+    '''Factory for the fused loss path: fn(hidden, head_weight, targets) ->
+    mean CE with the z-loss term folded in. impl 'chunked' is the
+    dependency-free fallback; 'liger' (CUDA/Triton) trades ~1.3x loss-path
+    time for ~96% of its peak memory (bench_ce.py). The 'full' logits path
+    is not built here — it needs logits, which fused losses never create.'''
+    if impl == 'chunked':
+        def chunked_fn(hidden, weight, targets):
+            return chunked_cross_entropy(hidden, weight, targets,
+                                         chunk_rows=chunk_rows, z_loss=z_loss)
+        return chunked_fn
+    if impl == 'liger':
+        if LigerFusedLinearCrossEntropyLoss is None:
+            raise ImportError("ce_impl 'liger' requires liger-kernel "
+                              "(CUDA-only; pip install liger-kernel)")
+        flce = LigerFusedLinearCrossEntropyLoss(lse_square_scale=z_loss)
+        def liger_fn(hidden, weight, targets):
+            # liger ignores autocast; cast explicitly (grads flow back to
+            # the fp32 masters through the casts)
+            dt = compute_dtype or hidden.dtype
+            return flce(weight.to(dt), hidden.reshape(-1, hidden.shape[-1]).to(dt),
+                        targets.reshape(-1))
+        return liger_fn
+    raise KeyError(f"unknown fused ce impl '{impl}'")

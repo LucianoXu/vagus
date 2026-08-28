@@ -18,12 +18,13 @@ data_shards: null          # all 20 shards (16.7B tokens); 15B => 0.9 epoch.
 
 context_len: 2048
 # Hardware layout is part of the recipe (data order depends on it):
-# 4 GPUs, single node. global batch = 4 * 8 * 8 * 2048 = 0.5M tokens,
-# asserted at startup via global_batch_tokens. micro 8 fits A100-40GB
-# (micro 16 OOMed at the fp32 CE logits buffer, job 29680266).
+# 4 GPUs, single node. global batch = 4 * 16 * 4 * 2048 = 0.5M tokens,
+# asserted at startup via global_batch_tokens. micro 16 fits A100-40GB
+# with the liger fused CE (with full-logits CE it OOMed, job 29680266;
+# a completed 15B reference run used micro 8 + full CE, job 29680332).
 world_size: 4
-batch_size: 8              # per-rank micro-batch
-grad_accum_steps: 8
+batch_size: 16             # per-rank micro-batch
+grad_accum_steps: 4
 global_batch_tokens: 524288
 train_tokens: 15_000_000_000
 seed: 42
@@ -41,6 +42,8 @@ schedule_args:
 
 grad_clip: 1.0
 z_loss: null               # benchmark recipe: off
+ce_impl: liger             # fused CE; loss equals the full-logits path to
+                           # bf16 rounding (bench_ce.py correctness check)
 
 device: auto
 dtype: bfloat16

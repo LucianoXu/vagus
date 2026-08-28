@@ -162,12 +162,18 @@ class TransformerPP(nn.Module):
         for blk in self.blocks:
             blk.compile()
 
-    def forward(self, tokens, is_causal: bool = True):
+    def forward(self, tokens, is_causal: bool = True, return_hidden: bool = False):
         # tokens : (B, L) int64
         x = self.embedding(tokens)
         for blk in self.blocks:
             x = blk(x, is_causal)
         x = self.rms_head(x)
+        if return_hidden:
+            # pre-head hidden for fused-CE losses (the head projection is
+            # folded into the loss; self.head.weight is read by the caller).
+            # Must stay reachable through the DDP-wrapped forward, so this
+            # is a flag rather than a separate method.
+            return x
         return self.head(x)   # (B, L, vocab_size) logits
 
     # streaming inference
