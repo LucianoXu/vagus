@@ -8,8 +8,20 @@
 #                  rank, exactly resumable). Doc-aware policies for streaming
 #                  block training are meant to become siblings of this class,
 #                  built on TokenStore's doc addressing.
+#
+# I/O path: window bytes come from os.pread, not the mmap view. Random
+# 4KB window reads on a store larger than the Lustre OST caches cost
+# real seeks (measured 0.4-0.9s per micro-batch on the 140-shard
+# FineWeb-Edu store — it throttled the sax1 pilots to 0.65x throughput),
+# so WindowLoader prefetches on a background thread; pread releases the
+# GIL during the disk wait, whereas a page fault inside numpy's copy
+# would hold it and stall the training thread anyway. The mmap views
+# stay for doc addressing and init-time validation.
 
 import json
+import os
+import queue
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -44,7 +56,23 @@ class TokenStore:
         self.total_tokens = sum(self.shard_tokens)
         self.vocab_size = self.manifest['tokenizer']['vocab_size']
 
+        # pread path (read_window): raw fds + the npy header size, taken
+        # from the memmap so the .npy format stays numpy's problem.
+        # Opened eagerly: no lazy-open race with the prefetch thread.
+        self._fds = [os.open(str(self.dir / e['file']), os.O_RDONLY)
+                     for e in entries]
+        self._data_off = [int(arr.offset) for arr in self.tokens]  # type: ignore[attr-defined]
+
         self._idx: list[np.ndarray | None] = [None] * len(entries)
+
+    def read_window(self, shard: int, start: int, count: int) -> np.ndarray:
+        '''`count` tokens at token offset `start` of one shard, read via
+        pread — GIL-free during the disk wait (see module header).'''
+        buf = os.pread(self._fds[shard], count * 2,
+                       self._data_off[shard] + start * 2)
+        assert len(buf) == count * 2, \
+            f'short read: shard {shard} @ {start}+{count}'
+        return np.frombuffer(buf, dtype=np.uint16)
 
     # document addressing (for doc-aware policies and inspection)
 
@@ -76,6 +104,14 @@ class WindowLoader:
     order-defining parameters and refuses a mismatched resume, since that
     would silently change which tokens are seen.
 
+    Prefetch: a daemon thread reads `prefetch` batches ahead (0 =
+    synchronous), overlapping the window gather I/O with compute. The
+    batch sequence is byte-identical either way (one reader running the
+    same order), and epoch/batch_in_epoch always track the position the
+    CONSUMER has reached — state_dict() taken between training steps
+    checkpoints consumed batches, never the thread's read-ahead. Call
+    load_state_dict before iter(), not during iteration.
+
     Iteration is infinite (epochs advance automatically); the training
     loop owns the stop condition, in steps or tokens.
     '''
@@ -90,9 +126,11 @@ class WindowLoader:
             rank: int = 0,
             world_size: int = 1,
             shuffle: bool = True,
+            prefetch: int = 4,
         ):
         assert context_len > 0 and batch_size > 0
         assert 0 <= rank < world_size
+        assert prefetch >= 0
 
         self.store = store
         self.context_len = context_len
@@ -101,6 +139,7 @@ class WindowLoader:
         self.rank = rank
         self.world_size = world_size
         self.shuffle = shuffle
+        self.prefetch = prefetch
 
         # window k of shard s starts at k * context_len and spans
         # context_len + 1 tokens (the +1 provides the shifted label)
@@ -147,17 +186,61 @@ class WindowLoader:
         for row, flat in enumerate(flat_starts):
             s = int(np.searchsorted(self._shard_base, flat, side='right')) - 1
             local = int(flat - self._shard_base[s])
-            out[row] = self.store.tokens[s][local:local + L + 1]
+            out[row] = self.store.read_window(s, local, L + 1)
         batch = torch.from_numpy(out)
         return batch[:, :-1], batch[:, 1:]
 
-    def __iter__(self):
+    def _produce(self, epoch: int, batch_in_epoch: int):
+        '''Infinite (epoch, index, x, y) stream from a start position.
+        Pure w.r.t. loader state — the consumer owns epoch/batch_in_epoch,
+        so a read-ahead producer never corrupts what state_dict() saves.'''
+        B, W, R = self.batch_size, self.world_size, self.rank
         while True:
-            order = self._epoch_order(self.epoch)
-            B, W, R = self.batch_size, self.world_size, self.rank
-            while self.batch_in_epoch < self.batches_per_epoch:
-                g = self.batch_in_epoch * W + R   # interleaved rank slices
-                self.batch_in_epoch += 1
-                yield self._gather(order[g * B:(g + 1) * B])
-            self.epoch += 1
-            self.batch_in_epoch = 0
+            order = self._epoch_order(epoch)
+            while batch_in_epoch < self.batches_per_epoch:
+                g = batch_in_epoch * W + R   # interleaved rank slices
+                x, y = self._gather(order[g * B:(g + 1) * B])
+                yield epoch, batch_in_epoch, x, y
+                batch_in_epoch += 1
+            epoch += 1
+            batch_in_epoch = 0
+
+    def __iter__(self):
+        src = self._produce(self.epoch, self.batch_in_epoch)
+        if self.prefetch == 0:
+            for epoch, b, x, y in src:
+                # b+1 before the yield, matching the historical states a
+                # checkpointed fingerprint may carry
+                self.epoch, self.batch_in_epoch = epoch, b + 1
+                yield x, y
+            return
+
+        q: queue.Queue = queue.Queue(maxsize=self.prefetch)
+        stop = threading.Event()
+
+        def reader():
+            try:
+                for item in src:
+                    while not stop.is_set():
+                        try:
+                            q.put(item, timeout=1.0)
+                            break
+                        except queue.Full:
+                            pass
+                    else:
+                        return
+            except BaseException as e:   # surface in the consumer
+                q.put(e)
+
+        threading.Thread(target=reader, daemon=True,
+                         name='WindowLoader-prefetch').start()
+        try:
+            while True:
+                item = q.get()
+                if isinstance(item, BaseException):
+                    raise item
+                epoch, b, x, y = item
+                self.epoch, self.batch_in_epoch = epoch, b + 1
+                yield x, y
+        finally:
+            stop.set()   # generator closed: let the reader drain and exit
