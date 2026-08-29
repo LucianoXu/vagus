@@ -1,0 +1,59 @@
+# SAX1-340M lr pilot @ 1.0e-3 (flame 340M variant value) — 1B tokens,
+# ~80 min on 4xA100. Siblings: pilot_lr17 (1.75e-3), pilot_lr30 (3.0e-3).
+#
+# Purpose: STABILITY GATE + coarse ranking for sax1_340M_fwe15B, not an
+# argmax — the marin law says optimal lr grows as tokens^-0.3461, so a 1B
+# pilot's optimum sits ~2.5x above the 15B optimum and ranking at 1B is
+# biased toward high lr. Read it as: spikes/divergence disqualify an lr;
+# a small loss edge does not promote one.
+#
+# warmup 0.1 = 100M tokens, held near the main run's warmup TOKEN count
+# (150M) rather than its 1% fraction — 19 warmup steps would stress the
+# high-lr arms in a way the real run never experiences.
+
+run_name: sax1-340M-pilot-lr10
+model_recipe: ../model/sax1_340M.yaml
+
+data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+data_shards: null
+
+context_len: 2048
+world_size: 4
+batch_size: 16
+grad_accum_steps: 4
+global_batch_tokens: 524288
+train_tokens: 1_000_000_000
+seed: 42
+
+optimizer_name: muon
+optimizer_args:
+  lr: 1.0e-3
+  momentum: 0.95
+  weight_decay: 0.1
+  lr_adjust: rms
+  ns_coeffs: polar_express
+  adamw:
+    lr: 1.0e-3
+    betas: [0.9, 0.95]
+    weight_decay: 0.1
+
+schedule_name: linear
+schedule_args:
+  warmup: 0.1
+  min_ratio: 0.05
+
+grad_clip: 1.0
+z_loss: 1e-4
+ce_impl: liger
+
+device: auto
+dtype: bfloat16
+compile: true
+tf32: true
+
+out_root: runs
+log_interval: 10
+slow_interval: 100
+permanent_ckpt_interval: null    # final checkpoint only
+recent_ckpt_minutes: 30
+peak_tflops: 312

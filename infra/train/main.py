@@ -379,6 +379,10 @@ def train(config: TrainConfig):
         config.ce_impl, z_loss=config.z_loss or 0.0,
         chunk_rows=config.ce_chunk_rows,
         compute_dtype=amp_dtype if amp_dtype is not torch.float32 else None)
+    if config.z_loss and not ce_fn.tracks_z:
+        log('[warn] z-loss active but this liger-kernel cannot report the z '
+            'term separately (needs return_z_loss, >= 0.5.2); training is '
+            'unaffected, loss_ce/loss_z curves disabled')
 
     batches = iter(loader)
     model.train()
@@ -395,6 +399,7 @@ def train(config: TrainConfig):
 
             optimizer.zero_grad(set_to_none=True)
             loss_acc = torch.zeros((), device=device)
+            z_acc = torch.zeros((), device=device) if ce_fn.tracks_z else None
             for micro in range(config.grad_accum_steps):
                 x, y = next(batches)
                 x = x.to(device, non_blocking=True)
@@ -407,6 +412,11 @@ def train(config: TrainConfig):
                     loss = ce_fn(hidden, head_weight, y)
                     (loss / config.grad_accum_steps).backward()
                 loss_acc += loss.detach()
+                if z_acc is not None:
+                    assert ce_fn.last_z is not None   # tracks_z contract
+                    z_acc += ce_fn.last_z
+                ctx.last_batch = x   # for probe-style slow hooks (a
+                                     # reference, not a copy)
 
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 model.parameters(), config.grad_clip or float('inf'))
@@ -421,7 +431,9 @@ def train(config: TrainConfig):
 
             monitor.observe(step, loss_acc / config.grad_accum_steps,
                             grad_norm, tokens_seen,
-                            final=stop or step == steps_total)
+                            final=stop or step == steps_total,
+                            z=None if z_acc is None
+                              else z_acc / config.grad_accum_steps)
 
             if is_main and config.permanent_ckpt_interval \
                     and step % config.permanent_ckpt_interval == 0 and step < steps_total:

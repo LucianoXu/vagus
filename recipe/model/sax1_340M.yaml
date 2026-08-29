@@ -1,0 +1,36 @@
+# SAX1-340M — first entry of the SAX series: frontier-design tracking for
+# softmax-attention Transformer LLMs. SAX keeps the 340M benchmark
+# coordinate system (24 x 1024, tied embedding, MHA — directly comparable
+# to transformer_pp_340M / Mamba Table 12 / GLA / DeltaNet) and folds
+# current best practices on top of Transformer++.
+#
+# vs transformer_pp_340M, only one architectural change:
+#   qk_norm: per-head RMSNorm on q/k before RoPE (Qwen/Gemma style).
+#     Bounds attention logits so the Muon recipe's ~6x higher lr stays
+#     stable; adds 2 * 24 * 64 = 3k params (negligible).
+# The rest of the SAX1 delta is training recipe (see train/sax1_*): Muon,
+# linear decay, z-loss 1e-4, wd 0.1, compute-scaled lr.
+#
+# Considered and deliberately NOT taken (2026-08-29):
+#   MoE — orthogonal to the attention line; breaks the 340M coordinate
+#     (active vs total params) and costs router/balancing infra.
+#   GQA — an inference-memory trade, not a quality upgrade: 16q/8kv frees
+#     ~25M params (~+512 ffn width if reinvested), a wash within seed
+#     noise at this scale, while breaking comparability with every
+#     published MHA 340M number. Revisit when SAX tracks inference
+#     efficiency or long context (kv_head_count is already supported).
+#   untied embeddings — would leave the 340M coordinate (~374M untied).
+
+model_name: TransformerPP
+model_args:
+  vocab_size: 32000        # mistral32k tokenizer
+  dim: 1024
+  head_dim: 64             # 16 heads, MHA
+  context_len: 2048
+  layer_count: 24
+  ffn_hidden_dim: 2816     # llama SwiGLU sizing: 8/3*dim -> multiple of 256
+  kv_head_count: null
+  rmsnorm_eps: 1.0e-6
+  rope_base: 10000
+  tie_embedding: true
+  qk_norm: true

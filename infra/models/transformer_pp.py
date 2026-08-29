@@ -20,6 +20,7 @@ class Block(nn.Module):
             ffn_hidden_dim: int | None = None,
             kv_head_count: int | None = None,
             rmsnorm_eps: float = 1e-6,
+            qk_norm: bool = False,
             *,
             rope: RoPE,
             layer_count: int | None
@@ -39,7 +40,7 @@ class Block(nn.Module):
             kv_head_count=kv_head_count,
             v_dim_mult=1,
             short_conv_size=None,
-            qk_norm=False,
+            qk_norm=qk_norm,
             rope=rope,
             init_std=0.02,
             layer_count=layer_count
@@ -105,6 +106,7 @@ class TransformerPP(nn.Module):
             rmsnorm_eps: float = 1e-6,
             rope_base: float = 10000,
             tie_embedding: bool = True,
+            qk_norm: bool = False,
         ):
         super().__init__()
 
@@ -119,6 +121,7 @@ class TransformerPP(nn.Module):
             rmsnorm_eps=rmsnorm_eps,
             rope_base=rope_base,
             tie_embedding=tie_embedding,
+            qk_norm=qk_norm,
         )
 
         # constructing the pipeline
@@ -131,6 +134,7 @@ class TransformerPP(nn.Module):
                 ffn_hidden_dim=ffn_hidden_dim,
                 kv_head_count=kv_head_count,
                 rmsnorm_eps=rmsnorm_eps,
+                qk_norm=qk_norm,
                 rope=self.rope,
                 layer_count=layer_count   # total depth for the 1/sqrt(2L)
             )                          # residual scaling, same for every layer
@@ -201,7 +205,7 @@ class TransformerPP(nn.Module):
     # training
 
     def param_groups(self) -> dict[str, list[nn.Parameter]]:
-        '''Three-way split for the Muon + AdamW pattern. 
+        '''Three-way split for the Muon + AdamW pattern.
         For plain AdamW, use muon + adamw_decay as the decay group.'''
         muon = [p for p in self.blocks.parameters() if p.requires_grad and p.dim() == 2]
         muon_ids = {id(p) for p in muon}   # `p in list` would call Tensor.__eq__
@@ -213,3 +217,26 @@ class TransformerPP(nn.Module):
             'adamw_decay': adamw_decay,
             'adamw_no_decay': adamw_no_decay,
         }
+
+    def metric_hooks(self) -> dict:
+        return {'slow': [self._metric_max_attn_logit]}
+
+    @torch.no_grad()
+    def _metric_max_attn_logit(self, ctx) -> dict:
+        '''Global max pre-softmax attention logit, probed on one sequence
+        of the trainer's most recent micro-batch (ctx.last_batch). Calls
+        submodules directly rather than Block.forward, so the probe's
+        (B=1, no_grad) shapes never touch the compiled graphs.'''
+        tokens = ctx.last_batch
+        if tokens is None:
+            return {}
+        x = self.embedding(tokens[:1])
+        worst = None
+        for blk in self.blocks:
+            assert isinstance(blk, Block)
+            h = blk.rmsnorm1(x)
+            m = blk.att.max_attn_logit(h)
+            worst = m if worst is None else torch.maximum(worst, m)
+            x = x + blk.att(h)
+            x = x + blk.ffn(blk.rmsnorm2(x))
+        return {} if worst is None else {'attn_logit_max': float(worst)}

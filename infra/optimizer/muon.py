@@ -17,22 +17,44 @@ from torch import Tensor
 from torch.optim.optimizer import Optimizer, ParamsT
 
 
-def newton_schulz(G: Tensor, steps: int = 5, eps: float = 1e-7) -> Tensor:
+# Coefficient schemes for the quintic iteration. 'jordan' is the constant
+# tuple from the reference impl (slope at 0 maximized; the bulk of the
+# spectrum lands in a ~[0.68, 1.2] band and never tightens further).
+# 'polar_express' is the minimax-optimal 5-step schedule (Amsel et al.,
+# arXiv:2505.16932, values from modded-nanogpt): ~2x closer to UV^T at
+# identical cost; its schedule length fixes the step count, and it wants
+# the 2% norm slack it was optimized under.
+_NS_SCHEMES: dict[str, tuple[list[tuple[float, float, float]], float]] = {
+    'jordan': ([(3.4445, -4.7750, 2.0315)], 0.0),  # repeated `steps` times
+    'polar_express': ([
+        (8.156554524902461, -22.48329292557795, 15.878769915207462),
+        (4.042929935166739, -2.808917465908714, 0.5000178451051316),
+        (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
+        (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
+        (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
+    ], 2e-2),
+}
+
+
+def newton_schulz(G: Tensor, steps: int = 5, eps: float = 1e-7,
+                  scheme: str = 'jordan') -> Tensor:
     '''Orthogonalize G (..., m, n) by quintic Newton-Schulz in bf16.
 
     Returns an approximation of U V^T from the SVD of G (batched over
-    leading dims). The quintic coefficients maximize convergence speed at
-    the price of the singular values only landing in ~[0.7, 1.3], which
-    is enough for Muon. bf16 throughout: the iteration is stable in low
-    precision and matmuls are the whole cost.
+    leading dims). Inexact by design: the coefficients favor slope at 0
+    (inflating small singular values fast) over exact convergence to 1,
+    which is enough for Muon. bf16 throughout: the iteration is stable in
+    low precision and matmuls are the whole cost.
     '''
-    a, b, c = 3.4445, -4.7750, 2.0315
+    coeffs, slack = _NS_SCHEMES[scheme]
+    if len(coeffs) == 1:
+        coeffs = coeffs * steps          # constant scheme: `steps` applies
     X = G.to(torch.bfloat16)
     transposed = X.size(-2) > X.size(-1)
     if transposed:                       # keep X @ X.mT the small gram matrix
         X = X.mT
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) + eps)
-    for _ in range(steps):
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * (1 + slack) + eps)
+    for a, b, c in coeffs:
         A = X @ X.mT
         X = a * X + (b * A + c * (A @ A)) @ X
     if transposed:
@@ -60,6 +82,7 @@ def muon_update(
     ns_steps: int,
     eps: float,
     lr_adjust: str = 'shape',
+    ns_coeffs: str = 'jordan',
     compile_ns: bool = False,
     world_size: int = 1,
     rank: int = 0,
@@ -100,13 +123,13 @@ def muon_update(
             if local.size(0) < chunk:
                 local = torch.cat(
                     [local, stack.new_zeros((chunk - local.size(0), *shape))])
-            local = ns(local, steps=ns_steps, eps=eps)
+            local = ns(local, steps=ns_steps, eps=eps, scheme=ns_coeffs)
             out = torch.empty((chunk * world_size, *shape),
                               dtype=local.dtype, device=device)
             dist.all_gather(list(out.chunk(world_size)), local.contiguous())
             O = out[:n]
         else:
-            O = ns(stack, steps=ns_steps, eps=eps)
+            O = ns(stack, steps=ns_steps, eps=eps, scheme=ns_coeffs)
 
         if lr_adjust == 'shape':
             # Reference impl (Jordan): unit spectral-ish norm, boosted for
@@ -136,6 +159,7 @@ class Muon(Optimizer):
         ns_steps: int = 5,
         eps: float = 1e-7,
         lr_adjust: str = 'shape',
+        ns_coeffs: str = 'jordan',
         compile_ns: bool | None = None,
         shard: bool = True,
     ) -> None:
@@ -150,9 +174,12 @@ class Muon(Optimizer):
         if lr_adjust not in ('shape', 'rms'):
             raise ValueError(f'Invalid lr_adjust: {lr_adjust!r} '
                              f"(expected 'shape' or 'rms')")
+        if ns_coeffs not in _NS_SCHEMES:
+            raise ValueError(f'Invalid ns_coeffs: {ns_coeffs!r} '
+                             f'(expected one of {sorted(_NS_SCHEMES)})')
         defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay,
                         nesterov=nesterov, ns_steps=ns_steps, eps=eps,
-                        lr_adjust=lr_adjust)
+                        lr_adjust=lr_adjust, ns_coeffs=ns_coeffs)
         super().__init__(params, defaults)
         # Machine-local execution knobs, deliberately kept out of defaults
         # (and thus out of state_dict): a checkpoint must not carry the
@@ -174,6 +201,7 @@ class Muon(Optimizer):
             group.setdefault('ns_steps', 5)
             group.setdefault('eps', 1e-7)
             group.setdefault('lr_adjust', 'shape')
+            group.setdefault('ns_coeffs', 'jordan')
 
     @torch.no_grad()
     def step(self, closure=None):  # type: ignore[override]
@@ -209,6 +237,7 @@ class Muon(Optimizer):
                     weight_decay=group['weight_decay'],
                     nesterov=group['nesterov'], ns_steps=group['ns_steps'],
                     eps=group['eps'], lr_adjust=group['lr_adjust'],
+                    ns_coeffs=group['ns_coeffs'],
                     compile_ns=self._compile_ns,
                     world_size=world_size, rank=rank)
         return loss
@@ -227,6 +256,14 @@ class MuonAdamW:
     @property
     def param_groups(self):
         return self.muon.param_groups + self.adamw.param_groups
+
+    @property
+    def state(self):
+        '''Merged per-param state view (fresh dict each access, so writes
+        to the mapping itself are lost — mutate member .state instead).
+        Lets state-inspecting metric hooks treat the composite like a
+        single optimizer.'''
+        return {**self.muon.state, **self.adamw.state}
 
     def step(self, closure=None):
         loss = None

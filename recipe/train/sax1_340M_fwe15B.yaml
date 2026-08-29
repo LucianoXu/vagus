@@ -1,0 +1,73 @@
+# SAX1-340M on FineWeb-Edu, 15B tokens — the SAX series opener.
+# Same data / token budget / batch layout as tpp_340M_fwe15B, so the loss
+# delta vs run tpp-340M-fwe15B-a0660ce7 (final 2.5417, ema 2.515) is
+# attributable to the recipe. COMPARE ON loss_ce, NOT loss: the reported
+# loss includes the z term (~5e-3 nats), logged separately as loss_z.
+#
+# Recipe delta vs the baseline (marin Aug hero run practices, issue 8435):
+# - Muon on block matrices + AdamW on embedding/vectors, one shared lr
+#   via lr_adjust 'rms' (update RMS = 0.2*lr matches AdamW's, so a single
+#   lr and schedule drive both groups; do NOT copy marin's 13/3 ratio —
+#   that converts their differently-scaled Muon parameterization).
+#   Newton-Schulz runs the polar-express schedule (arXiv:2505.16932),
+#   the SAX-wide standard — ~2x closer to UV^T than the jordan constants
+#   at identical cost.
+# - lr 1.75e-3 from marin's fitted law
+#     adam_lr = 0.087571 * tokens^-0.3461 * hidden^-0.3448 * sqrt(tpb)
+#   at (15e9, 1024, 524288); fit range d512-d2048. Stability-gated by the
+#   sax1_340M_pilot_* runs (1B tokens) before this run starts.
+# - linear decay, warmup 1%, floor 0.05 (marin shape; was cosine/0.1).
+# - z_loss 1e-4: bounds logit growth over long horizons; expect the
+#   embedding-norm growth of the baseline (114 -> 225) to flatten.
+# - weight decay 0.1 (marin/Mamba convention; baseline had 0.01).
+# - qk_norm via the model recipe.
+
+run_name: sax1-340M-fwe15B
+model_recipe: ../model/sax1_340M.yaml
+
+data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+data_shards: null          # all 20 shards (16.7B tokens); 15B => 0.9 epoch
+
+context_len: 2048
+# 4 GPUs, single node; global batch = 4 * 16 * 4 * 2048 = 0.5M tokens.
+# micro 16 fits A100-40GB with liger CE (baseline evidence); Muon's
+# optimizer state is smaller than AdamW's (1 momentum buffer vs m+v).
+world_size: 4
+batch_size: 16             # per-rank micro-batch
+grad_accum_steps: 4
+global_batch_tokens: 524288
+train_tokens: 15_000_000_000
+seed: 42
+
+optimizer_name: muon
+optimizer_args:
+  lr: 1.75e-3
+  momentum: 0.95
+  weight_decay: 0.1
+  lr_adjust: rms
+  ns_coeffs: polar_express
+  adamw:
+    lr: 1.75e-3
+    betas: [0.9, 0.95]
+    weight_decay: 0.1
+
+schedule_name: linear
+schedule_args:
+  warmup: 0.01             # 150M tokens
+  min_ratio: 0.05
+
+grad_clip: 1.0
+z_loss: 1e-4
+ce_impl: liger
+
+device: auto
+dtype: bfloat16
+compile: true
+tf32: true
+
+out_root: runs
+log_interval: 10
+slow_interval: 100
+permanent_ckpt_interval: 5000
+recent_ckpt_minutes: 30
+peak_tflops: 312           # A100 bf16 dense; only feeds the MFU metric

@@ -176,6 +176,32 @@ class SoftmaxAttention(nn.Module):
         return x
 
 
+    @torch.no_grad()
+    def max_attn_logit(self, x) -> torch.Tensor:
+        '''Max causal pre-softmax logit over the input (the health signal
+        z-loss/qk_norm exist to bound; marin dashboard item). Mirrors
+        forward()'s q/k path exactly, then materialises the (B, H, L, L)
+        score matrix — probe-sized inputs only (a sequence or two), not
+        the training batch. fp32 for an exact max.'''
+        B, L = x.shape[0], x.shape[1]
+        H, H_kv, Dh = self.head_count, self.kv_head_count, self.dim // self.head_count
+
+        qp, kp = self.wq(x), self.wk(x)
+        if self.short_conv_size is not None:
+            qp, kp = self.conv_q(qp), self.conv_k(kp)
+        q = qp.reshape(B, L, H, Dh).transpose(1, 2)
+        k = kp.reshape(B, L, H_kv, Dh).transpose(1, 2)
+        if self.qk_norm:
+            q, k = self.q_norm(q), self.k_norm(k)
+        q = self.rope(q)
+        k = self.rope(k)
+        if H_kv != H:
+            k = k.repeat_interleave(H // H_kv, dim=1)
+
+        scores = q.float() @ k.float().transpose(-1, -2) / math.sqrt(Dh)
+        causal = torch.ones(L, L, dtype=torch.bool, device=x.device).tril()
+        return scores.masked_fill(~causal, float('-inf')).amax()
+
     # for reasoning
     def reset_cache(self, batch_size: int, max_cache_len: int):
         device = infer_device(self)

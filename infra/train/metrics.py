@@ -46,17 +46,25 @@ class MetricCtx:
     # per log window
     loss: float = 0.0
     loss_ema: float | None = None
+    z_term: float | None = None      # z-loss term inside loss (None = untracked)
     lr: float = 0.0
     grad_norm: float = 0.0
     prev_grad_norm: float = 0.0
     tokens_seen: int = 0
     tokens_per_s: float = 0.0
     step_ms: float = 0.0
+    last_batch: Any = None           # most recent input ids (one rank's micro-
+                                     # batch), for probe-style slow hooks
 
 
 def metric_core(c: MetricCtx) -> dict:
     out = {'loss': c.loss, 'loss_ema': c.loss_ema, 'lr': c.lr,
            'grad_norm': c.grad_norm, 'tokens': c.tokens_seen}
+    if c.z_term is not None:
+        # 'loss' is the combined objective; only loss_ce is comparable
+        # across runs with different z_loss settings
+        out['loss_z'] = c.z_term
+        out['loss_ce'] = c.loss - c.z_term
     if c.prev_grad_norm:
         out['grad_norm_step_ratio'] = c.grad_norm / c.prev_grad_norm
     return out
@@ -87,8 +95,46 @@ def metric_param_norms(c: MetricCtx) -> dict:
     return out
 
 
+def metric_update_ratio(c: MetricCtx) -> dict:
+    '''Per-group ||update|| / ||param|| at the current lr (marin health
+    checklist; the direct check that Muon and AdamW step sizes stay
+    coordinated under one shared lr). AdamW groups are computed from the
+    optimizer state (post-step m/v ~ the next update); Muon groups use the
+    closed form of the orthogonalized update — exact up to the
+    Newton-Schulz singular spread (~[0.7, 1.3]) under lr_adjust 'rms',
+    where update RMS = 0.2*lr by construction. Weight-decay contribution
+    ignored in both.'''
+    out = {}
+    state = c.optimizer.state          # MuonAdamW: merged read-only view
+    for g in c.optimizer.param_groups:
+        lr = g['lr']
+        upd_sq = pnorm_sq = 0.0
+        for p in g['params']:
+            pnorm_sq += float(p.detach().float().pow(2).sum())
+            s = state.get(p)
+            if not s:
+                continue               # before the first step
+            if 'exp_avg' in s:         # AdamW
+                beta1, beta2 = g['betas']
+                t = float(s['step'])
+                m_hat = s['exp_avg'].float() / (1 - beta1 ** t)
+                v_hat = s['exp_avg_sq'].float() / (1 - beta2 ** t)
+                upd_sq += lr * lr * float(
+                    (m_hat / (v_hat.sqrt() + g['eps'])).pow(2).sum())
+            elif 'momentum_buffer' in s:   # Muon: analytic estimate
+                m, n = p.shape
+                if g['lr_adjust'] == 'rms':
+                    upd_sq += (0.2 * lr) ** 2 * p.numel()
+                else:                  # 'shape': ~unit spectral norm output
+                    scale = max(1.0, m / n) ** 0.5
+                    upd_sq += (lr * scale) ** 2 * min(m, n)
+        if pnorm_sq > 0 and upd_sq > 0:
+            out[f"upd_ratio/{g['name']}"] = math.sqrt(upd_sq / pnorm_sq)
+    return out
+
+
 FAST_METRICS = [metric_core, metric_throughput]
-SLOW_METRICS = [metric_param_norms]
+SLOW_METRICS = [metric_param_norms, metric_update_ratio]
 
 
 class Monitor:
@@ -100,9 +146,12 @@ class Monitor:
     enabled: pass tb_dir on the main rank alone, and a log_fn that is
     already rank-gated.
 
-    observe(step, loss, grad_norm, tokens_seen, final) expects the
+    observe(step, loss, grad_norm, tokens_seen, final, z) expects the
     per-rank mean loss of the step as a device tensor; `final` forces a
-    log event off-cadence (last step, stop signal).
+    log event off-cadence (last step, stop signal). `z` is the per-rank
+    mean z-loss term inside that loss (device tensor, or None when
+    untracked) — its presence must be uniform across ranks and steps, as
+    it changes the collective.
     '''
 
     def __init__(
@@ -143,15 +192,22 @@ class Monitor:
         self._t = time.perf_counter()
 
     def observe(self, step: int, loss: torch.Tensor, grad_norm,
-                tokens_seen: int, final: bool = False):
+                tokens_seen: int, final: bool = False,
+                z: torch.Tensor | None = None):
         if step % self.log_interval != 0 and not final:
             return
         if dist.is_available() and dist.is_initialized():
-            dist.all_reduce(loss, op=dist.ReduceOp.AVG)
+            if z is not None:          # one collective for both scalars
+                pack = torch.stack([loss, z])
+                dist.all_reduce(pack, op=dist.ReduceOp.AVG)
+                loss, z = pack[0], pack[1]
+            else:
+                dist.all_reduce(loss, op=dist.ReduceOp.AVG)
 
         c = self.ctx
         now = time.perf_counter()
         c.loss = float(loss)
+        c.z_term = float(z) if z is not None else None
         c.loss_ema = (c.loss if c.loss_ema is None
                       else 0.9 * c.loss_ema + 0.1 * c.loss)
         c.prev_grad_norm, c.grad_norm = c.grad_norm, float(grad_norm)
