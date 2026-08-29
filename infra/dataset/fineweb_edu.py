@@ -19,9 +19,11 @@ SAMPLES = ("10BT", "100BT", "350BT")
 
 
 def _default_dest() -> Path:
-    # <repo-root>/data: git-ignored; on shared-storage machines bind it
-    # by symlinking data/ to the real location. Valid under the editable
-    # install only, which is how this repo is used.
+    # <repo-root>/data: git-ignored, a real directory (since 2026-08-29
+    # data lives beside the repo, not behind a scratch-fs symlink — raven
+    # /ptmp purges cost us nothing but raw parquet, which is disposable).
+    # Valid under the editable install only, which is how this repo is
+    # used.
     return Path(__file__).resolve().parents[2] / "data" / "fineweb-edu"
 
 

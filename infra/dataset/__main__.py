@@ -22,9 +22,11 @@ def _local_sources(sample: str, count: int, out_dir: Path) -> list[Path]:
     '''
     Name-sorted source prefix for `prepare`; no network. A source whose
     shard is already in the manifest may have had its parquet deleted
-    (they are dropped after tokenization to free /ptmp) — prepare skips
-    it by name, so a placeholder path stands in for it. Only sources
-    that still need tokenizing must actually be on disk.
+    (raw parquet is disposable once tokenized — dropped to free disk;
+    on raven it stays on /ptmp while tokenized data lives in $HOME
+    since the 2026-08-29 migration) — prepare skips it by name, so a
+    placeholder path stands in for it. Only sources that still need
+    tokenizing must actually be on disk.
     '''
     dest = fineweb_edu._default_dest() / 'sample' / sample
     have = {p.name: p for p in dest.glob('*.parquet')}
