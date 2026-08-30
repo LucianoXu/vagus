@@ -1,0 +1,66 @@
+# SAX2-340M — the SAX1 recipe with the schedule swapped to WSD
+# (warmup-stable-decay). That swap IS the generation delta; the model and
+# every other knob are byte-identical to sax1_340M_fwe15B (same seed, so
+# the two runs are batch-paired and the schedule is the only variable).
+#
+# Purpose:
+# 1. Validate WSD on our stack (Muon + qk-norm + z-loss) against the
+#    linear run's 15B endpoint — the go/no-go for using WSD on the
+#    long-horizon 1.3B flagship, where its options (early cooldown,
+#    budget extension, branching) matter most.
+# 2. The stable-phase permanent checkpoints (steps 5000..20000; decay
+#    only starts at 85% = step 24318) become the trunk for future
+#    cooldown-branch experiments (anneal data mixes, lr tails,
+#    checkpoint averaging) without retraining.
+#
+# lr stays 1.75e-3: the fitted law's 15B-horizon value — the horizon did
+# not change with the schedule shape. Stable phase holds it flat; the
+# pilots' clean 3e-3 warmups say the plateau is well within margin.
+
+run_name: sax2-340M-fwe15B
+model_recipe: ../model/sax1_340M.yaml   # architecture unchanged in SAX2
+
+data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+data_shards: null
+
+context_len: 2048
+world_size: 4
+batch_size: 16
+grad_accum_steps: 4
+global_batch_tokens: 524288
+train_tokens: 15_000_000_000
+seed: 42
+
+optimizer_name: muon
+optimizer_args:
+  lr: 1.75e-3
+  momentum: 0.95
+  weight_decay: 0.1
+  lr_adjust: rms
+  ns_coeffs: polar_express
+  adamw:
+    lr: 1.75e-3
+    betas: [0.9, 0.95]
+    weight_decay: 0.1
+
+schedule_name: wsd
+schedule_args:
+  warmup: 0.01             # 150M tokens, same as SAX1
+  decay: 0.15              # linear cooldown over the last 2.25B tokens
+  min_ratio: 0.0
+
+grad_clip: 1.0
+z_loss: 1e-4
+ce_impl: liger
+
+device: auto
+dtype: bfloat16
+compile: true
+tf32: true
+
+out_root: runs
+log_interval: 10
+slow_interval: 100
+permanent_ckpt_interval: 5000
+recent_ckpt_minutes: 30
+peak_tflops: 312
