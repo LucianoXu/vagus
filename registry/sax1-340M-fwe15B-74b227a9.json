@@ -1,0 +1,57 @@
+{
+  "run": {
+    "name": "sax1-340M-fwe15B-74b227a9",
+    "purpose": "SAX series opener: Muon(polar-express) + qk-norm + z-loss + fitted-law lr at the 340M/15B benchmark coordinate — first recipe verdict vs the tpp baseline",
+    "code_commit": "74b227a9",
+    "created": "2026-08-29T21:12:20+02:00",
+    "finished": "2026-08-30T14:03:17+02:00",
+    "elapsed": "16:50:57",
+    "slurm_jobs": {
+      "completed": 29739338,
+      "lr_pilots_1B": {
+        "lr10": 29731115,
+        "lr17": 29731118,
+        "lr30": 29731123,
+        "lr45_cancelled_untrained": 29736830
+      }
+    },
+    "hardware": "1 node x 4x A100-SXM4-40GB (MPCDF Raven, partition gpu)",
+    "torch": "2.13.0+cu130"
+  },
+  "recipe": "recipe/train/sax1_340M_fwe15B.yaml at the commit — delta vs tpp baseline: muon (lr 1.75e-3 shared via lr_adjust rms, polar-express NS), linear 1%->0.05 (was cosine 3e-4/0.1), z_loss 1e-4, wd 0.1 (was 0.01), qk_norm on, micro 16 + liger CE (baseline ran micro 8 + full fp32 CE)",
+  "lr_selection": "fitted law adam_lr = 0.087571*tokens^-0.3461*hidden^-0.3448*sqrt(tpb) -> 1.75e-3 @ (15e9, 1024, 524288). 1B pilots (loss_ce tail5): lr10 2.8378, lr17 2.8037, lr30 2.7909 — monotone to 3e-3, consistent with the law's 1B optimum ~4.5e-3; 15B value kept per the law (user decision: trust the horizon exponent).",
+  "data": {
+    "dir": "/u/yinxu/work/vagus/data/tokenized/fineweb-edu-100BT-mistral32k",
+    "note": "first run on the migrated home-GPFS layout (2026-08-29, no ptmp symlinks) and first with the prefetch loader (298b37e)",
+    "source": {
+      "repo_id": "HuggingFaceFW/fineweb-edu",
+      "revision": "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9",
+      "sample": "100BT"
+    },
+    "tokenizer": {
+      "id": "mistral32k",
+      "sha256": "fc4f0bd70b3709312d9d1d9e5ba674794b6bc5abc17429897a540f93882f25fc"
+    },
+    "total_tokens": 110823555571,
+    "shards": "000_00000.npy .. 013_00009.npy (140 shards, one per source parquet; full witnessed list in the run's meta.json)"
+  },
+  "results": {
+    "steps": 28610,
+    "tokens_seen": 14999879680,
+    "final_loss": 2.4106,
+    "final_loss_ema": 2.4063,
+    "loss_tail5": 2.4016,
+    "loss_ce_tail5": 2.4007,
+    "loss_z_final": 0.0009,
+    "mean_tokens_per_s": 251885,
+    "mfu_median": 0.535,
+    "max_mem_gb": 40.1,
+    "verdict": "loss_ce 2.4007 vs tpp baseline tail5 2.5259 — -0.125 nat at matched data/order/budget; roughly a 1.7-2.5x token-equivalent advantage (exact multiplier depends on the irreducible-loss estimate). Baseline's final loss was reached by ~9B tokens mid-flight.",
+    "health": "zero instability events across 28610 steps: gnorm max 0.79 post-warmup (clip 1.0 never fired), attn_logit_max capped ~25-27 flat (qk-norm), z-term 0.015->0.0009 monotone, pnorm/embedding arc 140->434(step 8000)->314 (wd-0.1 equilibrium then decay-tracking; baseline grew monotonically 114->225), upd_ratio muon-vs-decay groups within ~15% all run (shared-lr rms design validated)."
+  },
+  "archive": {
+    "primary": "raven:/u/yinxu/work/vagus/runs/sax1-340M-fwe15B-74b227a9/ (home GPFS, backed up + 2x replicated)",
+    "contents": "ckpt-{05000,10000,15000,20000,25000,28610}.pt (full training state), recent.pt/recent-prev.pt, tb/, config.yaml, meta.json, slurm logs runs/slurm-sax1-340M-29739338.*",
+    "durable_archive": "pending (selene copy + SHA256SUMS, as done for the baseline)"
+  }
+}
