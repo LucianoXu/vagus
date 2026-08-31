@@ -1,0 +1,37 @@
+{
+  "run": {
+    "name": "sax2-340M-fwe15B-79629bc6",
+    "purpose": "SAX2 = SAX1 recipe with the schedule swapped to WSD — batch-paired vs sax1-340M-fwe15B-74b227a9 (same seed/data order, schedule is the only variable). WSD go/no-go for the 1.3B flagship; stable-phase ckpts are the cooldown-branch trunk.",
+    "code_commit": "79629bc6",
+    "created": "2026-08-30T10:53+02:00",
+    "finished": "2026-08-31T03:49:55+02:00",
+    "elapsed": "~16:57 (queue-adjacent start after pilot node freed)",
+    "slurm_jobs": { "completed": 29763834 },
+    "hardware": "1 node x 4x A100-SXM4-40GB (MPCDF Raven, partition gpu)",
+    "torch": "2.13.0+cu130"
+  },
+  "recipe": "recipe/train/sax2_340M_fwe15B.yaml at the commit — identical to sax1_340M_fwe15B except schedule: wsd (warmup 0.01, stable 84%, decay 0.15 linear to 0; sax1 ran linear 1%->0.05)",
+  "data": "same store as sax1 run (fineweb-edu-100BT-mistral32k, 140 shards, 110.8B tokens, home-GPFS layout); identical batch sequence by construction",
+  "results": {
+    "steps": 28610,
+    "tokens_seen": 14999879680,
+    "final_loss": 2.4235,
+    "final_loss_ema": 2.4209,
+    "loss_tail5": 2.416,
+    "loss_ce_tail5": 2.4153,
+    "loss_z_final": 0.0007,
+    "mean_tokens_per_s": 251829,
+    "mfu_median": 0.535,
+    "verdict": "loss_ce 2.4153 vs paired SAX1 (linear) 2.4007: WSD trails by 0.0146 nat at matched budget — a real but small cost (same-seed pairing beats seed noise), consistent with literature 'WSD ~ cosine within noise' given our short 15% decay and floor-0 tail. Decay cliff delivered 0.164 nat (2.5789 at decay start step 24318 -> 2.4153). Both runs crushed the tpp baseline (2.5259).",
+    "health": "zero instability events; gnorm max 0.83 post-warmup, attn_logit_max capped ~26 (qk-norm), z-term 0.0007 final. Plateau physics as predicted: loss sat in a 2.57-2.62 band for the whole stable phase, pnorm/embedding equilibrated ~478-481 at constant lr then fell to 423 in decay (SAX1 arc peaked 434 and fell to 314 under its earlier-starting decay); upd_ratio/no_decay drifted up ~10% over the plateau (gradient-coherence effect, lr-normalized SAX1 shows the same) and collapsed with lr->0.",
+    "trunk_asset": "stable-phase full-state ckpts 05000/10000/15000/20000 (decay only began at step 24318) — valid branch points for future cooldown experiments (anneal data mixes, lr tails, checkpoint averaging)"
+  },
+  "decision_note": "1.3B schedule choice: WSD's ~0.015 nat cost buys early-cooldown/extend/branch optionality that matters most on a multi-day run; a longer decay fraction (20%) would likely close part of the gap. Decision open at archive time.",
+  "archive": {
+    "primary": "selene:/data/vagus/runs/sax2-340M-fwe15B-79629bc6/  (SHA256SUMS inside; pushed from raven 2026-08-31)",
+    "contents": "ckpt-{05000,10000,15000,20000,25000,28610}.pt (full training state), model-final.pt (slim weights+args), tb/, config.yaml, meta.json, slurm logs",
+    "transient": [
+      "raven:/u/yinxu/work/vagus/runs/sax2-340M-fwe15B-79629bc6/ (home GPFS working copy, incl. recent*.pt)"
+    ]
+  }
+}
