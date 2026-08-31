@@ -91,11 +91,59 @@ checkpoints, so paired deltas are unaffected). NLL over positions ≥
 
 ## Runs
 
-(filled as jobs are submitted; job IDs, states and results land here)
+Constraint discovered at submit time (2026-09-01 01:07): **Raven full
+maintenance 2026-09-01 08:00 → 2026-09-07 08:00 (all nodes)**. All four
+CT arms were therefore submitted with 6h walltime to fit the remaining
+window; they checkpoint on SIGUSR1 900s before the limit and resume by
+resubmitting the same command after maintenance. Plain arms should
+finish 2B tonight (~2.5h at SAX2 throughput); unified arms cover as
+much as eager streaming throughput allows and resume after 09-07.
 
-| job | config | state |
+| job | config | notes |
 |---|---|---|
+| 29835289 | eval-frozen: SAX2 model-final, ceiling + floors + m512-evict-only, L∈{2048,4096} | out: runs/eval/frozen_sax2.json |
+| 29835293 | plain-ct2B-s43 (arm 4, gate-1-at-scale) | 6h wall |
+| 29835294 | plain-ct2B-s44 (arm 4) | 6h wall |
+| 29835295 | unified-ct2B-m512-s43 (arm 3, gate-2 pilot) | 6h wall |
+| 29835296 | unified-ct2B-m512-s44 (arm 3) | 6h wall |
+
+Deployment note: GitHub was unreachable from the workstation at
+submit time; the branch reached raven as a git bundle over SSH
+(`git bundle create ... c3436e3..unified-tier1` → fetch on raven). An
+earlier bundle accidentally shipped a pre-amend commit carrying 2.6GB
+of stignore-runs checkpoints; raven's checkout and object store were
+reset and pruned (.git back to 1.6M), and `/stignore-*` is now in
+.gitignore.
+
+## After the maintenance window (2026-09-07 08:00+)
+
+Resume any CT arm that did not reach step 3,814 (identical command
+resumes from its recent checkpoint; drop -t once the queue is normal):
+
+    cd ~/work/vagus
+    sbatch -J plain-s43 recipe/slurm/raven_managed.sbatch recipe/train/plain_ct2B_s43.yaml
+    sbatch -J plain-s44 recipe/slurm/raven_managed.sbatch recipe/train/plain_ct2B_s44.yaml
+    sbatch -J uct-s43  recipe/slurm/raven_managed.sbatch recipe/train/unified_ct2B_m512_s43.yaml
+    sbatch -J uct-s44  recipe/slurm/raven_managed.sbatch recipe/train/unified_ct2B_m512_s44.yaml
+
+Then the trained-arm evaluation (fills rows 3–4 of the matrix):
+
+    sbatch -J eval-ct recipe/slurm/raven_eval_ppl.sbatch \
+      --ckpt runs/unified-ct2B-m512-s43-02cad06b/ckpt-00003814.pt \
+      --ckpt runs/unified-ct2B-m512-s44-02cad06b/ckpt-00003814.pt \
+      --ckpt runs/plain-ct2B-s43-02cad06b/ckpt-00003814.pt \
+      --ckpt runs/plain-ct2B-s44-02cad06b/ckpt-00003814.pt \
+      --data_dir data/tokenized/fineweb-edu-100BT-mistral32k \
+      --out runs/eval/ct_arms.json
+
+Progress check: `squeue -u yinxu` and
+`tail runs/slurm-uct-s43-*.out` from `~/work/vagus` (login via `mpcdf`).
 
 ## Results
 
 (budget-PPL table lands here)
+
+- Frozen ceiling (2026-09-01, job 29835289): held-out L2048 full-cache
+  nll 2.4244 / ppl 11.30 — matches the SAX2 training endpoint (2.4235),
+  confirming the streaming full-cache path at scale (gate 0).
+  Holdout shard: 013_00009.npy (274.7M tokens).

@@ -34,7 +34,6 @@ import math
 from dataclasses import dataclass
 
 import torch
-from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from .attention import SoftmaxAttention
@@ -328,6 +327,7 @@ def stream_hidden(model, tokens: torch.Tensor, mcfg: ManageCfg,
                                  health, *ts, use_reentrant=False)
             else:
                 res = _block_cell(blk, xb, pos0, mcfg, manage, health, *ts)
+            assert res is not None   # checkpoint's stub says Optional
             xb, states[li] = res[0], LayerState.from_tensors(res[1:])
         outs.append(xb)
     return model.rms_head(torch.cat(outs, dim=1))

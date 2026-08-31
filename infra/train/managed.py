@@ -193,7 +193,7 @@ def train(config: ManagedConfig):
         net: nn.Module = StreamWrapper(model, mcfg)
     else:
         if config.compile and hasattr(model, 'compile_blocks'):
-            model.compile_blocks()
+            model.compile_blocks()  # type: ignore
         net = model
     if is_dist:
         net = DDP(net, device_ids=[device.index], output_device=device.index)
@@ -215,7 +215,7 @@ def train(config: ManagedConfig):
                       tb_dir=run_dir / 'tb' if is_main else None,
                       log_fn=log)
 
-    head_weight = unwrap(model).head.weight
+    head_weight = unwrap(model).head.weight  # type: ignore
     ce_fn = make_ce(config.ce_impl, z_loss=config.z_loss or 0.0,
                     chunk_rows=config.ce_chunk_rows,
                     compute_dtype=amp_dtype if amp_dtype is not torch.float32 else None)

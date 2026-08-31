@@ -7,8 +7,6 @@
 # Plus: managed path runs, respects budget, backprops finite grads, and
 #       the checkpointed backward matches the plain one.
 
-import math
-
 import torch
 
 from infra.components.unified import Health, ManageCfg, stream_hidden
