@@ -141,9 +141,56 @@ Progress check: `squeue -u yinxu` and
 
 ## Results
 
-(budget-PPL table lands here)
+### Frozen SAX2 (job 29835289, complete — runs/eval/frozen_sax2.json)
 
-- Frozen ceiling (2026-09-01, job 29835289): held-out L2048 full-cache
-  nll 2.4244 / ppl 11.30 — matches the SAX2 training endpoint (2.4235),
-  confirming the streaming full-cache path at scale (gate 0).
-  Holdout shard: 013_00009.npy (274.7M tokens).
+Held-out shard 013_00009.npy (274.7M tokens); NLL in nats over
+positions ≥ 256; m512e = eviction-only ablation.
+
+| cell | full | m1024 | m512 | m256 | m512e |
+|---|---|---|---|---|---|
+| L2048 | 2.4244 | 2.4347 | 2.5863 | 3.6274 | **2.4370** |
+| L4096 | 2.4591 | 2.4878 | 2.8709 | 4.7117 | **2.4398** |
+
+Findings (2026-09-01):
+
+1. **Gate 0 at scale**: full-cache streaming nll 2.4244 ≈ the SAX2
+   training endpoint 2.4235 (fresh-data regime).
+2. **The transported eviction score alone is a strong floor**: m512e
+   sits 0.013 nat above full at L2048 — quarter-cache with near-ceiling
+   quality — and at L4096 it is **below** full (2.4398 < 2.4591):
+   light eviction beats full attention beyond the trained context
+   (engram E6's compression-beats-full effect reproduced on SAX at
+   340M; short effective context also dodges RoPE extrapolation).
+3. **The P=1 pool as wired is a net harm under tight budgets**:
+   evict+demote at m512 pays +0.15 nat over evict-only, the gap more
+   than doubles at L4096 (+0.43), and the denominator-guardrail rate
+   rises with length (0.2% → 0.7% at m512; 1.9% → 4.4% at m256).
+   Interpretation: the demote score's ring ensemble is transported only
+   to the block end (Δ ≤ 32), so it cannot see RoPE decoherence of the
+   pooled linear term hundreds of positions later; high-mass atoms get
+   demoted cheaply and their P=1 extrapolation later pollutes the
+   partition function. This is the pre-registered first suspect (see
+   Deviations) and is the empirical form of engram axis-D item 7
+   (per-band gate / decoherence pricing). v2 direction: score demotion
+   against a long-horizon transported ensemble (or analytic per-band
+   decoherence), not the near ring.
+
+### Gate 1 at scale — PASSED
+
+plain-ct2B-s43, step 100: loss 2.4258 (ema 2.4241), gnorm 0.11,
+0.23 Mtok/s — clean continuation of the 2.4235 endpoint, no warmup
+spike. Plain arms complete 2B in ~2.4h (before the maintenance wall).
+
+### Unified-arm throughput (tonight's run)
+
+Eager streaming: ~95 s/step ≈ 0.0055 Mtok/s (4 GPUs at 51–71%,
+25.8/40GB — the memory model held). Tonight's 6h window yields ~0.1B
+tokens per unified arm: enough for gate 2 (loss sanity under
+management) but not 2B. Post-maintenance v2 performance pass before
+relaunching the arms: bf16 logit matmuls under autocast (the current
+fp32 einsums bypass tensor cores; bf16 logits are the training-native
+numerics — SDPA does the same), micro-batch back to 16, optionally
+torch.compile of the block cell and W=16 scoring. Target ≥ 0.05
+Mtok/s (2B ≈ 11h). Relaunch BOTH unified seeds fresh on v2 so the
+pair shares one code state; plain arms stay valid as controls
+(manage=none semantics untouched).
