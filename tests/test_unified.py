@@ -9,12 +9,10 @@
 
 import math
 
-import pytest
 import torch
 
 from infra.components.unified import Health, ManageCfg, stream_hidden
 from infra.models.transformer_pp import TransformerPP
-
 
 def tiny_model(seed=0):
     torch.manual_seed(seed)
@@ -22,14 +20,11 @@ def tiny_model(seed=0):
                          context_len=1024, layer_count=3,
                          tie_embedding=True, qk_norm=True).float().eval()
 
-
 def tokens(B=2, L=512, seed=1):
     g = torch.Generator().manual_seed(seed)
     return torch.randint(0, 512, (B, L), generator=g)
 
-
 MCFG = ManageCfg(block_len=64, budget=96, ring_window=16)
-
 
 def test_gate0_stream_equals_forward():
     model, x = tiny_model(), tokens()
@@ -44,7 +39,6 @@ def test_gate0_stream_equals_forward():
         out2 = stream_hidden(model, x, loose, manage=True)
     assert (ref - out2).abs().max().item() < 2e-4
 
-
 def test_gate1_loss_matches_stateless():
     model, x = tiny_model(), tokens()
     y = torch.roll(x, -1, dims=1)
@@ -54,7 +48,6 @@ def test_gate1_loss_matches_stateless():
         lstr = torch.nn.functional.cross_entropy(
             model.head(stream_hidden(model, x, MCFG, manage=False)).transpose(1, 2), y)
     assert abs(lref.item() - lstr.item()) < 1e-4
-
 
 def test_managed_run_and_budget():
     model, x = tiny_model(), tokens()
@@ -66,14 +59,12 @@ def test_managed_run_and_budget():
     d = h.as_dict()
     assert d.get('unified_z_fallback', 0.0) < 0.05, d
 
-
 def test_managed_deterministic():
     model, x = tiny_model(), tokens()
     with torch.no_grad():
         a = stream_hidden(model, x, MCFG, manage=True)
         b = stream_hidden(model, x, MCFG, manage=True)
     assert torch.equal(a, b)
-
 
 def test_backward_finite_and_checkpoint_matches():
     model, x = tiny_model(), tokens(B=1, L=256)
@@ -97,7 +88,6 @@ def test_backward_finite_and_checkpoint_matches():
     assert abs(l0 - l1) < 1e-5
     assert (g0 - g1).abs().max().item() < 1e-4, 'checkpointed grads diverge'
     assert g0.abs().max().item() > 0
-
 
 def test_demotion_engages_pool():
     model, x = tiny_model(), tokens()
