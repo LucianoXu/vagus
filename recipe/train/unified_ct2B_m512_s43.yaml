@@ -1,0 +1,65 @@
+# Tier-1 arm 3: management-aware continued pretraining, seed 43.
+# From the SAX2 15B endpoint, 2B tokens with the unified block active
+# (block streaming, budget 512 atoms/head, evict + demote-to-P=1-pool,
+# hard selection / differentiable state). Paired control = plain_ct2B_s43
+# (identical everything, manage: none). Batch geometry 8x8 (not SAX2's
+# 16x4) keeps the streaming state within a 40GB A100; both arms use the
+# same geometry so the window->step mapping stays identical.
+# lr: continued-pretraining convention, 10% of pretrain peak, short
+# warmup, linear cooldown over the last 20%.
+
+run_name: unified-ct2B-m512-s43
+model_recipe: ../model/sax1_340M.yaml
+
+init_ckpt: runs/sax2-340M-fwe15B-79629bc6/ckpt-00028610.pt
+manage: unified
+block_len: 256
+budget: 512
+ring_window: 32
+demote: true
+holdout_last_shard: true
+
+data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+data_shards: null
+
+context_len: 2048
+world_size: 4
+batch_size: 8
+grad_accum_steps: 8
+global_batch_tokens: 524288
+train_tokens: 2_000_000_000
+seed: 43
+
+optimizer_name: muon
+optimizer_args:
+  lr: 1.75e-4
+  momentum: 0.95
+  weight_decay: 0.1
+  lr_adjust: rms
+  ns_coeffs: polar_express
+  adamw:
+    lr: 1.75e-4
+    betas: [0.9, 0.95]
+    weight_decay: 0.1
+
+schedule_name: wsd
+schedule_args:
+  warmup: 0.02
+  decay: 0.2
+  min_ratio: 0.0
+
+grad_clip: 1.0
+z_loss: 1e-4
+ce_impl: liger
+
+device: auto
+dtype: bfloat16
+compile: false          # streaming path is eager
+tf32: true
+
+out_root: runs
+log_interval: 10
+slow_interval: 100
+permanent_ckpt_interval: 2000
+recent_ckpt_minutes: 30
+peak_tflops: 312
