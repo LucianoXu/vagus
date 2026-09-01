@@ -407,3 +407,31 @@ merged on raven; they will load commit ≥ 0a9804f at start. Their
 recipes leave `pool_gate` at the default `static`, whose code path v3
 does not touch — training semantics are bit-identical to dae0f07;
 only the run-dir commit hash differs.
+
+---
+
+## Parallel tracks (2026-09-01, coordinator-approved ladder)
+
+Iron rule in force: uct v2 arms (29852392/93) and their monitoring
+untouched; everything below runs beside them.
+
+- **Track A (this repo)**: v3 stepped gate — section above; A/B job
+  29853967.
+- **Track B (engram)**: E2″(d) estimator dimension — extended
+  `kvbm/e2pp_capacity.py` (the pre-existing untracked file; nothing
+  else in the frozen kvbm layout touched): write-only projected-P=1
+  Hebbian moment readout vs ridge-at-d per q-head (`delta_price`),
+  key-collision mass portrait, per-tercile concentration check
+  against §7′(c″)(ii)'s prediction. Decision rule recorded in the
+  file header: delta implementation only after a substantial measured
+  gap, and always with mass column + denominator. llama32-1b fit-only
+  job 29854049 (captures reused, sbatch --wrap — no new file in the
+  frozen slurm/ dir). engram's EXPERIMENTS.md carries uncommitted
+  human edits, so the design note lives in the module docstring for
+  now rather than the design doc.
+- **Queued (fires after the uct arms land, per coordinator/user)**:
+  training-time re-profiling — recompute D_h(m) on the uct
+  checkpoints (training-free), waterfill the per-head profile, add a
+  "uct+alloc" row vs frozen+alloc / plain+alloc, and compare the
+  pre/post spectrum shape (unimodal kept vs moved — §7′(g)'s free
+  verdict).
