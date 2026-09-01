@@ -564,3 +564,44 @@ measure; exactly the failure class a lone implementation cannot see
   null must re-stand on corrected pricing or be re-verdicted),
   **v4** A/B 29855757. v2→v2.1 diff (demote rate, guardrail rate,
   per-budget deficits) lands here when 29855755 completes.
+
+### v2→v2.1 diff (corrected V; job 29855755) — all v2 conclusions stand
+
+| cell | v2 | v2.1 | evict-only | deficit v2→v2.1 |
+|---|---|---|---|---|
+| L2048 m256 | 2.4902 | 2.4939 | 2.4508 | +0.039→+0.043 |
+| L2048 m512 | 2.4472 | 2.4458 | 2.4370 | +0.010→+0.009 |
+| L2048 m1024 | 2.4277 | 2.4273 | 2.4270 | +0.001→+0.000 |
+| L4096 m256 | 2.5596 | 2.5686 | 2.4527 | +0.107→+0.116 |
+| L4096 m512 | 2.4742 | 2.4663 | 2.4398 | +0.034→+0.027 |
+| L4096 m1024 | 2.4371 | 2.4367 | 2.4328 | +0.004→+0.004 |
+
+Corrected pricing demotes ~70% MORE (m512/L2048: 5.1M→8.6M atoms —
+the broken V was inflated, overpricing demotion), guardrail rates
+slightly lower, PPL within ±0.009 of v2 everywhere. **The pool's
+neutral-to-negative per-budget verdict, the monotone tightness
+structure, and the no-crossover conclusion are robust to the pricing
+bias**; the bug mainly mispriced which atoms demote, not the outcome.
+
+### v3.1 re-verdict (job 29855756): the tie degrades to mild net harm
+
+On corrected pricing the stepped gate is consistently slightly worse
+than static: +0.006 (m512, both lengths) to +0.019 (m256/L4096), tie
+only at m1024. The v3 "ties v2" verdict is superseded: **static
+strictly ≥ stepped at every cell; static stays default with stronger
+evidence** ((a′)'s age-independent coherence modulus again).
+
+### v4 verdict (job 29855757): whitened slopes as implemented are a net harm — reverted to hebbian default
+
+Deficits blow up at tight budgets: m256 +0.17 (L2048) / +0.49
+(L4096), m512 +0.039/+0.105; pool magnitudes 10× (t1_max 11M→159M at
+m512/L4096), guardrail up to 0.93%. Diagnosis: τ(G+ετI)⁻¹ amplifies
+the damped-key Gram's small-eigenvalue directions; symmetric
+slope-whitening inside the fixed-constant ratio readout is NOT the
+RLS fixed point the op-point measurement priced (there: per-sequence
+fitted affine map with intercept). The measurement-level green light
+stands (dp_op 0.26–0.30), but the write-side form needs a derived
+normalized-RLS variant — a theory-side item (fits the (c″)(ii)
+revision the coordinator is drafting), not an engineering retry; the
+ε-regularization knob is the obvious sensitivity to check if pursued.
+`pool_write: delta` stays in-tree, default hebbian.
