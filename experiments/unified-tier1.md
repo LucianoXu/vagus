@@ -715,3 +715,78 @@ on the block step (main fix, attacks the launch storm); (ii) cache
 the constant Gp/Gm/phase band matrices in measure_stats; (iii)
 `manage_every` lever (in-tree) now justified by the 65% scoring
 share; block_len 512 variant next. Target ≥0.1 Mtok/s.
+
+---
+
+## Byte-fair deep grid + the frozen D(R) leg (jobs 29859778/29859829)
+
+Motivation (user conjecture): managed softmax should hold full-level
+PPL within a few multiples of the native linear-state bytes; M_eq=32
+≈ one d² pool's bytes (d=64: pool = 4225 numbers ≈ 33 atoms of 129).
+Byte accounting: evict-only atoms = M_eq; triage atoms = M_eq − 33
+(pool fixed cost). m0 = the pure-pool + current-block endpoint (the
+frozen training-free linearization point).
+
+| M_eq (bytes/129) | evict-only L2048/L4096 | triage v2.1 L2048/L4096 |
+|---|---|---|
+| 128 | 2.4669 / 2.4692 | 2.6697 / 2.9525 |
+| 64 | 2.4835 / 2.4861 | 3.0350 / 3.6453 |
+| 48 | 2.4904 / 2.4933 | 3.3382 / 4.1736 |
+| 32 | 2.5010 / 2.5050 | **4.2058 / 5.1699** (pure pool) |
+| (full) | 2.4244 / 2.4591 | — |
+
+**Criterion 1 (demote share rises as M_eq falls): CONFIRMED.**
+16.6% (m256) → 23.0% (m95) → 27.0% → 28.4% → 29.0% (m0) — λ crosses
+the bounded demote price exactly as the mechanism predicts.
+**Criterion 2 (triage overtakes at depth): REFUTED, inverted.** The
+byte-fair gap grows monotonically with depth (+0.20 → +0.55 → +0.85 →
++1.70 nat at L2048; worse at L4096). Mechanism visible in the
+forensics: at deep budgets high-mass atoms are FORCED out (top raw
+write weights reach 1.3e8 at m0 — sinks entering the P=1 pool), the
+guardrail climbs to 3.3%/7.1%, and the per-atom prices cannot see the
+collective pool loading (the unpriced spread/interference gap again).
+
+**Headline of the frozen D(R) leg**: the evict-only curve is nearly
+FLAT into the linear-state byte region — at 32 atoms (≈1× linear
+state bytes) it sits only +0.077/+0.046 nat above FULL attention.
+The user's conjecture holds — via eviction alone; the current pool
+adds no byte savings at any point on the curve, and the training-free
+linearization endpoint is poor (ppl 67/176). Sketch (L2048; T =
+triage, E = evict-only, x = atom-equivalent bytes):
+
+```
+NLL
+4.2 |T
+3.3 |   T
+3.0 |     T
+2.67|        T
+2.50|E
+2.49|   E  E
+2.47|        E     E......E
+2.44|_______________________________ full
+    +--32-48-64--95/128--256--512---> bytes/129 (triage +33 included)
+```
+
+Stage-3 pure-linear / hybrid points land on these axes later; that
+completes the money figure.
+
+## Throughput sprint: current table (340M, A100-40GB, per-GPU Mtok/s)
+
+| config | Mtok/s/GPU | agg ×4 | 2B wall |
+|---|---|---|---|
+| eager + ckpt, micro8, block256 (v2.2 baseline) | 0.0033 | 0.013 | ~28h |
+| compile + no-ckpt, micro4, block256 | 0.0042 | 0.017 | ~22h |
+| **compile + no-ckpt, micro4, block512** | **0.0119** | **0.048** | **~11.6h** |
+
+Fixes that got here: padded fixed-capacity slot state (scatter reuse,
+static shapes), rope-table hoist (per-cell .item() graph breaks),
+band-matrix caching, python-side r bookkeeping. Blockers logged:
+compile × non-reentrant checkpoint fails recompute metadata
+validation (so compile runs no-ckpt at micro4); manage_every=2 and
+micro8 no-ckpt variants OOM at 40GB. **Status vs acceptance: single
+24h segment achieved (11.6h at block512); the ≥0.1 agg target needs
+one more ~2×** — candidates: manage_every=2 with ckpt-compatible
+compile (selective checkpointing of the readout only), scoring-path
+fusion (65% of CUDA time), micro8 via selective ckpt. Acceptance
+tests in-tree: compiled-vs-eager ≤5e-4 + gate-1 under compile +
+17-test suite green.
