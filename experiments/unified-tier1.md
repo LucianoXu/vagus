@@ -104,8 +104,8 @@ much as eager streaming throughput allows and resume after 09-07.
 | 29835289 | eval-frozen: SAX2 model-final, ceiling + floors + m512e, L∈{2048,4096} | COMPLETED 7m26s → runs/eval/frozen_sax2.json (copy: stignore-runs/eval/) |
 | 29835293 | plain-ct2B-s43 (arm 4) | COMPLETED 2h27m, 2.000B, final loss 2.3765 (ema 2.3999), ckpt-00003814.pt |
 | 29835294 | plain-ct2B-s44 (arm 4) | COMPLETED 2h27m, 2.000B, final loss 2.4310 (ema 2.3962), ckpt-00003814.pt |
-| 29835295 | unified-ct2B-m512-s43 (arm 3 pilot) | pilot-only: gate-2 verdict below; walltime-checkpoints ~06:45, **do not resume** (v2 relaunch) |
-| 29835296 | unified-ct2B-m512-s44 (arm 3 pilot) | same |
+| 29835295 | unified-ct2B-m512-s43 (arm 3 pilot) | FAILED at maintenance wall (5h44); **gate 2 not passed — chronic divergence** (loss 2.60@100 → 3.27@500, gnorm →2.6e16); weights polluted, archived, never resume |
+| 29835296 | unified-ct2B-m512-s44 (arm 3 pilot) | same (FAILED 5h44) |
 | 29840076 | eval-plainct: both arm-4 ckpts, same 10 cells | COMPLETED → runs/eval/plain_ct.json (copy: stignore-runs/eval/) |
 
 Deployment note: GitHub was unreachable from the workstation at
@@ -197,27 +197,52 @@ plain-ct2B-s43, step 100: loss 2.4258 (ema 2.4241), gnorm 0.11,
 0.23 Mtok/s — clean continuation of the 2.4235 endpoint, no warmup
 spike. Plain arms complete 2B in ~2.4h (before the maintenance wall).
 
-### Gate 2 — pilot verdict: stable loss, pathological gradients
+### Gate 2 — FAILED: chronic divergence (corrected 2026-09-01)
 
-Both unified arms at step 100 (02:07): loss s43 2.5964 (ema 2.5698),
-s44 2.5466 (ema 2.5664) — finite, non-diverging, sitting ≈0.15 nat
-above the plain arm at the same step (2.4258), i.e. exactly the frozen
-m512 management gap before any adaptation. Formally gate 2 passes
-(no divergence). BUT: **gnorm ~1.6e14 / 5.0e13** (plain arm: 0.11).
+The original verdict ("stable loss, formally passes") was wrong — it
+read a single point (step 100). The full trajectory of uct-s43:
+loss 2.5964 (step 100, gnorm 1.6e14) → **3.2713 (step 500, gnorm
+2.6e16)** — a monotone climb with growing gradient norms. Mechanism:
+the rms-normalized optimizer + grad_clip=1.0 turn 1e14-scale garbage
+gradients into a bounded-step **noise walk** — nothing explodes, but
+every step drags the weights away from the checkpoint. Gate 2 is
+recorded as **not passed (chronic divergence)**; both pilot arms ended
+FAILED at the maintenance wall (05:44 elapsed) and their weights are
+noise-polluted at every step. gnorm at the same step on the plain arm:
+0.11.
 Root cause (same disease as the PPL finding, backward face): demoted
 high-mean-logit atoms (sinks) enter the pool with weight
 w = c·e^a ~ e^25; gradients through the pool moments back into k/v
 carry the unbalanced factor e^(a − M_t) whenever the atom's absorbed
 logit scale a exceeds the readout-time alive max M_t. grad_clip=1.0
 keeps the run alive but the clipped update direction is dominated by
-this garbage — closed-loop adaptation signal is drowned. Verdict:
-tonight's unified segments are **pilot-only and will not be resumed**;
-v2 relaunches both seeds fresh. The principled fix is the same one the
-PPL result demands — price demotion on a long-horizon transported
-ensemble, which makes sinks expensive to demote and keeps e^a inside
-the pool bounded relative to the live partition function — plus a
-numerical belt (bound pooled weights relative to a running Z̄, or
-log-domain pool accumulators).
+this garbage — closed-loop adaptation signal is drowned and the
+weights walk away from the init (corrected verdict above). Tonight's
+unified segments are **pilot-only and must not be resumed**; v2
+relaunches both seeds fresh (implemented 2026-09-01 as §6(a′)/5′-7/5′-8,
+commit dbcc5fe).
+
+**uct v2 restart plan** (hold until the frozen-v2 verdict is in):
+
+1. **gnorm hard gate**: at step 100 the v2 unified arm's gnorm must be
+   within 10× of the plain arm's (0.11 → gate at ≤ 1.1); otherwise
+   stop immediately — a second amplifier exists beyond the pricing fix.
+2. **stop-grad on the statistics**: (m_q, Σ_q, σ_j, γ_b, Z̄) are
+   environment estimates, not model outputs — all detached; gradients
+   flow only through the readout path and (if any) softened decisions.
+   Status in the v2 code: already structural — `_measure_stats` and
+   `_manage` run under `@torch.no_grad()`, the ring is detached at
+   capture, and the write uses detached (μ, σ²) with gradients only
+   through (c, k, v) — keep this as an asserted invariant at restart.
+3. **init_ckpt = the SAX2 origin** (ckpt-00028610), never the pilot
+   weights (every pilot step is noise-polluted). Mechanically
+   guaranteed: run dirs are keyed by code commit (a v2 launch creates
+   `unified-ct2B-m512-s4x-<v2commit>` and starts fresh from
+   init_ckpt); the pilot dirs are archived under
+   `runs/archive-pilot-v1/` to make accidental resume impossible.
+   Add at restart: per-step guardrail-rate logging and a gnorm
+   decomposition (pool-write path vs atom path) so a recurrence is
+   locatable at a glance.
 
 ### Unified-arm throughput (tonight's run)
 
