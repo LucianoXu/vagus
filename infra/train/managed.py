@@ -63,6 +63,7 @@ class ManagedConfig(TrainConfig):
     lam: float = 1.0 / 1024      # v2 position-measure discount rate
     pool_gate: str = 'static'    # 'static' (v2) | 'stepped' (v3 per-band gate)
     pool_write: str = 'hebbian'  # 'hebbian' | 'delta' (v4 whitened slopes)
+    pool_norm: str = 'ledger'    # v2.2 write normalization ('ledger' | 'off')
     slope_eps: float = 1e-3      # v2 P0/P1 slope-degeneracy threshold
     # kill condition (uct v2 restart plan item 1): if set, the pre-clip
     # grad norm at step 100 must be <= this, else checkpoint + exit(3)
@@ -204,7 +205,8 @@ def train(config: ManagedConfig):
                      ring_window=config.ring_window, demote=config.demote,
                      lam=config.lam, slope_eps=config.slope_eps,
                      pool_gate=config.pool_gate,
-                     pool_write=config.pool_write)
+                     pool_write=config.pool_write,
+                     pool_norm=config.pool_norm)
     if config.manage == 'triage':
         net: nn.Module = StreamWrapper(model, mcfg)
     else:
@@ -282,9 +284,13 @@ def train(config: ManagedConfig):
                             final=stop or step == steps_total)
             if config.gnorm_gate is not None and step == 100 \
                     and float(grad_norm) > config.gnorm_gate:
+                w = unwrap(net)
+                forensics = (w.health.as_dict()
+                             if isinstance(w, StreamWrapper) else {})
                 log(f'GNORM GATE FAILED: {float(grad_norm):.4g} > '
                     f'{config.gnorm_gate} at step 100 — a second amplifier '
-                    f'exists; stopping (uct v2 restart plan item 1)')
+                    f'exists; stopping (uct v2 restart plan item 1) | '
+                    f'forensics: {forensics}')
                 if is_main:
                     save_checkpoint(run_dir, 'recent', step, tokens_seen,
                                     model, optimizer, loader, config)

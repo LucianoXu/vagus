@@ -639,3 +639,30 @@ gradient. Candidate structural fixes, for decision (not applied):
 Instrumentation note for the next restart: the health signature line
 prints after the gate check, so the forensic pool_w_max readout never
 lands on a gate kill — move the health dump into the gate message.
+
+### v2.2 write-normalized pool (approved fix (a); commit below)
+
+Decision rationale (coordinator, 2026-09-01): (a) approved; (b)
+rejected — detaching the pool severs the closed-loop signal the uct
+hypothesis exists to test; (c) rejected as a hack. Implementation:
+pool moments stored scaled by exp(−b), readout pool factor
+exp(−M + b) — the forward is **exactly invariant for any b** (ratio
+readout + detached scales), asserted by
+`test_ledger_normalization_forward_invariant` (≤2e-5, float
+reordering only). **Honest mechanism note**: since all scales are
+detached, the analytic gradient is unchanged by this
+reparameterization; what (a) changes is *numerical conditioning* —
+pool intermediates drop from e^{μ+σ²/2}-scale (up to ~2.4e5 observed)
+to O(1), so bf16/fp32 rounding noise in the pool-path products stops
+masquerading as gradient. This matches the gate portrait (spiky,
+1000× seed spread). The gate remains the arbiter.
+
+Z̄ convention (recorded per instruction): per-kv-head, stop-grad,
+EMA over management steps with α = 0.1/step (~10 blocks ≈ 2.5k-token
+time constant), initialized at the first write from the same
+`logZbar` (ring-mean log partition) the 5′-3 scoring ledger uses;
+state is per-window (LayerState lifetime), so the ledger re-forms
+each training window. Forensics: `unified_top_writes` (top-8 raw
+write weights) added to health and folded into the GNORM GATE
+message, so a gate kill now lands the signature. Discipline
+unchanged: gate ≤1.1 at step 100, origin init, both seeds.

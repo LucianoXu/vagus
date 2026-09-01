@@ -254,8 +254,8 @@ def test_measure_stats_matches_numeric_integration():
                     logc=z(B, H, T), alive=torch.ones(B, H, T, dtype=torch.bool),
                     pos=torch.arange(T), t0=z(B, H), t1=z(B, H, Dh),
                     T0=z(B, H, Dh), T1=z(B, H, Dh, Dh),
-                    Gk=z(B, H, Dh, Dh), ring_q=ring_q.float(),
-                    ring_pos=ring_pos)
+                    Gk=z(B, H, Dh, Dh), logzbar=z(B, H),
+                    ring_q=ring_q.float(), ring_pos=ring_pos)
     mu_mod, var_c, V_mod, cap = _measure_stats(rope, st, t_dec, lam)
 
     # independent numeric integration over s ~ Exp(lam)
@@ -279,3 +279,35 @@ def test_measure_stats_matches_numeric_integration():
           'rel_V per-atom', [round(float(x), 4) for x in rel_V])
     assert float(rel_mu.max()) < 0.02, f'mu off: {rel_mu}'
     assert float(rel_V.max()) < 0.02, f'V off: {rel_V}'
+
+
+# ---- v2.2 write-normalization checks ----
+
+def test_ledger_normalization_forward_invariant():
+    '''The ledger reparameterization (pool stored / e^b, readout factor
+    e^{-M+b}, per-kv-head EMA b) must leave the managed forward exactly
+    invariant — tolerance covers only float reordering.'''
+    model, x = tiny_model(), tokens()
+    kw = dict(block_len=64, budget=64, ring_window=16, demote=True)
+    with torch.no_grad():
+        a = stream_hidden(model, x, ManageCfg(**kw, pool_norm='off'),
+                          manage=True)
+        b = stream_hidden(model, x, ManageCfg(**kw, pool_norm='ledger'),
+                          manage=True)
+    diff = (a - b).abs().max().item()
+    assert diff < 2e-5, f'ledger reparameterization changed the forward: {diff}'
+
+
+def test_ledger_keeps_pool_intermediates_small():
+    '''Conditioning claim: with the ledger on, the stored pool write
+    weights are O(1)-ish rather than e^{mu+sigma^2/2}-scaled.'''
+    model, x = tiny_model(), tokens()
+    kw = dict(block_len=64, budget=64, ring_window=16, demote=True)
+    h_off, h_on = Health(), Health()
+    with torch.no_grad():
+        stream_hidden(model, x, ManageCfg(**kw, pool_norm='off'),
+                      manage=True, health=h_off)
+        stream_hidden(model, x, ManageCfg(**kw, pool_norm='ledger'),
+                      manage=True, health=h_on)
+    assert h_on.pool_t1_max < h_off.pool_t1_max * 0.5 or \
+        h_off.pool_t1_max < 10, (h_on.pool_t1_max, h_off.pool_t1_max)
