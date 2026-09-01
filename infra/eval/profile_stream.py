@@ -39,6 +39,10 @@ def main():
                     help='timing-only mode: no profiler, wall-clock Mtok/s')
     ap.add_argument('--compile', action='store_true')
     ap.add_argument('--manage_every', type=int, default=1)
+    ap.add_argument('--no_ckpt', action='store_true',
+                    help='disable activation checkpointing (needed with '
+                         '--compile: non-reentrant checkpoint fails metadata '
+                         'validation on compiled recompute)')
     args = ap.parse_args()
 
     device = torch.device('cuda')
@@ -61,7 +65,8 @@ def main():
             p.grad = None
         with torch.autocast('cuda', dtype=torch.bfloat16):
             h = stream_hidden(model, x, mcfg, manage=True,
-                              use_checkpoint=True, health=Health())
+                              use_checkpoint=not args.no_ckpt,
+                              health=Health())
             loss = torch.nn.functional.cross_entropy(
                 model.head(h).float().transpose(1, 2), y)
         loss.backward()
@@ -79,7 +84,7 @@ def main():
         torch.cuda.synchronize()
         dt = time.perf_counter() - t0
         n_tok = args.steps * args.batch * args.seq
-        print(f'BENCH block={args.block} budget={args.budget} '
+        print(f'BENCH block={args.block} budget={args.budget} ckpt={not args.no_ckpt} '
               f'manage_every={args.manage_every} compile={args.compile} '
               f'micro={args.batch}: {n_tok} tok / {dt:.2f}s = '
               f'{n_tok/dt/1e6:.4f} Mtok/s per GPU '
