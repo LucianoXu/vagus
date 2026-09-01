@@ -230,3 +230,52 @@ def test_delta_mode_runs_and_differs():
                           manage=True)
     assert torch.isfinite(b).all()
     assert not torch.equal(a, b), 'delta switch has no effect'
+
+
+# ---- upstream regression (engram triage-port cross-check, 2026-09-01):
+# Gm orientation in _measure_stats. mu and V must match direct numerical
+# integration of the offset measure; the transposed Gm is also real and
+# passes symmetry intuition but biases V by tens of percent.
+
+def test_measure_stats_matches_numeric_integration():
+    import math as _m
+    from infra.components.unified import (LayerState, _measure_stats,
+                                          _as_complex, _band_freqs)
+    from infra.components.pos_embed import RoPE
+    torch.manual_seed(5)
+    B, H, T, Dh, W = 1, 1, 5, 16, 8
+    rope = RoPE(Dh * 4, Dh, 4096)
+    lam, t_dec = 1.0 / 256, 700
+    k = torch.randn(B, H, T, Dh)
+    ring_q = torch.randn(B, H, W, Dh)
+    ring_pos = torch.arange(t_dec - W, t_dec)
+    z = lambda *s, dt=torch.float32: torch.zeros(*s, dtype=dt)
+    st = LayerState(k=k, v=torch.randn(B, H, T, Dh),
+                    logc=z(B, H, T), alive=torch.ones(B, H, T, dtype=torch.bool),
+                    pos=torch.arange(T), t0=z(B, H), t1=z(B, H, Dh),
+                    T0=z(B, H, Dh), T1=z(B, H, Dh, Dh),
+                    Gk=z(B, H, Dh, Dh), ring_q=ring_q.float(),
+                    ring_pos=ring_pos)
+    mu_mod, var_c, V_mod, cap = _measure_stats(rope, st, t_dec, lam)
+
+    # independent numeric integration over s ~ Exp(lam)
+    from infra.components.unified import _unrotate_ring
+    u = _unrotate_ring(rope, st.ring_q, st.ring_pos)
+    m = u.mean(dim=2)[0, 0].to(torch.complex128)          # (nb,)
+    zc = _as_complex(k)[0, 0].to(torch.complex128)        # (T, nb)
+    omega = _band_freqs(rope, 'cpu')                      # (nb,) f64
+    beta = 1.0 / _m.sqrt(Dh)
+    s_grid = torch.linspace(0, 24 / lam, 200_001, dtype=torch.float64)
+    w = lam * torch.exp(-lam * s_grid)
+    w = w / torch.trapz(w, s_grid)
+    phase = torch.exp(-1j * omega[None, :] * (t_dec + s_grid)[:, None])
+    mu_s = beta * (m.conj()[None, None, :] * zc[:, None, :]
+                   * phase[None, :, :]).sum(-1).real      # (T, S)
+    mu_num = torch.trapz(mu_s * w, s_grid, dim=-1)
+    V_num = torch.trapz(mu_s.pow(2) * w, s_grid, dim=-1) - mu_num.pow(2)
+    rel_mu = (mu_mod[0, 0].double() - mu_num).abs() / mu_num.abs().clamp_min(1e-9)
+    rel_V = (V_mod[0, 0].double() - V_num).abs() / V_num.clamp_min(1e-12)
+    print('rel_mu max', float(rel_mu.max()), 'rel_V max', float(rel_V.max()),
+          'rel_V per-atom', [round(float(x), 4) for x in rel_V])
+    assert float(rel_mu.max()) < 0.02, f'mu off: {rel_mu}'
+    assert float(rel_V.max()) < 0.02, f'V off: {rel_V}'

@@ -252,7 +252,12 @@ def _measure_stats(rope: RoPE, st: LayerState, t_dec: int, lam: float):
     mu = beta * torch.einsum('bhtn,n->bht', C, gc).real
 
     om = omega.unsqueeze(0)
-    Gm = _coherence(lam, om - om.T).to(torch.complex64)   # g(w_b - w_b')
+    # Orientation matters (engram triage-port cross-check, 2026-09-01):
+    # entry [b, b'] must be g(w_b - w_b') so the bilinear form sums
+    # C_b conj(C_b') g(w_b - w_b'). The transposed variant is also real
+    # and passes symmetry intuition, but biases V by tens of percent
+    # (regression: test_measure_stats_matches_numeric_integration).
+    Gm = _coherence(lam, om.T - om).to(torch.complex64)   # g(w_b - w_b')
     Gp = _coherence(lam, om + om.T).to(torch.complex64)   # g(w_b + w_b')
     e2 = 0.5 * beta ** 2 * (
         torch.einsum('bhtn,nm,bhtm->bht', C, Gp, C)
