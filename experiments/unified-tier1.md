@@ -371,3 +371,39 @@ forward signature of the v1 amplifier — the strict pool-path/atom-path
 gnorm split is deferred (checkpointed recompute makes retain_grad
 unreliable); the gate plus these signatures cover recurrence
 localization.
+
+---
+
+## Track A: v3 stepped per-band gate (2026-09-01, commit 0a9804f; job 29853967)
+
+v3 = v2 with the pool's phase-carrying moments aged **per streaming
+block** instead of damped once at write: t1/T1 ×= exp(−λ_b·block_len)
+each block, λ_b = λ_q·ln(1/γ_b) with λ_q = 1/1024 and γ_b the
+Lorentzian coherence — cumulative decay equals v2's static damping at
+the mean query horizon 1/λ_q. t0/T0 and the P=0 tier never decay
+(constants carry no phase; a content-drift gate is a separate knob,
+off). Write-side projection mass factor e^{σ²/2} retained. The two
+modes are a config-exclusive switch (`pool_gate: static|stepped`);
+the static branch is the untouched v2 code path (the pre-existing
+test suite is its regression guard). Tests: decay semigroup
+(half∘half = full), horizon calibration (decay(1/λ) = γ_b),
+empty-pool mode equality (the eonly sanity), switch liveness — 11/11.
+
+**Honest annotation (recorded as instructed): this is a hypothesis
+test, not a guaranteed win.** Under the (a′) position measure the
+coherence modulus is age-independent — static damping is already the
+L² answer for that measure; age-based decay instead tests (c″)(iv)'s
+measured-decoherence reading (older pooled content should address
+less). Criterion: the pool-vs-evict-only deficit, especially whether
+the L2048→L4096 deficit slope (+0.010→+0.034 under v2 at m512)
+flattens. Either outcome is informative.
+
+A/B: job 29853967, frozen line, all 11 cells, `--pool_gate stepped`
+→ runs/eval/frozen_sax2_v3.json; the m512e column must be
+bit-identical to v2 (eviction never touches the pool).
+
+Iron-rule note: uct v2 arms (29852392/93) were still queued when v3
+merged on raven; they will load commit ≥ 0a9804f at start. Their
+recipes leave `pool_gate` at the default `static`, whose code path v3
+does not touch — training semantics are bit-identical to dae0f07;
+only the run-dir commit hash differs.
