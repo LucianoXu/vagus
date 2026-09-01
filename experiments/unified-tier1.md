@@ -435,3 +435,28 @@ untouched; everything below runs beside them.
   "uct+alloc" row vs frozen+alloc / plain+alloc, and compare the
   pre/post spectrum shape (unimodal kept vs moved — §7′(g)'s free
   verdict).
+
+### Track A verdict: v3 ≈ v2 — age-based decay adds nothing at these lengths
+
+Frozen A/B (job 29853967, runs/eval/frozen_sax2_v3.json; v3−v2 in nats):
+
+| cell | v2 | v3 | Δ |
+|---|---|---|---|
+| L2048 m256 / m512 / m1024 | 2.4902 / 2.4472 / 2.4277 | 2.4939 / 2.4495 / 2.4275 | +0.004 / +0.002 / −0.000 |
+| L4096 m256 / m512 / m1024 | 2.5596 / 2.4742 / 2.4371 | 2.5588 / 2.4728 / 2.4364 | −0.001 / −0.001 / −0.001 |
+| m512e (both lengths) | 2.4370 / 2.4398 | bit-identical | 0 |
+| L4096 m512_lam256 | 2.4924 | 2.4910 | −0.001 |
+
+Criterion readout: the pool-vs-evict-only deficit slope
+L2048→L4096 at m512 is +0.0102→+0.0344 (v2) vs +0.0125→+0.0330 (v3)
+— a ~0.004-nat flattening, an order of magnitude below what would
+matter, with the sign trade exactly along the age-hypothesis
+direction (slightly worse short, slightly better long) but at
+negligible magnitude. Guardrail rates unchanged. **Verdict: on this
+corpus at ≤4k, stepped age-based decay ≈ static measure-level damping
+— the (c″)(iv) age-decoherence hypothesis gains no usable support,
+consistent with (a′)'s coherence modulus being age-independent under
+the position measure. v2 `static` stays the default.** Scope note:
+the L2048→L4096 lever is short; 16k+ contexts could still separate
+the modes — out of tier scope, recorded. (The stepped path and its
+tests remain in-tree behind `pool_gate`.)
