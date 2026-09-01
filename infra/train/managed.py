@@ -56,6 +56,8 @@ class ManagedConfig(TrainConfig):
     budget: int = 512
     ring_window: int = 32
     demote: bool = True
+    lam: float = 1.0 / 1024      # v2 position-measure discount rate
+    slope_eps: float = 1e-3      # v2 P0/P1 slope-degeneracy threshold
     # drop the manifest's last shard from training — the eval holdout
     # (budget_ppl.py picks entries[-1] by the same rule)
     holdout_last_shard: bool = True
@@ -188,7 +190,8 @@ def train(config: ManagedConfig):
         log(f'resumed from {resume_from.name} at step {step:,}')
 
     mcfg = ManageCfg(block_len=config.block_len, budget=config.budget,
-                     ring_window=config.ring_window, demote=config.demote)
+                     ring_window=config.ring_window, demote=config.demote,
+                     lam=config.lam, slope_eps=config.slope_eps)
     if config.manage == 'unified':
         net: nn.Module = StreamWrapper(model, mcfg)
     else:

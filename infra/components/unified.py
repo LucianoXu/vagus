@@ -1,34 +1,55 @@
-# Unified-block streaming: atom table + P=1 moment pool, managed by the
-# distortion calculus (engram theory §4/§5′/§7′c′), runnable frozen
-# (inference) or differentiably (management-aware training).
+# Unified-block streaming: atom table + moment pools (P=0, P=1), managed
+# by the distortion calculus (engram theory §4/§5′/§6(a′)/§7′c′),
+# runnable frozen (inference) or differentiably (management-aware
+# training).
 #
-# Scope (Tier 1): the SAX architecture subset — MHA (H_kv == H),
-# v_dim_mult == 1, no short conv. Operations: eviction and type-change
-# (demote to a P=1 pooled subtable). Merge and soft selection are out of
-# scope (§7′(h)(ii) gradient risk); selection is HARD (argsort of scores,
-# no gradient through the choice) while every surviving contribution —
-# atoms, masses, pool moments — stays differentiable, so training adapts
-# the model to a fixed policy (the Tier-1 question), not the policy.
+# v2 (2026-09-01, theory §6(a′) + §5′-7 + §5′-8) — the two derived
+# changes over v1:
 #
-# Readout per kv-head over a typed atom list:
-#     F(q) = (N_a(q) + e^{-M} N_p(q)) / (Z_a(q) + e^{-M} Z_p(q))
-# where atoms contribute N_a, Z_a through exp(logits - M) with the mass
-# column log c folded into logits, and the pool contributes the P=1
-# moment form (centered per §5′-2, e^{a} folded into the pooled weight):
-#     Z_p(q) = t0 + q·t1/sqrt(Dh)      N_p(q) = T0 + q^T T1/sqrt(Dh)
-# Denominator guardrail: where the signed pool term drives the total
-# partition function below eps * Z_a, fall back to the atoms-only
-# readout for that query (bounded output; occurrences are counted).
+#   A. Demotion pricing uses the POSITION-FACTORIZED ensemble instead of
+#      the near-window transported ring. Content distribution: window
+#      queries un-rotated to the 0-frame -> per-band mean m_b and
+#      band-isotropic variance s_b^2. Offset distribution: exponential
+#      discount pi(u') ~ exp(-lam u') from the decision time — the
+#      position integral is arithmetic: per-band coherence
+#      g(w) = lam / (lam + i w), |g| = lam/sqrt(lam^2 + w^2), and each
+#      atom's logit mean/variance under the joint measure is a
+#      trigonometric closed form (small fixed 32x32 band matrices).
+#      The eviction score is UNCHANGED (v1 transported-linear MC over
+#      the ring; E1-validated) — variable isolation.
 #
-# Scores are Monte-Carlo estimates of the two exit costs over the ring
-# of recent queries, RoPE-transported to the decision position (E1's
-# transported ensemble): per atom j and ring query q,
-#     evict:  (w_j(q))^2 ||v_j - F(q)||^2            (Lemma 3 kernel)
-#     demote: (c_j e^{a_j} R_1(x_j - a_j) / Z(q))^2 ||v_j - F(q)||^2
-#                                                     (Lemma 4, P=1)
-# with R_1(u) = e^u - 1 - u and a_j the ring-mean raw logit. Both are
-# the same substitution identity under different kernel perturbations,
-# so the per-atom exit is argmin and removal is top-k of the min.
+#   B. Pool writes are the L^2(Q) PROJECTION (Pi_1 e^x =
+#      e^{mu+sigma^2/2}(1 + (x - mu)), Stein), not the Taylor jet:
+#      mass factor e^{sigma^2/2} makes the pooled partition-function
+#      contribution mean-exact under Q (the v1 harm was mean-level Z
+#      pollution), and the stored slope is the per-band coherence-damped
+#      key gamma_b * k_b. A P=0 tier (only t0/T0; phi = c e^{mu +
+#      sigma^2/2} constant — always positive, zero decoherence) is the
+#      exit for atoms whose damped slope is degenerate.
+#
+# Exit rule per atom: argmin over {evict, demote} in one log-score
+# currency; a demoted atom lands in P=1 when its damped slope still
+# captures variance (sigma_cap^2 >= slope_eps), else P=0 (5′-8: sinks'
+# high-frequency keys damp to near-zero slope — P=0 makes it explicit
+# and removes denominator risk). Implementation choice, recorded: with
+# the literal residual formulas the P=1 residual is never above P=0
+# (an optimal slope cannot hurt in L^2), so the P0/P1 branch follows
+# 5′-8's slope-degeneracy argument rather than a score comparison.
+#
+# Residual formulas (per atom, centered; log-domain in code):
+#   P=1 (offset-averaged per-offset projection residual):
+#       e^{2 mu + 2V + sc^2} (e^{sc^2} - 1 - sc^2)
+#   P=0 (full-measure Var(e^delta)):
+#       e^{2 mu + st^2} (e^{st^2} - 1),   st^2 = sc^2 + V
+#   with sc^2 = content variance (band-isotropic, offset-invariant),
+#   V = variance of the offset-oscillating mean (decoherence), both
+#   from the closed forms above. Scores multiply the 5′-3 structure
+#   (c/Z̄)^2 ||v - f(q)||^2 and compare to the eviction MC score on a
+#   common log axis.
+#
+# Everything else (explicit-denominator readout, signed-pool guardrail,
+# hard selection with differentiable state, per-cell checkpointed BPTT)
+# is v1 unchanged; scope: SAX subset (MHA, v_dim_mult=1, no short conv).
 
 import math
 from dataclasses import dataclass
@@ -45,9 +66,11 @@ class ManageCfg:
     block_len: int = 256      # decisions between blocks of this many tokens
     budget: int = 512         # max alive atoms per (batch, kv-head)
     ring_window: int = 32     # recent queries kept for the score ensemble
-    demote: bool = True       # enable the type-change exit (P=1 pool)
+    demote: bool = True       # enable the type-change exits (P=0/P=1 pool)
+    lam: float = 1.0 / 1024   # offset-discount rate of the position measure
+    slope_eps: float = 1e-3   # damped-slope variance below this -> P=0
     eps_z: float = 1e-4       # denominator guardrail threshold
-    a_clamp: float = 25.0     # cap on the centering logit inside exp()
+    mu_clamp: float = 25.0    # cap on the centering logit inside exp()
 
 
 @dataclass
@@ -58,16 +81,17 @@ class LayerState:
     v: torch.Tensor        # (B, H, T, Dv)
     logc: torch.Tensor     # (B, H, T) fp32 log-mass
     alive: torch.Tensor    # (B, H, T) bool
-    t0: torch.Tensor       # (B, H)        pool: sum w (1 - a)
-    t1: torch.Tensor       # (B, H, Dh)    pool: sum w k
-    T0: torch.Tensor       # (B, H, Dv)    pool: sum w (1 - a) v
-    T1: torch.Tensor       # (B, H, Dh, Dv) pool: sum w k v^T
+    pos: torch.Tensor      # (T,) int64 absolute position of each atom
+    t0: torch.Tensor       # (B, H)        pool constants (P=0 and P=1)
+    t1: torch.Tensor       # (B, H, Dh)    pool: damped-key first moment
+    T0: torch.Tensor       # (B, H, Dv)
+    T1: torch.Tensor       # (B, H, Dh, Dv)
     ring_q: torch.Tensor   # (B, H, W, Dh) fp32 post-RoPE recent queries
     ring_pos: torch.Tensor # (W,) int64 absolute positions of ring queries
 
     def tensors(self) -> tuple:
-        return (self.k, self.v, self.logc, self.alive, self.t0, self.t1,
-                self.T0, self.T1, self.ring_q, self.ring_pos)
+        return (self.k, self.v, self.logc, self.alive, self.pos, self.t0,
+                self.t1, self.T0, self.T1, self.ring_q, self.ring_pos)
 
     @staticmethod
     def from_tensors(ts) -> 'LayerState':
@@ -84,6 +108,7 @@ def init_state(att: SoftmaxAttention, batch: int, device, dtype,
         k=z(batch, H, 0, Dh), v=z(batch, H, 0, Dv),
         logc=z(batch, H, 0, dt=torch.float32),
         alive=torch.zeros(batch, H, 0, device=device, dtype=torch.bool),
+        pos=torch.zeros(0, device=device, dtype=torch.int64),
         t0=z(batch, H, dt=torch.float32), t1=z(batch, H, Dh, dt=torch.float32),
         T0=z(batch, H, Dv, dt=torch.float32),
         T1=z(batch, H, Dh, Dv, dt=torch.float32),
@@ -97,21 +122,106 @@ class Health:
     def __init__(self):
         self.z_fallback = 0.0   # fraction of (query, head) readouts that
         self.z_events = 0       # tripped the denominator guardrail
-        self.a_clamped = 0.0    # fraction of demoted atoms with clamped a
-        self.a_events = 0
-        self.demoted = 0        # atoms demoted (summed over B, H)
+        self.mu_clamped = 0.0   # fraction of demoted atoms with clamped mu
+        self.mu_events = 0
+        self.demoted_p0 = 0     # atoms demoted into the P=0 tier
+        self.demoted_p1 = 0     # atoms demoted into the P=1 tier
         self.evicted = 0
 
     def as_dict(self) -> dict:
         d = {}
         if self.z_events:
             d['unified_z_fallback'] = self.z_fallback / self.z_events
-        if self.a_events:
-            d['unified_a_clamped'] = self.a_clamped / self.a_events
-        d['unified_demoted'] = float(self.demoted)
+        if self.mu_events:
+            d['unified_mu_clamped'] = self.mu_clamped / self.mu_events
+        d['unified_demoted_p0'] = float(self.demoted_p0)
+        d['unified_demoted_p1'] = float(self.demoted_p1)
         d['unified_evicted'] = float(self.evicted)
         return d
 
+
+# --------------------------------------------------------------------------
+# Band algebra (RoPE frequencies, complex views, coherence factors)
+# --------------------------------------------------------------------------
+
+def _band_freqs(rope: RoPE, device) -> torch.Tensor:
+    '''omega_b = base^(-b/arm_dim), radians per token, (arm_dim,).'''
+    idx = torch.arange(rope.arm_dim, device=device, dtype=torch.float64)
+    return torch.pow(torch.tensor(float(rope.base), device=device,
+                                  dtype=torch.float64), -idx / rope.arm_dim)
+
+
+def _as_complex(x: torch.Tensor) -> torch.Tensor:
+    '''Interleaved pairs (..., Dh) -> complex (..., Dh/2), matching the
+    RoPE convention (pair (x0, x1) rotates as (x0 + i x1) e^{i phi}).'''
+    y = x.float().reshape(*x.shape[:-1], x.shape[-1] // 2, 2)
+    return torch.complex(y[..., 0], y[..., 1])
+
+
+def _coherence(lam: float, omega: torch.Tensor) -> torch.Tensor:
+    '''g(w) = E_{s~Exp(lam)} e^{-i w s} = lam / (lam + i w). complex128.'''
+    return lam / torch.complex(torch.full_like(omega, lam), omega)
+
+
+def _unrotate_ring(rope: RoPE, ring_q: torch.Tensor,
+                   ring_pos: torch.Tensor) -> torch.Tensor:
+    '''Rotate ring queries back to the 0-frame: multiply band b of the
+    query at position p by e^{-i omega_b p}. Returns complex (B,H,W,Dh/2).'''
+    rope.prepare_m(int(ring_pos.max().item()) + 1)
+    mcos = rope.mcos.float()[ring_pos]          # (W, Dh/2)
+    msin = rope.msin.float()[ring_pos]
+    phase = torch.complex(mcos, -msin)          # e^{-i omega p}
+    return _as_complex(ring_q) * phase
+
+
+def _measure_stats(rope: RoPE, st: LayerState, t_dec: int, lam: float):
+    '''Per-atom logit statistics under the position-factorized measure
+    (theory §6(a′)), band-isotropic content model. Returns fp32 (B,H,T):
+      mu      — joint-measure mean logit
+      var_c   — content variance (offset-invariant under isotropy)
+      V       — offset variance of the oscillating mean (decoherence)
+      cap     — variance captured by the gamma-damped slope
+    All include the 1/sqrt(Dh) logit scaling.'''
+    B, H, T, Dh = st.k.shape
+    beta = 1.0 / math.sqrt(Dh)
+    dev = st.k.device
+
+    u = _unrotate_ring(rope, st.ring_q, st.ring_pos)      # (B,H,W,nb) complex
+    m = u.mean(dim=2)                                     # (B,H,nb)
+    s2 = 0.5 * (u - m.unsqueeze(2)).abs().pow(2).mean(dim=2)  # (B,H,nb)
+
+    omega = _band_freqs(rope, dev)                        # (nb,) float64
+    g = _coherence(lam, omega)                            # (nb,) complex128
+    gamma2 = g.abs().pow(2).float()                       # (nb,)
+
+    z = _as_complex(st.k)                                 # (B,H,T,nb)
+    zabs2 = z.abs().pow(2)                                # (B,H,T,nb)
+    var_c = beta ** 2 * torch.einsum('bhn,bhtn->bht', s2, zabs2)
+    cap = beta ** 2 * torch.einsum('bhn,bhtn->bht', s2, zabs2 * gamma2)
+
+    # c_b = conj(m_b) z_b e^{-i omega_b t_dec}: the deterministic decision-
+    # time phase; the atom's own e^{+i omega t_j} sits inside z, so the
+    # relative phase is -omega * age as required.
+    phase_dec = torch.exp(torch.complex(
+        torch.zeros_like(omega), -omega * float(t_dec))).to(torch.complex64)
+    C = m.conj().unsqueeze(2) * z * phase_dec             # (B,H,T,nb)
+
+    gc = g.to(torch.complex64)
+    mu = beta * torch.einsum('bhtn,n->bht', C, gc).real
+
+    om = omega.unsqueeze(0)
+    Gm = _coherence(lam, om - om.T).to(torch.complex64)   # g(w_b - w_b')
+    Gp = _coherence(lam, om + om.T).to(torch.complex64)   # g(w_b + w_b')
+    e2 = 0.5 * beta ** 2 * (
+        torch.einsum('bhtn,nm,bhtm->bht', C, Gp, C)
+        + torch.einsum('bhtn,nm,bhtm->bht', C, Gm, C.conj())).real
+    V = (e2 - mu.pow(2)).clamp(min=0)
+    return mu, var_c, V, cap
+
+
+# --------------------------------------------------------------------------
+# Readout (unchanged from v1)
+# --------------------------------------------------------------------------
 
 def _pool_terms(q32: torch.Tensor, st_t0, st_t1, st_T0, st_T1, scale: float):
     '''Pool contributions for queries q32 (B, H, L, Dh) fp32.
@@ -154,9 +264,7 @@ def _combined_readout(q32, k32, v32, logits_bias, allow, st, scale, eps_z,
 
 
 def _transport(rope: RoPE, ring_q: torch.Tensor, delta: torch.Tensor):
-    '''Rotate ring queries forward by per-query offsets delta (W,) —
-    RoPE phases add, so rotating an already-rotated query by delta moves
-    it to its position + delta.'''
+    '''Rotate ring queries forward by per-query offsets delta (W,).'''
     rope.prepare_m(int(delta.max().item()) + 1)
     mcos = rope.mcos.to(ring_q.dtype)[delta]      # (W, Dh/2)
     msin = rope.msin.to(ring_q.dtype)[delta]
@@ -165,49 +273,68 @@ def _transport(rope: RoPE, ring_q: torch.Tensor, delta: torch.Tensor):
     return x.reshape(*ring_q.shape)
 
 
+# --------------------------------------------------------------------------
+# Management (v2 scoring)
+# --------------------------------------------------------------------------
+
 @torch.no_grad()
 def _manage(att: SoftmaxAttention, st: LayerState, t_end: int,
             mcfg: ManageCfg, health: Health):
-    '''Score alive atoms with the transported ring ensemble, pick the
-    cheapest exits down to budget. Returns (sel_evict, sel_demote, a)
-    as (B,H,T) masks + fp32 centers; caller applies them differentiably.'''
+    '''Score alive atoms, pick the cheapest exits down to budget.
+    Returns (sel_evict, sel_p0, sel_p1, mu, sigma_tot2) — (B,H,T) masks
+    plus the fp32 measure statistics for the write path.'''
     B, H, T, Dh = st.k.shape
     scale = 1.0 / math.sqrt(Dh)
     alive_cnt = int(st.alive[0, 0].sum().item())     # uniform across (B,H)
     r = alive_cnt - mcfg.budget
     if r <= 0:
         return None
+
+    # ---- eviction score: v1 transported-linear MC, unchanged ----
     delta = (t_end - st.ring_pos).clamp(min=0)
     qt = _transport(att.rope, st.ring_q, delta)      # (B,H,W,Dh) fp32
     k32, v32 = st.k.float(), st.v.float()
     allow = st.alive.unsqueeze(-2).expand(B, H, qt.shape[2], T)
     f, logZ, xraw = _combined_readout(qt, k32, v32, st.logc, allow, st,
                                       scale, mcfg.eps_z, None)
-    # squared value displacement per (query, atom): ||v_j - f(q)||^2
     d2 = (v32.pow(2).sum(-1).unsqueeze(-2) - 2 * torch.einsum(
         'bhwe,bhte->bhwt', f, v32) + f.pow(2).sum(-1).unsqueeze(-1))
     d2 = d2.clamp(min=0)
     logw = xraw + st.logc.unsqueeze(-2) - logZ.unsqueeze(-1)   # log w_j(q)
     s_evict = (torch.exp(2 * logw) * d2).mean(dim=-2)          # (B,H,T)
-    a = xraw.mean(dim=-2)                                      # (B,H,T)
-    u = xraw - a.unsqueeze(-2)
-    R1 = torch.expm1(u) - u
-    amp = torch.exp((a + st.logc).unsqueeze(-2) - logZ.unsqueeze(-1))
-    s_dem = ((amp * R1).pow(2) * d2).mean(dim=-2)              # (B,H,T)
+    log_s_evict = torch.log(s_evict + 1e-45)
+
+    # ---- demotion score: position-factorized measure (§6(a′)/5′-7) ----
+    mu, var_c, V, cap = _measure_stats(att.rope, st, t_end, mcfg.lam)
+    sigma_tot2 = var_c + V
+    logZbar = logZ.mean(dim=-1)                                # (B,H)
+    d2bar = torch.log(d2.mean(dim=-2) + 1e-45)                 # log ||v-f̄||²
+    amp = 2 * (st.logc + mu - logZbar.unsqueeze(-1))
+    # residual terms, log-domain; expm1 keeps small-sigma precision
+    res_p1 = 2 * V + var_c + torch.log(
+        (torch.expm1(var_c) - var_c).clamp(min=1e-45))
+    res_p0 = sigma_tot2 + torch.log(torch.expm1(sigma_tot2).clamp(min=1e-45))
+    p0_branch = cap < mcfg.slope_eps          # slope degeneracy (5′-8)
+    log_s_dem = amp + torch.where(p0_branch, res_p0, res_p1) + d2bar
+    if not mcfg.demote:
+        log_s_dem = torch.full_like(log_s_dem, float('inf'))
+
     inf = torch.finfo(torch.float32).max
     dead = ~st.alive
-    s_evict = s_evict.masked_fill(dead, inf)
-    s_dem = s_dem.masked_fill(dead, inf) if mcfg.demote \
-        else torch.full_like(s_dem, inf)
-    s_min = torch.minimum(s_evict, s_dem)
+    log_s_evict = log_s_evict.masked_fill(dead, inf)
+    log_s_dem = log_s_dem.masked_fill(dead, inf)
+    s_min = torch.minimum(log_s_evict, log_s_dem)
     idx = s_min.topk(r, dim=-1, largest=False).indices          # (B,H,r)
     sel = torch.zeros_like(st.alive)
     sel.scatter_(-1, idx, True)
-    sel_demote = sel & (s_dem <= s_evict)
-    sel_evict = sel & ~sel_demote
-    health.demoted += int(sel_demote.sum().item())
+    sel_dem = sel & (log_s_dem <= log_s_evict)
+    sel_evict = sel & ~sel_dem
+    sel_p0 = sel_dem & p0_branch
+    sel_p1 = sel_dem & ~p0_branch
+    health.demoted_p0 += int(sel_p0.sum().item())
+    health.demoted_p1 += int(sel_p1.sum().item())
     health.evicted += int(sel_evict.sum().item())
-    return sel_evict, sel_demote, a
+    return sel_evict, sel_p0, sel_p1, mu, sigma_tot2
 
 
 def attn_block_step(att: SoftmaxAttention, x, st: LayerState, pos0: int,
@@ -239,6 +366,8 @@ def attn_block_step(att: SoftmaxAttention, x, st: LayerState, pos0: int,
         [st.logc, torch.zeros(B, H, L, device=x.device, dtype=torch.float32)], dim=2)
     alive_all = torch.cat(
         [st.alive, torch.ones(B, H, L, device=x.device, dtype=torch.bool)], dim=2)
+    pos_all = torch.cat(
+        [st.pos, torch.arange(pos0, pos0 + L, device=x.device)], dim=0)
     T = k_all.shape[2]
 
     # visibility: alive atoms, and within the new block causal lower-right
@@ -257,33 +386,41 @@ def attn_block_step(att: SoftmaxAttention, x, st: LayerState, pos0: int,
     ring_q = q[:, :, -W:, :].detach().float()
     ring_pos = torch.arange(pos0 + L - W, pos0 + L, device=x.device)
 
-    st2 = LayerState(k_all, v_all, logc_all, alive_all,
+    st2 = LayerState(k_all, v_all, logc_all, alive_all, pos_all,
                      st.t0, st.t1, st.T0, st.T1, ring_q, ring_pos)
 
     if manage:
         picks = _manage(att, st2, pos0 + L, mcfg, health)
         if picks is not None:
-            sel_evict, sel_demote, a = picks
-            if sel_demote.any():
-                a_c = a.clamp(max=mcfg.a_clamp)
+            sel_evict, sel_p0, sel_p1, mu, sig2 = picks
+            sel_dem = sel_p0 | sel_p1
+            alive_new = alive_all & ~(sel_evict | sel_dem)
+            if sel_dem.any():
+                mu_c = mu.clamp(max=mcfg.mu_clamp)
                 with torch.no_grad():
-                    health.a_clamped += ((a > mcfg.a_clamp) & sel_demote
-                                         ).float().sum().item() / max(
-                                             1, int(sel_demote.sum().item()))
-                    health.a_events += 1
-                w_d = torch.exp(a_c + logc_all) * sel_demote.float()  # (B,H,T)
+                    health.mu_clamped += ((mu > mcfg.mu_clamp) & sel_dem
+                                          ).float().sum().item() / max(
+                                              1, int(sel_dem.sum().item()))
+                    health.mu_events += 1
+                # projected-pool writes (5′-7/5′-8): mass factor
+                # e^{sigma^2/2}; P=1 slope = per-band damped key.
+                w_all = torch.exp(mu_c + 0.5 * sig2 + logc_all)   # (B,H,T)
+                w0 = w_all * sel_p0.float()
+                w1 = w_all * sel_p1.float()
                 kf, vf = k_all.float(), v_all.float()
-                st2 = LayerState(
-                    k_all, v_all, logc_all,
-                    alive_all & ~(sel_evict | sel_demote),
-                    st2.t0 + (w_d * (1 - a_c)).sum(-1),
-                    st2.t1 + torch.einsum('bht,bhtd->bhd', w_d, kf),
-                    st2.T0 + torch.einsum('bht,bhte->bhe', w_d * (1 - a_c), vf),
-                    st2.T1 + torch.einsum('bht,bhtd,bhte->bhde', w_d, kf, vf),
-                    ring_q, ring_pos)
+                omega = _band_freqs(att.rope, x.device)
+                gamma = _coherence(mcfg.lam, omega).abs().float()  # (nb,)
+                damp = gamma.repeat_interleave(2)                  # (Dh,)
+                kd = kf * damp                                     # damped key
+                t0 = st2.t0 + (w0 + w1 * (1 - mu_c)).sum(-1)
+                T0 = st2.T0 + torch.einsum('bht,bhte->bhe',
+                                           w0 + w1 * (1 - mu_c), vf)
+                t1 = st2.t1 + torch.einsum('bht,bhtd->bhd', w1, kd)
+                T1 = st2.T1 + torch.einsum('bht,bhtd,bhte->bhde', w1, kd, vf)
+                st2 = LayerState(k_all, v_all, logc_all, alive_new, pos_all,
+                                 t0, t1, T0, T1, ring_q, ring_pos)
             else:
-                st2 = LayerState(k_all, v_all, logc_all,
-                                 alive_all & ~sel_evict,
+                st2 = LayerState(k_all, v_all, logc_all, alive_new, pos_all,
                                  st2.t0, st2.t1, st2.T0, st2.T1,
                                  ring_q, ring_pos)
     return out, st2
@@ -305,8 +442,7 @@ def stream_hidden(model, tokens: torch.Tensor, mcfg: ManageCfg,
                   manage: bool = True, use_checkpoint: bool = False,
                   health: Health | None = None) -> torch.Tensor:
     '''Managed block-streaming forward. Returns post-rms_head hidden
-    states (B, L, dim) — same contract as model(x, return_hidden=True),
-    but every position beyond the first block reads a managed cache.
+    states (B, L, dim) — same contract as model(x, return_hidden=True).
     With manage=False and empty pools this is exactly softmax attention
     (gate 0). Gradients flow through all surviving state (BPTT across
     blocks); use_checkpoint recomputes each (layer, block) cell.'''

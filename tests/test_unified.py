@@ -1,16 +1,20 @@
-# Gates 0/1 for the unified streaming path (see experiments/unified-tier1.md).
+# Gates 0/1 + v2 closed-form checks for the unified streaming path.
 # Gate 0: with management off (or budget never binding) the streaming
 #         readout IS softmax attention: logits match forward().
 # Gate 1: the training loss through stream_hidden(manage=False) equals
-#         the stateless loss (managed.py's 'none' arm uses forward()
-#         itself, so this checks the shared-loss claim of the pair).
-# Plus: managed path runs, respects budget, backprops finite grads, and
-#       the checkpointed backward matches the plain one.
+#         the stateless loss.
+# v2:     projection coefficients (5′-7 Stein closed form), coherence
+#         factor gamma_b (§6(a′)), pool additivity under damped +
+#         mass-factor writes.
+
+import math
 
 import torch
 
-from infra.components.unified import Health, ManageCfg, stream_hidden
+from infra.components.unified import (Health, ManageCfg, stream_hidden,
+                                      _coherence)
 from infra.models.transformer_pp import TransformerPP
+
 
 def tiny_model(seed=0):
     torch.manual_seed(seed)
@@ -18,11 +22,14 @@ def tiny_model(seed=0):
                          context_len=1024, layer_count=3,
                          tie_embedding=True, qk_norm=True).float().eval()
 
+
 def tokens(B=2, L=512, seed=1):
     g = torch.Generator().manual_seed(seed)
     return torch.randint(0, 512, (B, L), generator=g)
 
+
 MCFG = ManageCfg(block_len=64, budget=96, ring_window=16)
+
 
 def test_gate0_stream_equals_forward():
     model, x = tiny_model(), tokens()
@@ -31,11 +38,11 @@ def test_gate0_stream_equals_forward():
         out = stream_hidden(model, x, MCFG, manage=False)
     diff = (ref - out).abs().max().item()
     assert diff < 2e-4, f'gate 0 failed: max hidden diff {diff}'
-    # non-binding budget behaves identically to manage=False
     loose = ManageCfg(block_len=64, budget=10_000, ring_window=16)
     with torch.no_grad():
         out2 = stream_hidden(model, x, loose, manage=True)
     assert (ref - out2).abs().max().item() < 2e-4
+
 
 def test_gate1_loss_matches_stateless():
     model, x = tiny_model(), tokens()
@@ -47,15 +54,17 @@ def test_gate1_loss_matches_stateless():
             model.head(stream_hidden(model, x, MCFG, manage=False)).transpose(1, 2), y)
     assert abs(lref.item() - lstr.item()) < 1e-4
 
+
 def test_managed_run_and_budget():
     model, x = tiny_model(), tokens()
     h = Health()
     with torch.no_grad():
         out = stream_hidden(model, x, MCFG, manage=True, health=h)
     assert torch.isfinite(out).all()
-    assert h.evicted + h.demoted > 0, 'management never triggered'
+    assert h.evicted + h.demoted_p0 + h.demoted_p1 > 0
     d = h.as_dict()
     assert d.get('unified_z_fallback', 0.0) < 0.05, d
+
 
 def test_managed_deterministic():
     model, x = tiny_model(), tokens()
@@ -63,6 +72,7 @@ def test_managed_deterministic():
         a = stream_hidden(model, x, MCFG, manage=True)
         b = stream_hidden(model, x, MCFG, manage=True)
     assert torch.equal(a, b)
+
 
 def test_backward_finite_and_checkpoint_matches():
     model, x = tiny_model(), tokens(B=1, L=256)
@@ -87,11 +97,61 @@ def test_backward_finite_and_checkpoint_matches():
     assert (g0 - g1).abs().max().item() < 1e-4, 'checkpointed grads diverge'
     assert g0.abs().max().item() > 0
 
+
 def test_demotion_engages_pool():
     model, x = tiny_model(), tokens()
     h = Health()
     tight = ManageCfg(block_len=64, budget=64, ring_window=16, demote=True)
     with torch.no_grad():
         stream_hidden(model, x, tight, manage=True, health=h)
-    # with random weights some atoms should still pick the demote exit
-    assert h.demoted > 0, 'no atom ever chose the type-change exit'
+    assert h.demoted_p0 + h.demoted_p1 > 0, 'no atom chose a demote exit'
+
+
+# ---- v2 closed-form checks ----
+
+def test_projection_coefficients_match_stein():
+    '''Least-squares fit of a + b x to e^x under N(mu, sigma^2) samples
+    must match Pi_1 e^x = e^{mu+sigma^2/2}(1 + (x - mu)) (theory 5′-7):
+    a = e^{mu+sigma^2/2}(1 - mu), b = e^{mu+sigma^2/2}.'''
+    g = torch.Generator().manual_seed(7)
+    for mu, sig in [(0.3, 0.5), (-1.0, 0.8), (1.2, 0.3)]:
+        x = mu + sig * torch.randn(400_000, generator=g, dtype=torch.float64)
+        X = torch.stack([torch.ones_like(x), x], dim=1)
+        coef = torch.linalg.lstsq(X, torch.exp(x).unsqueeze(1)).solution.squeeze()
+        s = math.exp(mu + sig ** 2 / 2)
+        assert abs(coef[0].item() - s * (1 - mu)) < 0.02 * s, (mu, sig, coef)
+        assert abs(coef[1].item() - s) < 0.02 * s, (mu, sig, coef)
+
+
+def test_coherence_factor_matches_numeric():
+    '''gamma_b = |E_{s~Exp(lam)} e^{-i w s}| = lam/sqrt(lam^2+w^2).'''
+    g = torch.Generator().manual_seed(11)
+    lam = 1.0 / 64
+    s = -torch.log(torch.rand(2_000_000, generator=g, dtype=torch.float64)) / lam
+    for w in [0.0, 1.0 / 128, 1.0 / 16, 0.5]:
+        num = torch.exp(torch.complex(torch.zeros_like(s), -w * s)).mean()
+        closed = _coherence(lam, torch.tensor([w], dtype=torch.float64))[0]
+        assert abs(num.abs().item() - closed.abs().item()) < 2e-3
+        assert abs(num.item().real - closed.item().real) < 2e-3
+
+
+def test_pool_additivity():
+    '''Damped + mass-factor writes are rank-1 updates: writing a batch of
+    atoms at once equals the sum of writing them one by one.'''
+    g = torch.Generator().manual_seed(13)
+    n, Dh, Dv = 5, 8, 8
+    k = torch.randn(n, Dh, generator=g, dtype=torch.float64)
+    v = torch.randn(n, Dv, generator=g, dtype=torch.float64)
+    w1 = torch.rand(n, generator=g, dtype=torch.float64) + 0.5
+    mu = torch.randn(n, generator=g, dtype=torch.float64)
+    damp = torch.rand(Dh // 2, generator=g, dtype=torch.float64).repeat_interleave(2)
+    kd = k * damp
+    t0_batch = (w1 * (1 - mu)).sum()
+    t1_batch = torch.einsum('t,td->d', w1, kd)
+    T1_batch = torch.einsum('t,td,te->de', w1, kd, v)
+    t0_seq = sum(w1[i] * (1 - mu[i]) for i in range(n))
+    t1_seq = sum(w1[i] * kd[i] for i in range(n))
+    T1_seq = sum(w1[i] * torch.outer(kd[i], v[i]) for i in range(n))
+    assert abs(t0_batch.item() - t0_seq.item()) < 1e-10
+    assert (t1_batch - t1_seq).abs().max().item() < 1e-10
+    assert (T1_batch - T1_seq).abs().max().item() < 1e-10
