@@ -471,3 +471,36 @@ in-flight uct recipes keep working unmodified), the module path
 `infra/components/unified.py` is unchanged so live imports never
 break, and run/recipe names keep their historical spellings; new
 recipes use triage names. Pure rename, no logic.
+
+### Track B verdict: delta gap is real, but it concentrates where the theory said it wouldn't
+
+E2″(d) on llama32-1b, both corpora (engram job 29854826; JSON+plots
+mirrored to engram results/llama32-1b/full/). Direction-form
+measurement (Hebbian slope's direction + per-sequence scalar/intercept,
+2 dof, vs ridge's full whitened map, d+1 dof — the dof asymmetry IS
+the estimator dimension; two ill-conditioned variants recorded in the
+JSON as negative results: the whole-cache ratio readout collapses on
+its signed denominator (guard rates up to 57%, R² ~ −150 — the
+positivity-guardrail failure mode writ large) and frozen-Z̄ cannot
+absorb the numerator's dynamic range).
+
+| tercile | ridge(d) | hebbian-dir | delta_price | frac>0.05 |
+|---|---|---|---|---|
+| retrieval | 0.21/0.22 | 0.06/0.08 | 0.10/0.11 | 0.64/0.67 |
+| mid | 0.39/0.41 | 0.16/0.13 | 0.19/0.24 | 0.81/0.91 |
+| linear | 0.57/0.59 | 0.27/0.27 | **0.32/0.31** | 0.85/0.95 |
+
+(prose/code; spearman(dp, R²_lin) = +0.47/+0.54;
+spearman(dp, collision mass) ≈ 0.)
+
+Findings: (1) the delta correction's price is substantial nearly
+everywhere (dp > 0.05 on 64–95% of heads); (2) **the concentration
+prediction of §7′(c″)(ii) is contradicted**: the gap grows toward the
+LINEAR tercile — whitening pays most exactly where the linear class
+works, i.e. on the heads the pool actually serves; even there the
+Hebbian direction keeps <50% of ridge's explanatory power
+("纯平滑头 Hebbian 已足够" does not hold in this measurement); (3) the
+collision-mass mechanism gets no support in the direction form
+(≈zero correlation). Caveat recorded: this is a whole-cache
+measurement; the operating-point version (pool restricted to the
+triage-demoted subset) is the sharper gate for implementation.
