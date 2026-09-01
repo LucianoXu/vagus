@@ -44,7 +44,7 @@ optimizer_args:
 
 schedule_name: wsd
 schedule_args:
-  warmup: 0.02
+  warmup: 0.04
   decay: 0.2
   min_ratio: 0.0
 

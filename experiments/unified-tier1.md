@@ -666,3 +666,52 @@ each training window. Forensics: `unified_top_writes` (top-8 raw
 write weights) added to health and folded into the GNORM GATE
 message, so a gate kill now lands the signature. Discipline
 unchanged: gate ≤1.1 at step 100, origin init, both seeds.
+
+---
+
+## Closing ledger, 2026-09-01 (uct line wrapped by user decision)
+
+**Verdict chain of the day** (all on holdout 013_00009, protocol
+constant, m512e bit-identical across every variant):
+
+| line | verdict |
+|---|---|
+| v2.1 (Gm-corrected pricing) | all v2 conclusions stand: pool neutral-to-negative per budget, monotone in tightness, no crossover; corrected V demotes ~70% more atoms at ~equal PPL |
+| v3.1 (stepped gate) | tie degrades to mild net harm (+0.006..+0.019); static default reinforced |
+| v4 (whitened slopes) | net harm as implemented (m256/L4096 +0.49); measurement-level delta green light stands, write-side needs a derived normalized-RLS form ((c″) revision territory) |
+| v2.2 (ledger normalization) | **discriminating experiment concluded: analytic-lever residue.** Same-seed v2.1/v2.2 loss trajectories step-identical (≤0.007 to step 70) and gnorm still 1e3–5e5 spiky — detached rescaling cannot and did not change gradients; the amplifier is the forward's true gradient structure, not rounding noise |
+
+**Gm fix chain**: found by the engram triage-port agent's independent
+reimplementation (credit); reproduced independently (V bias 21.9% max
+on our regression head), one-line fix, 5e-7 residual, e2pp audit clean
+(Track B / op-point verdicts unaffected by construction).
+
+**uct gate portraits (three kills)**: v1 pilot — chronic divergence
+(loss 2.60→3.27@500, gnorm →2.6e16). v2.1 — gate fired both seeds at
+step 100 (gnorm 807 / 851k; loss 2.45–2.50, near plain's 2.43); the
+pricing fix removed 8–11 orders of the v1 amplifier; residual is
+spiky, seed-varying, systematic (both seeds' ema above plain, same
+direction — not a restart transient: v2.1/v2.2 trajectory identity
+rules out gradient-path change, and 76-step LR warmup was present in
+every run, now bumped to 152 in the recipes as dormant hygiene).
+v2.2 — killed pre-gate by the wrap-up order (top-8 write forensics
+therefore not in its log; the tb gnorm series is the portrait).
+
+**Remaining structural option (recorded, NOT implemented)**:
+training-time demotion-eligibility exclusion for atoms whose write
+weight w = c·e^{μ+σ²/2} exceeds a threshold — 5′-8's own semantics
+("honest pricing keeps sinks in the atom table") applied as a hard
+eligibility rule for the training path; preferred over any truncation
+hack. This is the first candidate if the uct line reopens.
+
+**Throughput sprint status** (continues; Stage 2/3 prerequisite):
+profiler attribution complete (job 29859311; summary-print crash is
+cosmetic, raw table in the log): **CPU-bound** — 3 steps: 40.2s self
+CPU vs 12.7s self CUDA (≈2.6× launch overhead; 29k einsum calls, 125k
+aten::to). GPU side: PHASE_scoring_manage 65% of CUDA time (of which
+measure_stats 41%; complex GEMMs 2.57s = 20%), PHASE_readout 36%.
+Data-confirmed plan: (i) fixed-capacity padded state + torch.compile
+on the block step (main fix, attacks the launch storm); (ii) cache
+the constant Gp/Gm/phase band matrices in measure_stats; (iii)
+`manage_every` lever (in-tree) now justified by the 65% scoring
+share; block_len 512 variant next. Target ≥0.1 Mtok/s.
