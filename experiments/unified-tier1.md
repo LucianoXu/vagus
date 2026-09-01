@@ -299,11 +299,35 @@ two seeds exist.
 2. **m512 pooled vs evict-only — partially confirmed.** The sign of
    the harm flipped from catastrophic (+0.15/+0.43 behind evict-only)
    to marginal (+0.010 L2048 / +0.034 L4096 behind; plain-ct: +0.009 /
-   +0.031). Not yet ≥ evict-only at m512. At m1024 the pooled cell
-   (frozen 2.4277) is already better than m512e (2.4370) — but that
-   crosses budgets; the per-budget evict-only baselines (m256e, m1024e)
-   are running as job 29852376 to answer "at which budget does the
-   pool pay" cleanly.
+   +0.031). Not yet ≥ evict-only at m512; the per-budget baselines
+   below settle where the pool pays.
+
+### Pool vs evict-only, per budget (job 29852376, complete)
+
+Pool deficit = nll(pooled) − nll(evict-only), v2 policy; seed means.
+
+| | m256 | m512 | m1024 |
+|---|---|---|---|
+| frozen L2048 | +0.039 (2.4902/2.4508) | +0.010 (2.4472/2.4370) | +0.001 (2.4277/2.4270) |
+| frozen L4096 | +0.107 (2.5596/2.4527) | +0.034 (2.4742/2.4398) | +0.004 (2.4371/2.4328) |
+| plain L2048 | +0.038 (2.4636/2.4257) | +0.009 (2.4213/2.4120) | +0.000 (2.4026/2.4023) |
+| plain L4096 | +0.112 (2.5399/2.4275) | +0.031 (2.4458/2.4146) | +0.003 (2.4114/2.4082) |
+
+**Verdict: no budget tier where the pool nets positive on this corpus
+at these lengths.** The deficit is monotone in budget tightness with
+no crossover: neutral at loose budgets, mildly costly at tight ones —
+tight budgets force higher-value atoms into the demoted set, so the
+projection residual is exercised where it hurts. Recorded per
+instruction: **the pool is neutral-to-negative on this corpus/length;
+its value waits on long contexts, redundant corpora, or training
+adaptation** (the uct v2 arms are exactly the third test).
+Policy-level echo of engram's E3-SOTA "merge value = corpus
+redundancy" finding.
+
+Side fact worth keeping: at L4096 **evict-only beats full attention
+at every budget** — m256e 2.4527 (frozen) / 2.4275 (plain) vs full
+2.4591 / 2.4402: a 1/16-cache pure-eviction policy above the full
+cache beyond the trained context.
 3. **Exit portrait.** P=0 took zero traffic everywhere; sinks stay in
    the atom table — 5′-8's primary expectation ("honest pricing keeps
    sinks as atoms"). The slope-degeneracy branch (ε=1e-3) never fired;
