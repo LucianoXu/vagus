@@ -506,3 +506,28 @@ collision-mass mechanism gets no support in the direction form
 (≈zero correlation). Caveat recorded: this is a whole-cache
 measurement; the operating-point version (pool restricted to the
 triage-demoted subset) is the sharper gate for implementation.
+
+### Op-point delta verdict (engram job 29855184): criterion PASSED — implement delta
+
+Target = the triage-demoted subtable's normalized readout contribution
+(observed-ensemble selection, capture-protocol idealization; ~20% of
+atoms pooled, 60/54% of exits demote under observed stats — more
+aggressive than the streaming estimator's 7%, recorded). Ridge bracket
+(max of per-sequence and pooled shared-W) vs Hebbian direction:
+
+| | dp_op median | frac ≥ 0.1 | ridge_D | dir_D | per-tercile dp_op |
+|---|---|---|---|---|---|
+| prose | **0.297** | 0.82 | 0.60 | 0.26 | 0.20 / 0.26 / 0.38 |
+| code | **0.259** | 0.72 | 0.49 | 0.22 | 0.13 / 0.25 / 0.33 |
+
+Every tercile clears the 0.1 line; the gap grows at the operating
+point rather than collapsing. Per the recorded decision rule: **the
+delta write is implemented** — key-Gram whitened pool write (per
+coordinator: key-Gram, not Σ_q), mass column and denominator kept
+untouched; gated delta stays out (v3 null). Implementation = `v4`
+`pool_write: hebbian|delta` config-exclusive switch: state adds the
+damped-key Gram G = Σ w k̃ k̃ᵀ per kv-head (d² ≈ one P=1-pool's worth
+of state — the bytes ledger's "分子 P=1 + 分母几何 P=2 混合阶"
+coordinate, theory (c″)(iii)); the numerator slope readout becomes
+q^T (G+εI)^{-1} A (the DeltaNet fixed point on the subtable), the
+denominator stays Hebbian (t0, t1).
