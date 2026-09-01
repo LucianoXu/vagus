@@ -454,8 +454,11 @@ def attn_block_step(att: SoftmaxAttention, x, st: LayerState, pos0: int,
                 t1 = st2.t1 + torch.einsum('bht,bhtd->bhd', w1, kd)
                 T1 = st2.T1 + torch.einsum('bht,bhtd,bhte->bhde', w1, kd, vf)
                 with torch.no_grad():
+                    # max over weights actually written (post-selection);
+                    # w_all over unselected atoms can be astronomically
+                    # larger and is never absorbed.
                     health.pool_w_max = max(health.pool_w_max,
-                                            float(w_all.max()))
+                                            float((w0 + w1).max()))
                     health.pool_t1_max = max(health.pool_t1_max,
                                              float(t1.abs().max()))
                 st2 = LayerState(k_all, v_all, logc_all, alive_new, pos_all,
