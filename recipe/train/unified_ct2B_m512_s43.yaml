@@ -63,3 +63,4 @@ slow_interval: 100
 permanent_ckpt_interval: 2000
 recent_ckpt_minutes: 30
 peak_tflops: 312
+gnorm_gate: 1.1

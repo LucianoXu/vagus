@@ -75,14 +75,16 @@ def main():
     ap.add_argument('--ckpt', action='append', required=True)
     ap.add_argument('--data_dir', required=True)
     ap.add_argument('--out', required=True)
-    ap.add_argument('--budgets', type=int, nargs='+', default=[256, 512, 1024])
+    ap.add_argument('--budgets', type=int, nargs='*', default=[256, 512, 1024])
     ap.add_argument('--seq_len', type=int, nargs='+', default=[2048, 4096])
+    ap.add_argument('--no_full', action='store_true',
+                    help='skip the full-cache ceiling cell')
     ap.add_argument('--n_seq', type=int, default=128)
     ap.add_argument('--batch', type=int, default=8)
     ap.add_argument('--block_len', type=int, default=256)
     ap.add_argument('--ring_window', type=int, default=32)
-    ap.add_argument('--evict_only_at', type=int, default=512,
-                    help='budget for the eviction-only ablation row; 0 disables')
+    ap.add_argument('--evict_only_at', type=int, nargs='*', default=[512],
+                    help='budgets for eviction-only ablation rows; empty disables')
     ap.add_argument('--lam', type=float, default=1.0 / 1024,
                     help='offset-discount rate of the position measure (v2)')
     ap.add_argument('--lam_sens', type=float, default=1.0 / 256,
@@ -107,16 +109,17 @@ def main():
             seqs = holdout_sequences(store, L, args.n_seq if L <= 2048
                                      else max(args.n_seq // 2, 16))
             cells = []
-            cells.append(('full', ManageCfg(block_len=args.block_len,
-                                            ring_window=args.ring_window), False))
+            if not args.no_full:
+                cells.append(('full', ManageCfg(block_len=args.block_len,
+                                                ring_window=args.ring_window), False))
             for m in args.budgets:
                 cells.append((f'm{m}', ManageCfg(
                     block_len=args.block_len, budget=m,
                     ring_window=args.ring_window, demote=True,
                     lam=args.lam), True))
-            if args.evict_only_at:
-                cells.append((f'm{args.evict_only_at}e', ManageCfg(
-                    block_len=args.block_len, budget=args.evict_only_at,
+            for m in args.evict_only_at:
+                cells.append((f'm{m}e', ManageCfg(
+                    block_len=args.block_len, budget=m,
                     ring_window=args.ring_window, demote=False,
                     lam=args.lam), True))
             if args.lam_sens and L == 4096:

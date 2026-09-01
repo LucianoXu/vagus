@@ -127,6 +127,9 @@ class Health:
         self.demoted_p0 = 0     # atoms demoted into the P=0 tier
         self.demoted_p1 = 0     # atoms demoted into the P=1 tier
         self.evicted = 0
+        self.pool_w_max = 0.0   # largest pooled write weight seen (forward
+        self.pool_t1_max = 0.0  # signature of the v1 amplifier; cheap
+                                # stand-in for a pool-path gnorm split)
 
     def as_dict(self) -> dict:
         d = {}
@@ -137,6 +140,9 @@ class Health:
         d['unified_demoted_p0'] = float(self.demoted_p0)
         d['unified_demoted_p1'] = float(self.demoted_p1)
         d['unified_evicted'] = float(self.evicted)
+        if self.pool_w_max:
+            d['unified_pool_w_max'] = self.pool_w_max
+            d['unified_pool_t1_max'] = self.pool_t1_max
         return d
 
 
@@ -417,6 +423,11 @@ def attn_block_step(att: SoftmaxAttention, x, st: LayerState, pos0: int,
                                            w0 + w1 * (1 - mu_c), vf)
                 t1 = st2.t1 + torch.einsum('bht,bhtd->bhd', w1, kd)
                 T1 = st2.T1 + torch.einsum('bht,bhtd,bhte->bhde', w1, kd, vf)
+                with torch.no_grad():
+                    health.pool_w_max = max(health.pool_w_max,
+                                            float(w_all.max()))
+                    health.pool_t1_max = max(health.pool_t1_max,
+                                             float(t1.abs().max()))
                 st2 = LayerState(k_all, v_all, logc_all, alive_new, pos_all,
                                  t0, t1, T0, T1, ring_q, ring_pos)
             else:

@@ -58,6 +58,9 @@ class ManagedConfig(TrainConfig):
     demote: bool = True
     lam: float = 1.0 / 1024      # v2 position-measure discount rate
     slope_eps: float = 1e-3      # v2 P0/P1 slope-degeneracy threshold
+    # kill condition (uct v2 restart plan item 1): if set, the pre-clip
+    # grad norm at step 100 must be <= this, else checkpoint + exit(3)
+    gnorm_gate: float | None = None
     # drop the manifest's last shard from training — the eval holdout
     # (budget_ppl.py picks entries[-1] by the same rule)
     holdout_last_shard: bool = True
@@ -267,6 +270,18 @@ def train(config: ManagedConfig):
             monitor.observe(step, loss_acc / config.grad_accum_steps,
                             grad_norm, tokens_seen,
                             final=stop or step == steps_total)
+            if config.gnorm_gate is not None and step == 100 \
+                    and float(grad_norm) > config.gnorm_gate:
+                log(f'GNORM GATE FAILED: {float(grad_norm):.4g} > '
+                    f'{config.gnorm_gate} at step 100 — a second amplifier '
+                    f'exists; stopping (uct v2 restart plan item 1)')
+                if is_main:
+                    save_checkpoint(run_dir, 'recent', step, tokens_seen,
+                                    model, optimizer, loader, config)
+                monitor.close()
+                if is_dist:
+                    dist.destroy_process_group()
+                raise SystemExit(3)
             if is_main and config.manage == 'unified' \
                     and step % config.slow_interval == 0:
                 w = unwrap(net)
