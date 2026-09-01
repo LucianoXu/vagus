@@ -254,7 +254,8 @@ def _unrotate_ring(rope: RoPE, ring_q: torch.Tensor,
                    ring_pos: torch.Tensor) -> torch.Tensor:
     '''Rotate ring queries back to the 0-frame: multiply band b of the
     query at position p by e^{-i omega_b p}. Returns complex (B,H,W,Dh/2).'''
-    rope.prepare_m(int(ring_pos.max().item()) + 1)
+    if not torch.compiler.is_compiling():
+        rope.prepare_m(int(ring_pos.max().item()) + 1)
     mcos = rope.mcos.float()[ring_pos]          # (W, Dh/2)
     msin = rope.msin.float()[ring_pos]
     phase = torch.complex(mcos, -msin)          # e^{-i omega p}
@@ -374,8 +375,11 @@ def _combined_readout(q32, k32, v32, logits_bias, allow, st, scale, eps_z,
 
 
 def _transport(rope: RoPE, ring_q: torch.Tensor, delta: torch.Tensor):
-    '''Rotate ring queries forward by per-query offsets delta (W,).'''
-    rope.prepare_m(int(delta.max().item()) + 1)
+    '''Rotate ring queries forward by per-query offsets delta (W,).
+    Tables must be pre-prepared (stream_hidden hoists prepare_m; the
+    in-cell .item() was a per-cell dynamo graph break).'''
+    if not torch.compiler.is_compiling():
+        rope.prepare_m(int(delta.max().item()) + 1)
     mcos = rope.mcos.to(ring_q.dtype)[delta]      # (W, Dh/2)
     msin = rope.msin.to(ring_q.dtype)[delta]
     x = ring_q.reshape(*ring_q.shape[:-1], ring_q.shape[-1] // 2, 2)
@@ -461,13 +465,14 @@ def attn_block_step(att: SoftmaxAttention, x, st: LayerState, pos0: int,
         and att.short_conv_size is None, 'unified path covers the SAX subset'
     assert L >= mcfg.ring_window
     scale = 1.0 / math.sqrt(Dh)
+    if not torch.compiler.is_compiling():
+        att.rope.prepare_m(pos0 + L)
 
     qp, kp, vp = att.wq(x), att.wk(x), att.wv(x)
     q = qp.reshape(B, L, H, Dh).transpose(1, 2)
     k = kp.reshape(B, L, H, Dh).transpose(1, 2)
     if att.qk_norm:
         q, k = att.q_norm(q), att.k_norm(k)
-    att.rope.prepare_m(pos0 + L)
     q = att.rope(q, pos0)
     k = att.rope(k, pos0)
     v = vp.reshape(B, L, H, Dh).transpose(1, 2)
@@ -617,6 +622,7 @@ def stream_hidden(model, tokens: torch.Tensor, mcfg: ManageCfg,
     # budget + manage_every*block atoms; without (or with a non-binding
     # budget) it must hold the whole sequence.
     cap = min(L, mcfg.budget + mcfg.manage_every * bl) if manage else L
+    model.rope.prepare_m(L + 8)      # hoisted: cells never re-prepare
     states = [init_state(blk.att, B, tokens.device, dtype, mcfg, cap)
               for blk in model.blocks]
     cell = _cell_fn(mcfg.compile_cell)
