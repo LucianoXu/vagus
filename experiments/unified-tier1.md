@@ -790,3 +790,42 @@ compile (selective checkpointing of the readout only), scoring-path
 fusion (65% of CUDA time), micro8 via selective ckpt. Acceptance
 tests in-tree: compiled-vs-eager ≤5e-4 + gate-1 under compile +
 17-test suite green.
+
+---
+
+## Day close, 2026-09-01 (final addendum)
+
+**Sprint frozen** at 3.6× / 11.6h-per-2B single segment (usable line
+reached). Remaining ~2× levers, recorded for restart **when any
+training run is green-lit**: selective checkpointing (readout-only —
+unlocks micro8 and manage_every=2, both currently OOM at 40GB
+no-ckpt) and scoring-path fusion (65% of CUDA time); open diagnostics:
+compile × non-reentrant checkpoint metadata validation failure,
+me2/micro8 OOM signatures in runs/slurm-bench{2,3}-*.err.
+
+**Theory to-do list (recorded, NOT implemented):**
+1. **Collective pool loading is unpriced** — the per-atom demote
+   scores are individually honest but blind to the pool's aggregate
+   load; the deep-grid inversion (+0.20→+1.70 nat as M_eq shrinks
+   while demote share rises exactly as the λ mechanism predicts) is
+   this gap made empirical. The spread-ledger family (engram axis-D
+   item 1) is the natural home.
+2. **P0 is unreachable under per-atom ΔD argmin** — the literal
+   residuals give P1 ≤ P0 per atom always (an optimal slope cannot
+   hurt in L²), so P0 took zero traffic in every run; P0's actual
+   value is collective (guaranteed-positive denominator under load).
+   Needs positivity-aware pricing or an eligibility rule, tied to the
+   same collective-load gap as (1) and to the recorded
+   sink-eligibility option from the uct line.
+
+Full day's chain for the record: Tier-1 matrix (frozen + plain arms +
+eviction ladder) → v2 (position-factorized pricing + projected pool)
+→ Gm cross-check fix (v2.1, all conclusions robust) → v3.1 (stepped
+gate: mild harm, static default) → v4 (whitened slopes: harmful as
+implemented, derived form to theory) → v2.2 (ledger normalization:
+discriminating experiment — analytic-lever residue; uct line closed)
+→ throughput sprint (profile → padded-static + compile → 3.6×) →
+byte-fair deep grid (criterion 1 confirmed, criterion 2 inverted;
+frozen D(R) leg with the 32-atom headline). All numbers in
+stignore-runs/eval/*.json and this file; branch unified-tier1, synced
+GitHub + raven.
