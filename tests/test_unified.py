@@ -155,3 +155,42 @@ def test_pool_additivity():
     assert abs(t0_batch.item() - t0_seq.item()) < 1e-10
     assert (t1_batch - t1_seq).abs().max().item() < 1e-10
     assert (T1_batch - T1_seq).abs().max().item() < 1e-10
+
+
+# ---- v3 stepped-gate checks ----
+
+def test_stepped_decay_semigroup_and_calibration():
+    '''Two half-block decays compose to one full block, and the
+    cumulative decay at the mean query horizon 1/lam equals the static
+    damping gamma_b (the v2/v3 alignment).'''
+    from infra.components.unified import _band_decay, _band_freqs, _coherence
+    from infra.components.pos_embed import RoPE
+    rope = RoPE(128, 32, 64)
+    lam = 1.0 / 1024
+    half = _band_decay(rope, lam, 128, 'cpu').double()
+    full = _band_decay(rope, lam, 256, 'cpu').double()
+    assert (half * half - full).abs().max().item() < 2e-6  # fp32 factors
+    horizon = _band_decay(rope, lam, round(1 / lam), 'cpu').double()
+    gamma = _coherence(lam, _band_freqs(rope, 'cpu')).abs().repeat_interleave(2)
+    assert (horizon - gamma).abs().max().item() < 2e-6  # fp32 vs f64
+
+
+def test_pool_gate_switch():
+    '''With no demotions the two gate modes are bit-identical (empty
+    pool: the eonly sanity); with demotions they must differ (the
+    switch is live). The default 'static' path is the untouched v2
+    branch — the existing tests above are its regression suite.'''
+    model, x = tiny_model(), tokens()
+    kw = dict(block_len=64, budget=64, ring_window=16)
+    with torch.no_grad():
+        a = stream_hidden(model, x, ManageCfg(**kw, demote=False,
+                                              pool_gate='static'), manage=True)
+        b = stream_hidden(model, x, ManageCfg(**kw, demote=False,
+                                              pool_gate='stepped'), manage=True)
+        assert torch.equal(a, b), 'empty-pool modes must be bit-identical'
+        c = stream_hidden(model, x, ManageCfg(**kw, demote=True,
+                                              pool_gate='static'), manage=True)
+        d = stream_hidden(model, x, ManageCfg(**kw, demote=True,
+                                              pool_gate='stepped'), manage=True)
+        assert not torch.equal(c, d), 'gate switch has no effect'
+        assert torch.isfinite(d).all()

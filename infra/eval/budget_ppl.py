@@ -89,6 +89,9 @@ def main():
                     help='offset-discount rate of the position measure (v2)')
     ap.add_argument('--lam_sens', type=float, default=1.0 / 256,
                     help='second lambda for the L4096/m512 sensitivity cell; 0 disables')
+    ap.add_argument('--pool_gate', choices=['static', 'stepped'],
+                    default='static',
+                    help='v2 static write-damping vs v3 stepped per-band decay')
     args = ap.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -101,6 +104,7 @@ def main():
                'holdout_shard': holdout, 'n_seq': args.n_seq,
                'block_len': args.block_len, 'ring_window': args.ring_window,
                'lam': args.lam, 'lam_sens': args.lam_sens,
+               'pool_gate': args.pool_gate,
                'ckpts': {}}
     for ckpt in args.ckpt:
         model, meta = load_model(ckpt, device)
@@ -116,17 +120,17 @@ def main():
                 cells.append((f'm{m}', ManageCfg(
                     block_len=args.block_len, budget=m,
                     ring_window=args.ring_window, demote=True,
-                    lam=args.lam), True))
+                    lam=args.lam, pool_gate=args.pool_gate), True))
             for m in args.evict_only_at:
                 cells.append((f'm{m}e', ManageCfg(
                     block_len=args.block_len, budget=m,
                     ring_window=args.ring_window, demote=False,
-                    lam=args.lam), True))
+                    lam=args.lam, pool_gate=args.pool_gate), True))
             if args.lam_sens and L == 4096:
                 cells.append((f'm512_lam{round(1 / args.lam_sens)}', ManageCfg(
                     block_len=args.block_len, budget=512,
                     ring_window=args.ring_window, demote=True,
-                    lam=args.lam_sens), True))
+                    lam=args.lam_sens, pool_gate=args.pool_gate), True))
             for name, mcfg, manage in cells:
                 nlls, health = seq_nll(model, seqs, mcfg, manage, device,
                                        batch=args.batch)

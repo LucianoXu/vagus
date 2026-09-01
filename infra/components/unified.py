@@ -69,6 +69,14 @@ class ManageCfg:
     demote: bool = True       # enable the type-change exits (P=0/P=1 pool)
     lam: float = 1.0 / 1024   # offset-discount rate of the position measure
     slope_eps: float = 1e-3   # damped-slope variance below this -> P=0
+    # Pool aging (v3, theory (c″)(iv)): 'static' = v2, slope damped once
+    # at write by gamma_b; 'stepped' = slope written undamped, then t1/T1
+    # decay per streaming block by exp(-lam_b * block), lam_b =
+    # lam * ln(1/gamma_b) — cumulative decay matches the static damping
+    # at the mean query horizon 1/lam. t0/T0 (and the P=0 tier) never
+    # decay: constants carry no phase. Mutually exclusive switch; the
+    # static branch is the untouched v2 path.
+    pool_gate: str = 'static'
     eps_z: float = 1e-4       # denominator guardrail threshold
     mu_clamp: float = 25.0    # cap on the centering logit inside exp()
 
@@ -167,6 +175,18 @@ def _as_complex(x: torch.Tensor) -> torch.Tensor:
 def _coherence(lam: float, omega: torch.Tensor) -> torch.Tensor:
     '''g(w) = E_{s~Exp(lam)} e^{-i w s} = lam / (lam + i w). complex128.'''
     return lam / torch.complex(torch.full_like(omega, lam), omega)
+
+
+def _band_decay(rope: RoPE, lam: float, tokens: int, device) -> torch.Tensor:
+    '''Per-band stepped-gate decay over `tokens` positions, interleaved
+    to (Dh,): exp(-lam_b * tokens) with lam_b = lam * ln(1/gamma_b),
+    i.e. gamma_b ** (lam * tokens). Semigroup in `tokens` by
+    construction; at tokens = 1/lam the cumulative decay equals the
+    static damping gamma_b.'''
+    omega = _band_freqs(rope, device)
+    gamma = _coherence(lam, omega).abs()              # (nb,) float64
+    dec = gamma.pow(lam * tokens).float()
+    return dec.repeat_interleave(2)
 
 
 def _unrotate_ring(rope: RoPE, ring_q: torch.Tensor,
@@ -392,8 +412,16 @@ def attn_block_step(att: SoftmaxAttention, x, st: LayerState, pos0: int,
     ring_q = q[:, :, -W:, :].detach().float()
     ring_pos = torch.arange(pos0 + L - W, pos0 + L, device=x.device)
 
+    # v3 stepped gate: the elapsed block ages the pool's phase-carrying
+    # moments (t1/T1) by one block of per-band decay, before this
+    # boundary's writes; constants (t0/T0, the P=0 tier) never decay.
+    t1_in, T1_in = st.t1, st.T1
+    if manage and mcfg.pool_gate == 'stepped':
+        dec = _band_decay(att.rope, mcfg.lam, L, x.device)
+        t1_in = t1_in * dec
+        T1_in = T1_in * dec.unsqueeze(-1)
     st2 = LayerState(k_all, v_all, logc_all, alive_all, pos_all,
-                     st.t0, st.t1, st.T0, st.T1, ring_q, ring_pos)
+                     st.t0, t1_in, st.T0, T1_in, ring_q, ring_pos)
 
     if manage:
         picks = _manage(att, st2, pos0 + L, mcfg, health)
@@ -414,10 +442,12 @@ def attn_block_step(att: SoftmaxAttention, x, st: LayerState, pos0: int,
                 w0 = w_all * sel_p0.float()
                 w1 = w_all * sel_p1.float()
                 kf, vf = k_all.float(), v_all.float()
-                omega = _band_freqs(att.rope, x.device)
-                gamma = _coherence(mcfg.lam, omega).abs().float()  # (nb,)
-                damp = gamma.repeat_interleave(2)                  # (Dh,)
-                kd = kf * damp                                     # damped key
+                if mcfg.pool_gate == 'static':          # v2: damp at write
+                    omega = _band_freqs(att.rope, x.device)
+                    gamma = _coherence(mcfg.lam, omega).abs().float()
+                    kd = kf * gamma.repeat_interleave(2)
+                else:                                   # v3: age via decay
+                    kd = kf
                 t0 = st2.t0 + (w0 + w1 * (1 - mu_c)).sum(-1)
                 T0 = st2.T0 + torch.einsum('bht,bhte->bhe',
                                            w0 + w1 * (1 - mu_c), vf)
