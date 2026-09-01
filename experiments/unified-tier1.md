@@ -257,3 +257,90 @@ torch.compile of the block cell and W=16 scoring. Target ≥ 0.05
 Mtok/s (2B ≈ 11h). Relaunch BOTH unified seeds fresh on v2 so the
 pair shares one code state; plain arms stay valid as controls
 (manage=none semantics untouched).
+
+---
+
+## v2 results (2026-09-01, commits dbcc5fe/d6f3a1f; jobs 29851927/29851928)
+
+Same protocol as Tier-1, v2 policy (§6(a′) pricing + 5′-7/5′-8
+projected pool; eviction score untouched). NLL, seed-averaged where
+two seeds exist.
+
+### Frozen SAX2, v1 → v2
+
+| cell | v1 | v2 | Δ |
+|---|---|---|---|
+| L2048/m256 | 3.6274 | 2.4902 | **−1.137** |
+| L2048/m512 | 2.5863 | 2.4472 | −0.139 |
+| L2048/m1024 | 2.4347 | 2.4277 | −0.007 |
+| L2048/m512e | 2.4370 | 2.4370 | 0 (bit-identical) |
+| L4096/m256 | 4.7117 | 2.5596 | **−2.152** |
+| L4096/m512 | 2.8709 | 2.4742 | −0.397 |
+| L4096/m1024 | 2.4878 | 2.4371 | −0.051 |
+| L4096/m512e | 2.4398 | 2.4398 | 0 (bit-identical) |
+
+### plain-ct2B (both seeds), v2 policy
+
+| cell | v2 (seed mean) | gap vs own full |
+|---|---|---|
+| L2048: full / m256 / m512 / m1024 / m512e | 2.3999 / 2.4636 / 2.4213 / 2.4026 / 2.4120 | — / +0.064 / +0.021 / +0.003 / +0.012 |
+| L4096: full / m256 / m512 | 2.4402 / 2.5399 / 2.4458 | — / +0.100 / +0.006 |
+| L4096: m1024 / m512e / m512_lam256 | s43: 2.4114 / 2.4147 / 2.4663 (s44 landing) | +0.029 (m256→) … |
+
+### 5′-8 predictions, checked
+
+1. **Guardrail collapse — confirmed.** z-fallback m512: 0.20%/0.75%
+   (v1, L2048/L4096) → 0.013%/0.056%; m256: 1.9%/4.4% → 0.06%/0.18%.
+   One to two orders of magnitude, at every budget. μ-clamp: never
+   fired.
+2. **m512 pooled vs evict-only — partially confirmed.** The sign of
+   the harm flipped from catastrophic (+0.15/+0.43 behind evict-only)
+   to marginal (+0.010 L2048 / +0.034 L4096 behind; plain-ct: +0.009 /
+   +0.031). Not yet ≥ evict-only at m512. At m1024 the pooled cell
+   (frozen 2.4277) is already better than m512e (2.4370) — but that
+   crosses budgets; the per-budget evict-only baselines (m256e, m1024e)
+   are running as job 29852376 to answer "at which budget does the
+   pool pay" cleanly.
+3. **Exit portrait.** P=0 took zero traffic everywhere; sinks stay in
+   the atom table — 5′-8's primary expectation ("honest pricing keeps
+   sinks as atoms"). The slope-degeneracy branch (ε=1e-3) never fired;
+   ε review noted, not blocking. The dominant v2 behavior is
+   **demote-refusal**: at m512/L2048 the demotion share fell from 53%
+   (v1) to 6.8% (v2) — the honest price says "evict, don't pool" for
+   most candidates, and the small surviving pool is near-harmless.
+4. **λ sensitivity (consistent direction, default validated).**
+   L4096/m512 at λ=1/256: frozen 2.4924 vs 2.4742 (λ=1/1024); plain
+   s43: 2.4663 vs 2.4464. Shorter horizon under-prices decoherence.
+
+### Finding revision (v1 → v2)
+
+The v1 conclusion "plain CT widens the management gap at tight
+budgets" was mostly a pool-pathology artifact: under the v2 policy
+the gaps are essentially identical frozen vs plain-ct (L2048 m256:
++0.066 vs +0.064; m512: +0.023 vs +0.021; L4096 m256: +0.101 vs
++0.100) — plain continued training neither widens nor closes the gap.
+What survives of the v1 finding: uniform ~−0.025 improvement
+everywhere, no differential adaptation. This makes the closed-loop
+attribution for the uct v2 arms maximally clean: the static protocol
+is seed-stable and CT-invariant at every budget, so **any gap-closing
+by management-aware training is the model learning to write
+management-survivable kv** — the direct evidence the training axis
+wants (coordinator note, 2026-09-01).
+
+### uct v2 relaunch (green-lit after this section's commit)
+
+Per the restart plan above: fresh runs from the SAX2 origin under
+commit ≥ d6f3a1f (recipes now carry `gnorm_gate: 1.1`), 24h walltime;
+at ~0.02 Mtok/s a 2B arm needs one SIGUSR1 resume — the resume is the
+same sbatch command:
+
+    sbatch -J uct-s43 recipe/slurm/raven_managed.sbatch recipe/train/unified_ct2B_m512_s43.yaml
+    sbatch -J uct-s44 recipe/slurm/raven_managed.sbatch recipe/train/unified_ct2B_m512_s44.yaml
+
+Kill condition is automatic (trainer exits 3 with "GNORM GATE FAILED"
+if step-100 gnorm > 1.1); health logs now carry the pool write
+magnitudes (`unified_pool_w_max`, `unified_pool_t1_max`) as the
+forward signature of the v1 amplifier — the strict pool-path/atom-path
+gnorm split is deferred (checkpointed recompute makes retain_grad
+unreliable); the gate plus these signatures cover recurrence
+localization.
