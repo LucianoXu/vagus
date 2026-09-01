@@ -100,6 +100,11 @@ class ManageCfg:
     # of e^{mu+sigma^2/2}-scaled ones whose bf16/fp32 rounding noise
     # was the residual gradient amplifier (gate portrait 2026-09-01).
     pool_norm: str = 'ledger'     # 'ledger' | 'off'
+    # throughput levers (sprint, 2026-09-01): manage decisions fire only
+    # every k-th block boundary; between them the atom count transiently
+    # overshoots the budget by up to (k-1)*block_len (semantics change,
+    # recorded). k=1 = every boundary (default, all results so far).
+    manage_every: int = 1
     eps_z: float = 1e-4       # denominator guardrail threshold
     mu_clamp: float = 25.0    # cap on the centering logit inside exp()
 
@@ -489,7 +494,8 @@ def attn_block_step(att: SoftmaxAttention, x, st: LayerState, pos0: int,
                      st.t0, t1_in, st.T0, T1_in, st.Gk, st.logzbar,
                      ring_q, ring_pos)
 
-    if manage:
+    manage_now = manage and ((pos0 // max(L, 1)) + 1) % mcfg.manage_every == 0
+    if manage_now:
         picks = _manage(att, st2, pos0 + L, mcfg, health)
         if picks is not None:
             sel_evict, sel_p0, sel_p1, mu, sig2, logzbar_obs = picks
