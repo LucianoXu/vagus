@@ -107,6 +107,9 @@ much as eager streaming throughput allows and resume after 09-07.
 | 29835295 | unified-ct2B-m512-s43 (arm 3 pilot) | FAILED at maintenance wall (5h44); **gate 2 not passed — chronic divergence** (loss 2.60@100 → 3.27@500, gnorm →2.6e16); weights polluted, archived, never resume |
 | 29835296 | unified-ct2B-m512-s44 (arm 3 pilot) | same (FAILED 5h44) |
 | 29840076 | eval-plainct: both arm-4 ckpts, same 10 cells | COMPLETED → runs/eval/plain_ct.json (copy: stignore-runs/eval/) |
+| 29851927+28 | v2 evals: frozen + both plain ckpts, 11 cells each | COMPLETED → runs/eval/{frozen_sax2,plain_ct}_v2.json (mirrored) |
+| 29852376 | evict-only m256e/m1024e × 2 lengths × 3 ckpts | COMPLETED → runs/eval/evict_only_extra.json (mirrored) |
+| 29852392+93 | uct v2 s43/s44 relaunch (gnorm_gate 1.1, commit dae0f07) | queued |
 
 Deployment note: GitHub was unreachable from the workstation at
 submit time; the branch reached raven as a git bundle over SSH
