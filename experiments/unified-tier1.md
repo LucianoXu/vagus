@@ -481,7 +481,9 @@ measurement (Hebbian slope's direction + per-sequence scalar/intercept,
 the estimator dimension; two ill-conditioned variants recorded in the
 JSON as negative results: the whole-cache ratio readout collapses on
 its signed denominator (guard rates up to 57%, R² ~ −150 — the
-positivity-guardrail failure mode writ large) and frozen-Z̄ cannot
+positivity-guardrail failure mode writ large: an independent empirical
+demonstration of why 5′-8's always-positive P=0 tier and the
+denominator guardrail are necessary, cross-referenced per coordinator) and frozen-Z̄ cannot
 absorb the numerator's dynamic range).
 
 | tercile | ridge(d) | hebbian-dir | delta_price | frac>0.05 |
