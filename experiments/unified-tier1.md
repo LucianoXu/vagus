@@ -531,3 +531,36 @@ of state — the bytes ledger's "分子 P=1 + 分母几何 P=2 混合阶"
 coordinate, theory (c″)(iii)); the numerator slope readout becomes
 q^T (G+εI)^{-1} A (the DeltaNet fixed point on the subtable), the
 denominator stays Hebbian (t0, t1).
+
+---
+
+## Upstream finding: Gm orientation bug in _measure_stats (2026-09-01)
+
+**Credit: caught by the engram triage-port agent's independent
+reimplementation** (kvbm/triage.py) — two implementations of the same
+closed forms cross-checked against numerical integration of the offset
+measure; exactly the failure class a lone implementation cannot see
+(the transposed form is also real and passes symmetry intuition).
+
+- Bug: `Gm = g(om − om.T)` (entry [b,b'] = g(ω_b' − ω_b), the
+  conjugate-transposed bilinear form). Correct: `om.T − om` so the
+  form sums C_b·conj(C_b')·g(ω_b − ω_b'). μ and γ paths unaffected
+  (verified); **V (decoherence variance) biased — 21.9% max on our
+  regression head, ~63% on theirs; 5e-7 after the fix.**
+- Independent confirmation protocol followed: the numeric-integration
+  regression test was ported and run against the broken code FIRST
+  (reproduced the bias), then the one-line fix (commit 4e1b0d0),
+  14/14 tests.
+- Blast radius: V enters demote prices (res_p1's 2V, σ_tot²) and the
+  projection mass factor e^{μ+σ²/2} — all of v2/v3/v4 frozen numbers
+  carry it. **Track B and the op-point delta verdict are unaffected by
+  construction** (observed-ensemble stats; audited — no _coherence/Gm
+  in the e2pp path), so the delta green-light stands.
+- Actions: pending uct arms (29852392/93) cancelled before ever
+  burning GPU on wrong prices; the v4 A/B (29855344) had just started
+  and was killed (its partial output was wrong-priced anyway).
+  Resubmitted on 4e1b0d0: uct 29855753/54 (gnorm gate discipline
+  unchanged), frozen **v2.1** 29855755, **v3.1** 29855756 (the v3
+  null must re-stand on corrected pricing or be re-verdicted),
+  **v4** A/B 29855757. v2→v2.1 diff (demote rate, guardrail rate,
+  per-budget deficits) lands here when 29855755 completes.
