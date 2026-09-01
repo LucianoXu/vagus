@@ -92,6 +92,9 @@ def main():
     ap.add_argument('--pool_gate', choices=['static', 'stepped'],
                     default='static',
                     help='v2 static write-damping vs v3 stepped per-band decay')
+    ap.add_argument('--pool_write', choices=['hebbian', 'delta'],
+                    default='hebbian',
+                    help='v4: whitened (delta/RLS) pool slopes vs hebbian')
     args = ap.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -105,6 +108,7 @@ def main():
                'block_len': args.block_len, 'ring_window': args.ring_window,
                'lam': args.lam, 'lam_sens': args.lam_sens,
                'pool_gate': args.pool_gate,
+               'pool_write': args.pool_write,
                'ckpts': {}}
     for ckpt in args.ckpt:
         model, meta = load_model(ckpt, device)
@@ -120,17 +124,20 @@ def main():
                 cells.append((f'm{m}', ManageCfg(
                     block_len=args.block_len, budget=m,
                     ring_window=args.ring_window, demote=True,
-                    lam=args.lam, pool_gate=args.pool_gate), True))
+                    lam=args.lam, pool_gate=args.pool_gate,
+                    pool_write=args.pool_write), True))
             for m in args.evict_only_at:
                 cells.append((f'm{m}e', ManageCfg(
                     block_len=args.block_len, budget=m,
                     ring_window=args.ring_window, demote=False,
-                    lam=args.lam, pool_gate=args.pool_gate), True))
+                    lam=args.lam, pool_gate=args.pool_gate,
+                    pool_write=args.pool_write), True))
             if args.lam_sens and L == 4096:
                 cells.append((f'm512_lam{round(1 / args.lam_sens)}', ManageCfg(
                     block_len=args.block_len, budget=512,
                     ring_window=args.ring_window, demote=True,
-                    lam=args.lam_sens, pool_gate=args.pool_gate), True))
+                    lam=args.lam_sens, pool_gate=args.pool_gate,
+                    pool_write=args.pool_write), True))
             for name, mcfg, manage in cells:
                 nlls, health = seq_nll(model, seqs, mcfg, manage, device,
                                        batch=args.batch)

@@ -62,6 +62,7 @@ class ManagedConfig(TrainConfig):
     demote: bool = True
     lam: float = 1.0 / 1024      # v2 position-measure discount rate
     pool_gate: str = 'static'    # 'static' (v2) | 'stepped' (v3 per-band gate)
+    pool_write: str = 'hebbian'  # 'hebbian' | 'delta' (v4 whitened slopes)
     slope_eps: float = 1e-3      # v2 P0/P1 slope-degeneracy threshold
     # kill condition (uct v2 restart plan item 1): if set, the pre-clip
     # grad norm at step 100 must be <= this, else checkpoint + exit(3)
@@ -202,7 +203,8 @@ def train(config: ManagedConfig):
     mcfg = ManageCfg(block_len=config.block_len, budget=config.budget,
                      ring_window=config.ring_window, demote=config.demote,
                      lam=config.lam, slope_eps=config.slope_eps,
-                     pool_gate=config.pool_gate)
+                     pool_gate=config.pool_gate,
+                     pool_write=config.pool_write)
     if config.manage == 'triage':
         net: nn.Module = StreamWrapper(model, mcfg)
     else:

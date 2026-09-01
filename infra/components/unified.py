@@ -83,6 +83,13 @@ class ManageCfg:
     # decay: constants carry no phase. Mutually exclusive switch; the
     # static branch is the untouched v2 path.
     pool_gate: str = 'static'
+    # v4 (op-point delta verdict, 2026-09-01): pool numerator/denominator
+    # SLOPES read through the damped-key Gram's whitener,
+    # (t1,T1) -> tau (G + eps*tau*I)^-1 (t1,T1), tau = tr(G)/d — the
+    # DeltaNet/RLS fixed point on the pooled subtable; isotropic G
+    # recovers Hebbian exactly. Mass column (t0/T0) and the guardrail
+    # untouched. 'hebbian' = v2/v3 behavior.
+    pool_write: str = 'hebbian'   # 'hebbian' | 'delta'
     eps_z: float = 1e-4       # denominator guardrail threshold
     mu_clamp: float = 25.0    # cap on the centering logit inside exp()
 
@@ -100,12 +107,14 @@ class LayerState:
     t1: torch.Tensor       # (B, H, Dh)    pool: damped-key first moment
     T0: torch.Tensor       # (B, H, Dv)
     T1: torch.Tensor       # (B, H, Dh, Dv)
+    Gk: torch.Tensor       # (B, H, Dh, Dh) damped-key Gram (delta mode)
     ring_q: torch.Tensor   # (B, H, W, Dh) fp32 post-RoPE recent queries
     ring_pos: torch.Tensor # (W,) int64 absolute positions of ring queries
 
     def tensors(self) -> tuple:
         return (self.k, self.v, self.logc, self.alive, self.pos, self.t0,
-                self.t1, self.T0, self.T1, self.ring_q, self.ring_pos)
+                self.t1, self.T0, self.T1, self.Gk, self.ring_q,
+                self.ring_pos)
 
     @staticmethod
     def from_tensors(ts) -> 'LayerState':
@@ -126,6 +135,7 @@ def init_state(att: SoftmaxAttention, batch: int, device, dtype,
         t0=z(batch, H, dt=torch.float32), t1=z(batch, H, Dh, dt=torch.float32),
         T0=z(batch, H, Dv, dt=torch.float32),
         T1=z(batch, H, Dh, Dv, dt=torch.float32),
+        Gk=z(batch, H, Dh, Dh, dt=torch.float32),
         ring_q=z(batch, H, 0, Dh, dt=torch.float32),
         ring_pos=torch.zeros(0, device=device, dtype=torch.int64),
     )
@@ -255,16 +265,39 @@ def _measure_stats(rope: RoPE, st: LayerState, t_dec: int, lam: float):
 # Readout (unchanged from v1)
 # --------------------------------------------------------------------------
 
-def _pool_terms(q32: torch.Tensor, st_t0, st_t1, st_T0, st_T1, scale: float):
+def _pool_terms(q32: torch.Tensor, st_t0, st_t1, st_T0, st_T1, scale: float,
+                Gk=None):
     '''Pool contributions for queries q32 (B, H, L, Dh) fp32.
-    Returns Z_p (B, H, L) and N_p (B, H, L, Dv).'''
-    Z_p = st_t0.unsqueeze(-1) + torch.einsum('bhld,bhd->bhl', q32, st_t1) * scale
-    N_p = st_T0.unsqueeze(-2) + torch.einsum('bhld,bhde->bhle', q32, st_T1) * scale
+    Returns Z_p (B, H, L) and N_p (B, H, L, Dv). With Gk given (delta
+    mode, v4) the slopes read through the damped-key Gram whitener:
+    (t1, T1) -> tau (Gk + eps tau I)^-1 (t1, T1), tau = tr(Gk)/d —
+    the RLS/DeltaNet fixed point on the pooled subtable; isotropic Gk
+    recovers the Hebbian slopes exactly. Constants untouched.'''
+    t1, T1 = st_t1, st_T1
+    if Gk is not None:
+        d = q32.shape[-1]
+        tau = (torch.diagonal(Gk, dim1=-2, dim2=-1).sum(-1) / d)  # (B,H)
+        live = tau > 0
+        if bool(live.any()):
+            eps = 1e-4 * tau.clamp_min(1e-30)
+            A = Gk + (eps[..., None, None]
+                      * torch.eye(d, device=Gk.device, dtype=Gk.dtype))
+            rhs = torch.cat([st_t1.unsqueeze(-1), st_T1], dim=-1)
+            sol = torch.linalg.solve(
+                A + (~live)[..., None, None] * torch.eye(
+                    d, device=Gk.device, dtype=Gk.dtype), rhs)
+            sol = sol * tau.clamp_min(0)[..., None, None]
+            t1w, T1w = sol[..., 0], sol[..., 1:]
+            keep = live[..., None]
+            t1 = torch.where(keep, t1w, st_t1)
+            T1 = torch.where(keep.unsqueeze(-1), T1w, st_T1)
+    Z_p = st_t0.unsqueeze(-1) + torch.einsum('bhld,bhd->bhl', q32, t1) * scale
+    N_p = st_T0.unsqueeze(-2) + torch.einsum('bhld,bhde->bhle', q32, T1) * scale
     return Z_p, N_p
 
 
 def _combined_readout(q32, k32, v32, logits_bias, allow, st, scale, eps_z,
-                      health: Health | None):
+                      health: Health | None, pool_write: str = 'hebbian'):
     '''Shared readout: q32 (B,H,L,Dh) fp32; k32/v32 (B,H,T,*) fp32;
     logits_bias (B,H,T) fp32 added to raw logits (the mass column);
     allow (B,H,L,T) bool. Returns out (B,H,L,Dv), logZ (B,H,L),
@@ -278,7 +311,8 @@ def _combined_readout(q32, k32, v32, logits_bias, allow, st, scale, eps_z,
     e = torch.exp(x - M)
     Z_a = e.sum(dim=-1)                                # (B,H,L)
     N_a = torch.einsum('bhlt,bhte->bhle', e, v32)      # (B,H,L,Dv)
-    Z_p, N_p = _pool_terms(q32, st.t0, st.t1, st.T0, st.T1, scale)
+    Z_p, N_p = _pool_terms(q32, st.t0, st.t1, st.T0, st.T1, scale,
+                           Gk=(st.Gk if pool_write == 'delta' else None))
     em = torch.exp(-M.squeeze(-1))
     Z = Z_a + em * Z_p
     N = N_a + em.unsqueeze(-1) * N_p
@@ -328,7 +362,8 @@ def _manage(att: SoftmaxAttention, st: LayerState, t_end: int,
     k32, v32 = st.k.float(), st.v.float()
     allow = st.alive.unsqueeze(-2).expand(B, H, qt.shape[2], T)
     f, logZ, xraw = _combined_readout(qt, k32, v32, st.logc, allow, st,
-                                      scale, mcfg.eps_z, None)
+                                      scale, mcfg.eps_z, None,
+                                      pool_write=mcfg.pool_write)
     d2 = (v32.pow(2).sum(-1).unsqueeze(-2) - 2 * torch.einsum(
         'bhwe,bhte->bhwt', f, v32) + f.pow(2).sum(-1).unsqueeze(-1))
     d2 = d2.clamp(min=0)
@@ -409,7 +444,7 @@ def attn_block_step(att: SoftmaxAttention, x, st: LayerState, pos0: int,
 
     out, _, _ = _combined_readout(
         q.float(), k_all.float(), v_all.float(), logc_all, allow, st,
-        scale, mcfg.eps_z, health)
+        scale, mcfg.eps_z, health, pool_write=mcfg.pool_write)
     out = out.to(x.dtype).transpose(1, 2).reshape(B, L, H * Dh)
     out = att.wo(out)
 
@@ -427,7 +462,7 @@ def attn_block_step(att: SoftmaxAttention, x, st: LayerState, pos0: int,
         t1_in = t1_in * dec
         T1_in = T1_in * dec.unsqueeze(-1)
     st2 = LayerState(k_all, v_all, logc_all, alive_all, pos_all,
-                     st.t0, t1_in, st.T0, T1_in, ring_q, ring_pos)
+                     st.t0, t1_in, st.T0, T1_in, st.Gk, ring_q, ring_pos)
 
     if manage:
         picks = _manage(att, st2, pos0 + L, mcfg, health)
@@ -459,6 +494,9 @@ def attn_block_step(att: SoftmaxAttention, x, st: LayerState, pos0: int,
                                            w0 + w1 * (1 - mu_c), vf)
                 t1 = st2.t1 + torch.einsum('bht,bhtd->bhd', w1, kd)
                 T1 = st2.T1 + torch.einsum('bht,bhtd,bhte->bhde', w1, kd, vf)
+                Gk_new = (st2.Gk + torch.einsum('bht,bhtd,bhte->bhde',
+                                                w1, kd, kd)
+                          if mcfg.pool_write == 'delta' else st2.Gk)
                 with torch.no_grad():
                     # max over weights actually written (post-selection);
                     # w_all over unselected atoms can be astronomically
@@ -468,10 +506,10 @@ def attn_block_step(att: SoftmaxAttention, x, st: LayerState, pos0: int,
                     health.pool_t1_max = max(health.pool_t1_max,
                                              float(t1.abs().max()))
                 st2 = LayerState(k_all, v_all, logc_all, alive_new, pos_all,
-                                 t0, t1, T0, T1, ring_q, ring_pos)
+                                 t0, t1, T0, T1, Gk_new, ring_q, ring_pos)
             else:
                 st2 = LayerState(k_all, v_all, logc_all, alive_new, pos_all,
-                                 st2.t0, st2.t1, st2.T0, st2.T1,
+                                 st2.t0, st2.t1, st2.T0, st2.T1, st2.Gk,
                                  ring_q, ring_pos)
     return out, st2
 

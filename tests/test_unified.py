@@ -194,3 +194,39 @@ def test_pool_gate_switch():
                                               pool_gate='stepped'), manage=True)
         assert not torch.equal(c, d), 'gate switch has no effect'
         assert torch.isfinite(d).all()
+
+
+# ---- v4 delta-write checks ----
+
+def test_delta_isotropic_recovers_hebbian():
+    '''With an isotropic damped-key Gram, tau (G+eps tau I)^-1 = ~I and
+    the delta readout equals the Hebbian readout.'''
+    from infra.components.unified import _pool_terms
+    torch.manual_seed(3)
+    B, H, L, d, dv = 2, 3, 5, 8, 8
+    q = torch.randn(B, H, L, d)
+    t0 = torch.rand(B, H) + 1
+    t1 = torch.randn(B, H, d)
+    T0 = torch.randn(B, H, dv)
+    T1 = torch.randn(B, H, d, dv)
+    g = 2.7
+    Gk = g * torch.eye(d).expand(B, H, d, d).clone()
+    Zh, Nh = _pool_terms(q, t0, t1, T0, T1, 0.5)
+    Zd, Nd = _pool_terms(q, t0, t1, T0, T1, 0.5, Gk=Gk)
+    assert (Zh - Zd).abs().max().item() < 1e-3
+    assert (Nh - Nd).abs().max().item() < 1e-3
+    # empty Gram: delta mode must fall back to Hebbian slopes untouched
+    Z0, N0 = _pool_terms(q, t0, t1, T0, T1, 0.5, Gk=torch.zeros(B, H, d, d))
+    assert torch.equal(Z0, Zh) and torch.equal(N0, Nh)
+
+
+def test_delta_mode_runs_and_differs():
+    model, x = tiny_model(), tokens()
+    kw = dict(block_len=64, budget=64, ring_window=16, demote=True)
+    with torch.no_grad():
+        a = stream_hidden(model, x, ManageCfg(**kw, pool_write='hebbian'),
+                          manage=True)
+        b = stream_hidden(model, x, ManageCfg(**kw, pool_write='delta'),
+                          manage=True)
+    assert torch.isfinite(b).all()
+    assert not torch.equal(a, b), 'delta switch has no effect'
