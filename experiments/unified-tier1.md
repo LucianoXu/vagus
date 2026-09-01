@@ -99,13 +99,14 @@ resubmitting the same command after maintenance. Plain arms should
 finish 2B tonight (~2.5h at SAX2 throughput); unified arms cover as
 much as eager streaming throughput allows and resume after 09-07.
 
-| job | config | notes |
+| job | config | outcome |
 |---|---|---|
-| 29835289 | eval-frozen: SAX2 model-final, ceiling + floors + m512-evict-only, L∈{2048,4096} | out: runs/eval/frozen_sax2.json |
-| 29835293 | plain-ct2B-s43 (arm 4, gate-1-at-scale) | 6h wall |
-| 29835294 | plain-ct2B-s44 (arm 4) | 6h wall |
-| 29835295 | unified-ct2B-m512-s43 (arm 3, gate-2 pilot) | 6h wall |
-| 29835296 | unified-ct2B-m512-s44 (arm 3) | 6h wall |
+| 29835289 | eval-frozen: SAX2 model-final, ceiling + floors + m512e, L∈{2048,4096} | COMPLETED 7m26s → runs/eval/frozen_sax2.json (copy: stignore-runs/eval/) |
+| 29835293 | plain-ct2B-s43 (arm 4) | COMPLETED 2h27m, 2.000B, final loss 2.3765 (ema 2.3999), ckpt-00003814.pt |
+| 29835294 | plain-ct2B-s44 (arm 4) | COMPLETED 2h27m, 2.000B, final loss 2.4310 (ema 2.3962), ckpt-00003814.pt |
+| 29835295 | unified-ct2B-m512-s43 (arm 3 pilot) | pilot-only: gate-2 verdict below; walltime-checkpoints ~06:45, **do not resume** (v2 relaunch) |
+| 29835296 | unified-ct2B-m512-s44 (arm 3 pilot) | same |
+| 29840076 | eval-plainct: both arm-4 ckpts, same 10 cells | COMPLETED → runs/eval/plain_ct.json (copy: stignore-runs/eval/) |
 
 Deployment note: GitHub was unreachable from the workstation at
 submit time; the branch reached raven as a git bundle over SSH
@@ -117,24 +118,18 @@ reset and pruned (.git back to 1.6M), and `/stignore-*` is now in
 
 ## After the maintenance window (2026-09-07 08:00+)
 
-Resume any CT arm that did not reach step 3,814 (identical command
-resumes from its recent checkpoint; drop -t once the queue is normal):
+Plain arms and their eval finished before the wall — nothing to
+resume there. The unified arms are pilot-only (gradient pathology, see
+Gate 2): **do not resubmit their recipes as-is.** The v2 sequence is:
 
-    cd ~/work/vagus
-    sbatch -J plain-s43 recipe/slurm/raven_managed.sbatch recipe/train/plain_ct2B_s43.yaml
-    sbatch -J plain-s44 recipe/slurm/raven_managed.sbatch recipe/train/plain_ct2B_s44.yaml
-    sbatch -J uct-s43  recipe/slurm/raven_managed.sbatch recipe/train/unified_ct2B_m512_s43.yaml
-    sbatch -J uct-s44  recipe/slurm/raven_managed.sbatch recipe/train/unified_ct2B_m512_s44.yaml
-
-Then the trained-arm evaluation (fills rows 3–4 of the matrix):
-
-    sbatch -J eval-ct recipe/slurm/raven_eval_ppl.sbatch \
-      --ckpt runs/unified-ct2B-m512-s43-02cad06b/ckpt-00003814.pt \
-      --ckpt runs/unified-ct2B-m512-s44-02cad06b/ckpt-00003814.pt \
-      --ckpt runs/plain-ct2B-s43-02cad06b/ckpt-00003814.pt \
-      --ckpt runs/plain-ct2B-s44-02cad06b/ckpt-00003814.pt \
-      --data_dir data/tokenized/fineweb-edu-100BT-mistral32k \
-      --out runs/eval/ct_arms.json
+1. Fix the demote pricing (long-horizon transported ensemble) + bound
+   the pooled weights; bf16 matmuls / micro-batch 16 for throughput
+   (target ≥ 0.05 Mtok/s). Re-run gates 0–2.
+2. Relaunch BOTH unified seeds fresh on v2 (delete or archive the
+   pilot run dirs first — same run_name resumes otherwise):
+   `sbatch -J uct-s43 recipe/slurm/raven_managed.sbatch recipe/train/unified_ct2B_m512_s43.yaml` (and s44)
+3. Eval the v2 arms:
+   `sbatch -J eval-uct recipe/slurm/raven_eval_ppl.sbatch --ckpt runs/unified-ct2B-m512-s43-<commit>/ckpt-00003814.pt --ckpt runs/unified-ct2B-m512-s44-<commit>/ckpt-00003814.pt --data_dir data/tokenized/fineweb-edu-100BT-mistral32k --out runs/eval/unified_ct.json`
 
 Progress check: `squeue -u yinxu` and
 `tail runs/slurm-uct-s43-*.out` from `~/work/vagus` (login via `mpcdf`).
@@ -174,6 +169,27 @@ Findings (2026-09-01):
    (per-band gate / decoherence pricing). v2 direction: score demotion
    against a long-horizon transported ensemble (or analytic per-band
    decoherence), not the near ring.
+
+### Arm 4 — plain 2B CT, both seeds (job 29840076, complete)
+
+Same 10 cells; seed-averaged NLL (s43/s44 agree to ≤0.01 everywhere
+except the noisy m256 cells):
+
+| cell | full | m1024 | m512 | m256 | m512e |
+|---|---|---|---|---|---|
+| L2048 | 2.3999 | 2.4096 | 2.5676 | 3.6932 | 2.4120 |
+| L4096 | 2.4402 | 2.4724 | 2.8820 | 4.7840 | 2.4146 |
+
+Reading (vs frozen): plain CT lowers the ceiling and the loose floors
+by ≈ its train-loss gain (−0.025 nat, uniformly), i.e. the model got
+generically better — but the **management gap (managed − full) does
+not close; at tight budgets it widens**: m256@L2048 gap 1.203 → 1.293
+(+0.09), m512@L4096 0.412 → 0.442 (+0.03), m512e gaps unchanged
+(0.013/0.021 → 0.012/0.026). Plain continued training makes the model
+lean *more* on the full cache. This is the control half of the Tier-1
+question in its sharpest form: if the v2 management-aware arm closes
+any of the gap, the credit belongs to management awareness — the
+token-matched control moves the gap the other way.
 
 ### Gate 1 at scale — PASSED
 
