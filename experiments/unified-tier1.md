@@ -605,3 +605,37 @@ normalized-RLS variant — a theory-side item (fits the (c″)(ii)
 revision the coordinator is drafting), not an engineering retry; the
 ε-regularization knob is the obvious sensitivity to check if pursued.
 `pool_write: delta` stays in-tree, default hebbian.
+
+### uct v2.1 gnorm gate: FIRED on both seeds — second amplifier confirmed, characterized
+
+Fixed-code arms (29855753/54, from the SAX2 origin, manage=triage):
+gate fired at step 100 on both, by design (auto-checkpoint + exit;
+~75 min each, minimal burn). Readings:
+
+| arm | loss@100 (ema) | gnorm@100 | v1 pilot | plain |
+|---|---|---|---|---|
+| s43 | 2.4988 (2.4562) | **807** | 1.6e14 | 0.11 |
+| s44 | 2.4546 (2.4483) | **851,281** | 5.0e13 | 0.11 |
+
+The pricing fix removed 8–11 orders of magnitude of the v1 amplifier
+and the loss now tracks the plain arm's neighborhood (2.45–2.50 vs
+2.43; v1 pilot: 2.60 and climbing). What remains is a **spiky,
+seed-dependent amplifier** (1000× spread between seeds): consistent
+with the pool-write gradient lever — d(loss)/d(k,v) of demoted atoms
+carries the pooled weight w = c·e^{μ+σ²/2} (observed up to ~2.4e5 in
+v2.1 evals), so a handful of extreme-weight writes dominate the
+gradient. Candidate structural fixes, for decision (not applied):
+
+1. **Write-time normalization**: store pool moments scaled by the
+   ledger Z̄ (numerator and denominator share the scale — forward
+   identical, gradient lever shrunk by ~Z̄).
+2. **Pool as environment**: detach the pool from the gradient path;
+   the loss still sees managed readouts (the closed-loop signal), and
+   gradients flow only through alive atoms — cheapest, changes what
+   "adaptation" can learn through the pool path.
+3. Soft-cap w at write (straight-through) — a hack, listed for
+   completeness.
+
+Instrumentation note for the next restart: the health signature line
+prints after the gate check, so the forensic pool_w_max readout never
+lands on a gate kill — move the health dump into the gate message.
