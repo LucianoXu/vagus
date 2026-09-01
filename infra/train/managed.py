@@ -51,7 +51,11 @@ import signal
 @dataclass
 class ManagedConfig(TrainConfig):
     init_ckpt: str | None = None     # weights to continue from (fresh run)
-    manage: str = 'unified'          # 'unified' | 'none'
+    # Policy family name (2026-09-01, engram PLANNING.md): the dynamic
+    # management algorithm is 'triage' (this repo implements the
+    # evict+demote sub-family; 'full-triage' adds merge). 'unified' is
+    # kept as a read alias so in-flight recipes/jobs keep working.
+    manage: str = 'triage'           # 'triage' | 'none' ('unified' = alias)
     block_len: int = 256
     budget: int = 512
     ring_window: int = 32
@@ -97,8 +101,10 @@ class StreamWrapper(nn.Module):
 def train(config: ManagedConfig):
     rank, world, device, is_dist = setup_distributed(config)
     is_main = rank == 0
-    assert config.manage in ('unified', 'none')
-    if config.manage == 'unified':
+    if config.manage == 'unified':   # legacy alias -> canonical name
+        config.manage = 'triage'
+    assert config.manage in ('triage', 'none')
+    if config.manage == 'triage':
         assert not config.compile, 'streaming path is eager; set compile: false'
         assert config.context_len % config.block_len == 0
 
@@ -197,7 +203,7 @@ def train(config: ManagedConfig):
                      ring_window=config.ring_window, demote=config.demote,
                      lam=config.lam, slope_eps=config.slope_eps,
                      pool_gate=config.pool_gate)
-    if config.manage == 'unified':
+    if config.manage == 'triage':
         net: nn.Module = StreamWrapper(model, mcfg)
     else:
         if config.compile and hasattr(model, 'compile_blocks'):
@@ -249,7 +255,7 @@ def train(config: ManagedConfig):
                         if is_dist and micro < config.grad_accum_steps - 1
                         else nullcontext())
                 with sync, autocast:
-                    if config.manage == 'unified':
+                    if config.manage == 'triage':
                         hidden = net(x)
                     else:
                         hidden = net(x, return_hidden=True)
@@ -284,7 +290,7 @@ def train(config: ManagedConfig):
                 if is_dist:
                     dist.destroy_process_group()
                 raise SystemExit(3)
-            if is_main and config.manage == 'unified' \
+            if is_main and config.manage == 'triage' \
                     and step % config.slow_interval == 0:
                 w = unwrap(net)
                 if isinstance(w, StreamWrapper):

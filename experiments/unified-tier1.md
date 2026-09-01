@@ -460,3 +460,14 @@ the position measure. v2 `static` stays the default.** Scope note:
 the L2048→L4096 lever is short; 16k+ contexts could still separate
 the modes — out of tier scope, recorded. (The stepped path and its
 tests remain in-tree behind `pool_gate`.)
+
+## Naming registry (2026-09-01, user's PLANNING.md decision)
+
+The dynamic management algorithm is **triage**; the full
+three-operation version is **full-triage**; MRC survives as the merge
+sub-policy's ancestor name. In this repo: `manage: triage` is the
+canonical trainer value (`unified` accepted as a read alias — the
+in-flight uct recipes keep working unmodified), the module path
+`infra/components/unified.py` is unchanged so live imports never
+break, and run/recipe names keep their historical spellings; new
+recipes use triage names. Pure rename, no logic.

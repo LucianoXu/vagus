@@ -1,3 +1,9 @@
+# TRIAGE-family streaming block (naming registered 2026-09-01, engram
+# PLANNING.md): 'triage' = the dynamic management algorithm; this module
+# implements the evict+demote sub-family; 'full-triage' adds merge (MRC
+# is the merge sub-policy's ancestor name). Module path stays
+# `unified.py` so in-flight jobs' imports never break.
+#
 # Unified-block streaming: atom table + moment pools (P=0, P=1), managed
 # by the distortion calculus (engram theory §4/§5′/§6(a′)/§7′c′),
 # runnable frozen (inference) or differentiably (management-aware
