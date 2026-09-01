@@ -334,3 +334,18 @@ def test_compiled_cell_matches_eager():
                           manage=False)
     assert (ref - c).abs().max().item() < 5e-4
     U._COMPILED_CELL = None
+
+
+def test_budget_zero_pure_pool_endpoint():
+    '''M_eq=32 byte-fair cell: atom budget 0 — every boundary demotes or
+    evicts ALL atoms; readout = current block (the protocol's de-facto
+    recent window) + pool. The frozen training-free linearization
+    endpoint; must run finite with an active pool.'''
+    model, x = tiny_model(), tokens(B=1, L=256)
+    h = Health()
+    cfg = ManageCfg(block_len=64, budget=0, ring_window=16, demote=True)
+    with torch.no_grad():
+        out = stream_hidden(model, x, cfg, manage=True, health=h)
+    assert torch.isfinite(out).all()
+    assert h.demoted_p0 + h.demoted_p1 + h.evicted > 0
+    assert h.demoted_p0 + h.demoted_p1 > 0, 'pure-pool endpoint never pooled'
