@@ -105,6 +105,7 @@ class ManageCfg:
     # overshoots the budget by up to (k-1)*block_len (semantics change,
     # recorded). k=1 = every boundary (default, all results so far).
     manage_every: int = 1
+    compile_cell: bool = False    # torch.compile the (layer, block) cell
     eps_z: float = 1e-4       # denominator guardrail threshold
     mu_clamp: float = 25.0    # cap on the centering logit inside exp()
 
@@ -117,7 +118,7 @@ class LayerState:
     v: torch.Tensor        # (B, H, T, Dv)
     logc: torch.Tensor     # (B, H, T) fp32 log-mass
     alive: torch.Tensor    # (B, H, T) bool
-    pos: torch.Tensor      # (T,) int64 absolute position of each atom
+    pos: torch.Tensor      # (B, H, cap) int64 slot positions
     t0: torch.Tensor       # (B, H)        pool constants (P=0 and P=1)
     t1: torch.Tensor       # (B, H, Dh)    pool: damped-key first moment
     T0: torch.Tensor       # (B, H, Dv)
@@ -138,16 +139,16 @@ class LayerState:
 
 
 def init_state(att: SoftmaxAttention, batch: int, device, dtype,
-               mcfg: ManageCfg) -> LayerState:
+               mcfg: ManageCfg, cap: int) -> LayerState:
     H = att.kv_head_count
     Dh = att.dim // att.head_count
     Dv = Dh * att.v_dim_mult
     z = lambda *s, dt=dtype: torch.zeros(*s, device=device, dtype=dt)
     return LayerState(
-        k=z(batch, H, 0, Dh), v=z(batch, H, 0, Dv),
-        logc=z(batch, H, 0, dt=torch.float32),
-        alive=torch.zeros(batch, H, 0, device=device, dtype=torch.bool),
-        pos=torch.zeros(0, device=device, dtype=torch.int64),
+        k=z(batch, H, cap, Dh), v=z(batch, H, cap, Dv),
+        logc=z(batch, H, cap, dt=torch.float32),
+        alive=torch.zeros(batch, H, cap, device=device, dtype=torch.bool),
+        pos=torch.zeros(batch, H, cap, device=device, dtype=torch.int64),
         t0=z(batch, H, dt=torch.float32), t1=z(batch, H, Dh, dt=torch.float32),
         T0=z(batch, H, Dv, dt=torch.float32),
         T1=z(batch, H, Dh, Dv, dt=torch.float32),
@@ -194,11 +195,35 @@ class Health:
 # Band algebra (RoPE frequencies, complex views, coherence factors)
 # --------------------------------------------------------------------------
 
+_BAND_CACHE: dict = {}
+
+
 def _band_freqs(rope: RoPE, device) -> torch.Tensor:
-    '''omega_b = base^(-b/arm_dim), radians per token, (arm_dim,).'''
-    idx = torch.arange(rope.arm_dim, device=device, dtype=torch.float64)
-    return torch.pow(torch.tensor(float(rope.base), device=device,
-                                  dtype=torch.float64), -idx / rope.arm_dim)
+    '''omega_b = base^(-b/arm_dim), radians per token, (arm_dim,). Cached.'''
+    key = ('freq', float(rope.base), rope.arm_dim, str(device))
+    if key not in _BAND_CACHE:
+        idx = torch.arange(rope.arm_dim, device=device, dtype=torch.float64)
+        _BAND_CACHE[key] = torch.pow(
+            torch.tensor(float(rope.base), device=device,
+                         dtype=torch.float64), -idx / rope.arm_dim)
+    return _BAND_CACHE[key]
+
+
+def _band_mats(rope: RoPE, lam: float, device):
+    '''Constant per-(rope, lam) matrices for _measure_stats: g vector,
+    gamma^2, Gm = g(w_b - w_b'), Gp = g(w_b + w_b') (complex64). The
+    profiler showed these were rebuilt per call (2.57s of complex GEMM
+    prep per 3 steps); they are constants of the run.'''
+    key = ('mats', float(rope.base), rope.arm_dim, float(lam), str(device))
+    if key not in _BAND_CACHE:
+        omega = _band_freqs(rope, device)
+        g = _coherence(lam, omega)
+        om = omega.unsqueeze(0)
+        _BAND_CACHE[key] = (
+            g.to(torch.complex64), g.abs().pow(2).float(),
+            _coherence(lam, om.T - om).to(torch.complex64),
+            _coherence(lam, om + om.T).to(torch.complex64), omega)
+    return _BAND_CACHE[key]
 
 
 def _as_complex(x: torch.Tensor) -> torch.Tensor:
@@ -252,9 +277,7 @@ def _measure_stats(rope: RoPE, st: LayerState, t_dec: int, lam: float):
     m = u.mean(dim=2)                                     # (B,H,nb)
     s2 = 0.5 * (u - m.unsqueeze(2)).abs().pow(2).mean(dim=2)  # (B,H,nb)
 
-    omega = _band_freqs(rope, dev)                        # (nb,) float64
-    g = _coherence(lam, omega)                            # (nb,) complex128
-    gamma2 = g.abs().pow(2).float()                       # (nb,)
+    gc, gamma2, Gm, Gp, omega = _band_mats(rope, lam, dev)
 
     z = _as_complex(st.k)                                 # (B,H,T,nb)
     zabs2 = z.abs().pow(2)                                # (B,H,T,nb)
@@ -268,17 +291,9 @@ def _measure_stats(rope: RoPE, st: LayerState, t_dec: int, lam: float):
         torch.zeros_like(omega), -omega * float(t_dec))).to(torch.complex64)
     C = m.conj().unsqueeze(2) * z * phase_dec             # (B,H,T,nb)
 
-    gc = g.to(torch.complex64)
     mu = beta * torch.einsum('bhtn,n->bht', C, gc).real
-
-    om = omega.unsqueeze(0)
-    # Orientation matters (engram triage-port cross-check, 2026-09-01):
-    # entry [b, b'] must be g(w_b - w_b') so the bilinear form sums
-    # C_b conj(C_b') g(w_b - w_b'). The transposed variant is also real
-    # and passes symmetry intuition, but biases V by tens of percent
-    # (regression: test_measure_stats_matches_numeric_integration).
-    Gm = _coherence(lam, om.T - om).to(torch.complex64)   # g(w_b - w_b')
-    Gp = _coherence(lam, om + om.T).to(torch.complex64)   # g(w_b + w_b')
+    # Gm/Gp orientation note lives in _band_mats (engram cross-check
+    # 2026-09-01): Gm[b,b'] = g(w_b - w_b'), regression-tested.
     e2 = 0.5 * beta ** 2 * (
         torch.einsum('bhtn,nm,bhtm->bht', C, Gp, C)
         + torch.einsum('bhtn,nm,bhtm->bht', C, Gm, C.conj())).real
@@ -374,16 +389,13 @@ def _transport(rope: RoPE, ring_q: torch.Tensor, delta: torch.Tensor):
 
 @torch.no_grad()
 def _manage(att: SoftmaxAttention, st: LayerState, t_end: int,
-            mcfg: ManageCfg, health: Health):
-    '''Score alive atoms, pick the cheapest exits down to budget.
-    Returns (sel_evict, sel_p0, sel_p1, mu, sigma_tot2) — (B,H,T) masks
-    plus the fp32 measure statistics for the write path.'''
+            mcfg: ManageCfg, health: Health, r: int):
+    '''Score alive atoms, pick the cheapest r exits. r is a PYTHON int
+    computed by the caller's static bookkeeping (no device sync, static
+    shape for topk under compile). Returns (B,H,cap) masks plus the
+    fp32 measure statistics for the write path.'''
     B, H, T, Dh = st.k.shape
     scale = 1.0 / math.sqrt(Dh)
-    alive_cnt = int(st.alive[0, 0].sum().item())     # uniform across (B,H)
-    r = alive_cnt - mcfg.budget
-    if r <= 0:
-        return None
 
     # ---- eviction score: v1 transported-linear MC, unchanged ----
     delta = (t_end - st.ring_pos).clamp(min=0)
@@ -427,17 +439,22 @@ def _manage(att: SoftmaxAttention, st: LayerState, t_end: int,
     sel_evict = sel & ~sel_dem
     sel_p0 = sel_dem & p0_branch
     sel_p1 = sel_dem & ~p0_branch
-    health.demoted_p0 += int(sel_p0.sum().item())
-    health.demoted_p1 += int(sel_p1.sum().item())
-    health.evicted += int(sel_evict.sum().item())
+    if not torch.compiler.is_compiling():
+        health.demoted_p0 += int(sel_p0.sum().item())
+        health.demoted_p1 += int(sel_p1.sum().item())
+        health.evicted += int(sel_evict.sum().item())
     return sel_evict, sel_p0, sel_p1, mu, sigma_tot2, logZbar
 
 
 def attn_block_step(att: SoftmaxAttention, x, st: LayerState, pos0: int,
-                    mcfg: ManageCfg, manage: bool, health: Health):
-    '''One attention block step: project the new block, read out against
-    atoms + pool, then (optionally) manage down to budget. x is the
-    post-rmsnorm block input (B, L, dim). Returns (out, new_state).'''
+                    mcfg: ManageCfg, health: Health, do_manage: bool, r: int):
+    '''One attention block step over FIXED-CAPACITY slot state (sprint
+    rewrite): the L new tokens are scattered into free slots, dead slots
+    are reused, every shape is static — the padded form the profiler
+    demanded (CPU-bound eager launch storm) and torch.compile requires.
+    Visibility is one rule: occ & (pos_slot <= pos_query), which covers
+    both old atoms and within-block causality. do_manage/r come from the
+    caller's python-side bookkeeping (no device syncs).'''
     B, L = x.shape[0], x.shape[1]
     H, Dh = att.kv_head_count, att.dim // att.head_count
     assert att.head_count == H and att.v_dim_mult == 1 \
@@ -455,21 +472,24 @@ def attn_block_step(att: SoftmaxAttention, x, st: LayerState, pos0: int,
     k = att.rope(k, pos0)
     v = vp.reshape(B, L, H, Dh).transpose(1, 2)
 
-    # append the block as fresh atoms (mass 1, alive)
-    k_all = torch.cat([st.k, k], dim=2)
-    v_all = torch.cat([st.v, v], dim=2)
-    logc_all = torch.cat(
-        [st.logc, torch.zeros(B, H, L, device=x.device, dtype=torch.float32)], dim=2)
-    alive_all = torch.cat(
-        [st.alive, torch.ones(B, H, L, device=x.device, dtype=torch.bool)], dim=2)
-    pos_all = torch.cat(
-        [st.pos, torch.arange(pos0, pos0 + L, device=x.device)], dim=0)
-    T = k_all.shape[2]
+    # scatter the block into L free slots (capacity guarantees they exist)
+    free_idx = (~st.alive).float().topk(L, dim=-1).indices        # (B,H,L)
+    idx_d = free_idx.unsqueeze(-1).expand(B, H, L, Dh)
+    k_all = st.k.scatter(2, idx_d, k.to(st.k.dtype))
+    v_all = st.v.scatter(2, idx_d, v.to(st.v.dtype))
+    logc_all = st.logc.scatter(2, free_idx, torch.zeros(
+        B, H, L, device=x.device, dtype=torch.float32))
+    alive_all = st.alive.scatter(2, free_idx, torch.ones(
+        B, H, L, device=x.device, dtype=torch.bool))
+    newpos = torch.arange(pos0, pos0 + L, device=x.device
+                          ).expand(B, H, L)
+    pos_all = st.pos.scatter(2, free_idx, newpos)
+    Tcap = k_all.shape[2]
 
-    # visibility: alive atoms, and within the new block causal lower-right
-    allow = alive_all.unsqueeze(-2).expand(B, H, L, T).clone()
-    causal = torch.ones(L, L, device=x.device, dtype=torch.bool).tril()
-    allow[:, :, :, T - L:] &= causal
+    # visibility: occupied and causally past (covers within-block order)
+    qpos = torch.arange(pos0, pos0 + L, device=x.device)
+    allow = alive_all.unsqueeze(-2) & (
+        pos_all.unsqueeze(-2) <= qpos.view(1, 1, L, 1))
 
     out, _, _ = _combined_readout(
         q.float(), k_all.float(), v_all.float(), logc_all, allow, st,
@@ -482,11 +502,9 @@ def attn_block_step(att: SoftmaxAttention, x, st: LayerState, pos0: int,
     ring_q = q[:, :, -W:, :].detach().float()
     ring_pos = torch.arange(pos0 + L - W, pos0 + L, device=x.device)
 
-    # v3 stepped gate: the elapsed block ages the pool's phase-carrying
-    # moments (t1/T1) by one block of per-band decay, before this
-    # boundary's writes; constants (t0/T0, the P=0 tier) never decay.
+    # v3 stepped gate: age the pool's phase-carrying moments per block
     t1_in, T1_in = st.t1, st.T1
-    if manage and mcfg.pool_gate == 'stepped':
+    if mcfg.pool_gate == 'stepped':
         dec = _band_decay(att.rope, mcfg.lam, L, x.device)
         t1_in = t1_in * dec
         T1_in = T1_in * dec.unsqueeze(-1)
@@ -494,88 +512,92 @@ def attn_block_step(att: SoftmaxAttention, x, st: LayerState, pos0: int,
                      st.t0, t1_in, st.T0, T1_in, st.Gk, st.logzbar,
                      ring_q, ring_pos)
 
-    manage_now = manage and ((pos0 // max(L, 1)) + 1) % mcfg.manage_every == 0
-    if manage_now:
-        picks = _manage(att, st2, pos0 + L, mcfg, health)
-        if picks is not None:
-            sel_evict, sel_p0, sel_p1, mu, sig2, logzbar_obs = picks
-            sel_dem = sel_p0 | sel_p1
-            alive_new = alive_all & ~(sel_evict | sel_dem)
-            if sel_dem.any():
-                mu_c = mu.clamp(max=mcfg.mu_clamp)
-                with torch.no_grad():
+    if do_manage and r > 0:
+        sel_evict, sel_p0, sel_p1, mu, sig2, logzbar_obs = _manage(
+            att, st2, pos0 + L, mcfg, health, r)
+        sel_dem = sel_p0 | sel_p1
+        alive_new = alive_all & ~(sel_evict | sel_dem)
+        mu_c = mu.clamp(max=mcfg.mu_clamp)
+        if mcfg.pool_norm == 'ledger':
+            b_old = st2.logzbar
+            b_new = torch.where(
+                torch.isneginf(b_old), logzbar_obs,
+                0.9 * b_old + 0.1 * logzbar_obs).detach()
+            resc = torch.exp(b_old - b_new)       # 0 for -inf
+            wsc = torch.exp(-b_new)
+        else:
+            b_new = st2.logzbar
+            resc = torch.ones_like(b_new)
+            wsc = torch.ones_like(b_new)
+        w_all = torch.exp(mu_c + 0.5 * sig2 + logc_all)   # (B,H,cap)
+        if not torch.compiler.is_compiling():
+            with torch.no_grad():
+                nd = int(sel_dem.sum().item())
+                if nd:
                     health.mu_clamped += ((mu > mcfg.mu_clamp) & sel_dem
-                                          ).float().sum().item() / max(
-                                              1, int(sel_dem.sum().item()))
+                                          ).float().sum().item() / nd
                     health.mu_events += 1
-                # projected-pool writes (5′-7/5′-8): mass factor
-                # e^{sigma^2/2}; P=1 slope = per-band damped key.
-                if mcfg.pool_norm == 'ledger':
-                    b_old = st2.logzbar
-                    b_new = torch.where(
-                        torch.isneginf(b_old), logzbar_obs,
-                        0.9 * b_old + 0.1 * logzbar_obs).detach()
-                    resc = torch.exp(b_old - b_new)       # 0 for -inf
-                    wsc = torch.exp(-b_new)
-                else:
-                    b_new = st2.logzbar
-                    resc = torch.ones_like(b_new)
-                    wsc = torch.ones_like(b_new)
-                w_all = torch.exp(mu_c + 0.5 * sig2 + logc_all)   # (B,H,T)
-                with torch.no_grad():
-                    tw = sorted(health.top_writes + (w_all * (
-                        sel_p0 | sel_p1).float()).flatten().topk(
-                        min(8, w_all.numel())).values.tolist(),
-                        reverse=True)[:8]
-                    health.top_writes = tw
-                w_all = w_all * wsc[..., None]
-                w0 = w_all * sel_p0.float()
-                w1 = w_all * sel_p1.float()
-                kf, vf = k_all.float(), v_all.float()
-                if mcfg.pool_gate == 'static':          # v2: damp at write
-                    omega = _band_freqs(att.rope, x.device)
-                    gamma = _coherence(mcfg.lam, omega).abs().float()
-                    kd = kf * gamma.repeat_interleave(2)
-                else:                                   # v3: age via decay
-                    kd = kf
-                t0 = st2.t0 * resc + (w0 + w1 * (1 - mu_c)).sum(-1)
-                T0 = (st2.T0 * resc[..., None]
-                      + torch.einsum('bht,bhte->bhe', w0 + w1 * (1 - mu_c), vf))
-                t1 = st2.t1 * resc[..., None]                     + torch.einsum('bht,bhtd->bhd', w1, kd)
-                T1 = (st2.T1 * resc[..., None, None]
-                      + torch.einsum('bht,bhtd,bhte->bhde', w1, kd, vf))
-                Gk_new = (st2.Gk * resc[..., None, None]
-                          + torch.einsum('bht,bhtd,bhte->bhde', w1, kd, kd)
-                          if mcfg.pool_write == 'delta'
-                          else st2.Gk * resc[..., None, None])
-                with torch.no_grad():
-                    # max over weights actually written (post-selection);
-                    # w_all over unselected atoms can be astronomically
-                    # larger and is never absorbed.
-                    health.pool_w_max = max(health.pool_w_max,
-                                            float((w0 + w1).max()))
-                    health.pool_t1_max = max(health.pool_t1_max,
-                                             float(t1.abs().max()))
-                st2 = LayerState(k_all, v_all, logc_all, alive_new, pos_all,
-                                 t0, t1, T0, T1, Gk_new, b_new,
-                                 ring_q, ring_pos)
-            else:
-                st2 = LayerState(k_all, v_all, logc_all, alive_new, pos_all,
-                                 st2.t0, st2.t1, st2.T0, st2.T1, st2.Gk,
-                                 st2.logzbar, ring_q, ring_pos)
+                tw = sorted(health.top_writes + (w_all * sel_dem.float()
+                            ).flatten().topk(min(8, w_all.numel())
+                            ).values.tolist(), reverse=True)[:8]
+                health.top_writes = tw
+        w_all = w_all * wsc[..., None]
+        w0 = w_all * sel_p0.float()
+        w1 = w_all * sel_p1.float()
+        kf, vf = k_all.float(), v_all.float()
+        if mcfg.pool_gate == 'static':          # v2: damp at write
+            omega = _band_freqs(att.rope, x.device)
+            gamma = _coherence(mcfg.lam, omega).abs().float()
+            kd = kf * gamma.repeat_interleave(2)
+        else:                                   # v3: age via decay
+            kd = kf
+        t0 = st2.t0 * resc + (w0 + w1 * (1 - mu_c)).sum(-1)
+        T0 = (st2.T0 * resc[..., None]
+              + torch.einsum('bht,bhte->bhe', w0 + w1 * (1 - mu_c), vf))
+        t1 = st2.t1 * resc[..., None] \
+            + torch.einsum('bht,bhtd->bhd', w1, kd)
+        T1 = (st2.T1 * resc[..., None, None]
+              + torch.einsum('bht,bhtd,bhte->bhde', w1, kd, vf))
+        Gk_new = (st2.Gk * resc[..., None, None]
+                  + torch.einsum('bht,bhtd,bhte->bhde', w1, kd, kd)
+                  if mcfg.pool_write == 'delta'
+                  else st2.Gk * resc[..., None, None])
+        if not torch.compiler.is_compiling():
+            with torch.no_grad():
+                health.pool_w_max = max(health.pool_w_max,
+                                        float((w0 + w1).max()))
+                health.pool_t1_max = max(health.pool_t1_max,
+                                         float(t1.abs().max()))
+        st2 = LayerState(k_all, v_all, logc_all, alive_new, pos_all,
+                         t0, t1, T0, T1, Gk_new, b_new,
+                         ring_q, ring_pos)
     return out, st2
 
 
-def _block_cell(blk, xb, pos0: int, mcfg: ManageCfg, manage: bool,
-                health: Health, *state_tensors):
+def _block_cell(blk, xb, pos0: int, mcfg: ManageCfg, do_manage: bool,
+                r: int, health: Health, *state_tensors):
     '''One (layer, block) cell: rmsnorm→attn(stream)→residual→ffn. Shaped
-    for torch.utils.checkpoint: tensor state flattened in/out.'''
+    for torch.utils.checkpoint: tensor state flattened in/out; pos0 /
+    do_manage / r are python-static per call.'''
     st = LayerState.from_tensors(state_tensors)
     h = blk.rmsnorm1(xb)
-    attn_out, st2 = attn_block_step(blk.att, h, st, pos0, mcfg, manage, health)
+    attn_out, st2 = attn_block_step(blk.att, h, st, pos0, mcfg, health,
+                                    do_manage, r)
     xb = xb + attn_out
     xb = xb + blk.ffn(blk.rmsnorm2(xb))
     return (xb, *st2.tensors())
+
+
+_COMPILED_CELL = None
+
+
+def _cell_fn(compile_cell: bool):
+    global _COMPILED_CELL
+    if not compile_cell:
+        return _block_cell
+    if _COMPILED_CELL is None:
+        _COMPILED_CELL = torch.compile(_block_cell, dynamic=False)
+    return _COMPILED_CELL
 
 
 def stream_hidden(model, tokens: torch.Tensor, mcfg: ManageCfg,
@@ -591,19 +613,31 @@ def stream_hidden(model, tokens: torch.Tensor, mcfg: ManageCfg,
     bl = mcfg.block_len
     x = model.embedding(tokens)
     dtype = x.dtype
-    states = [init_state(blk.att, B, tokens.device, dtype, mcfg)
+    # capacity: with management the state never holds more than
+    # budget + manage_every*block atoms; without (or with a non-binding
+    # budget) it must hold the whole sequence.
+    cap = min(L, mcfg.budget + mcfg.manage_every * bl) if manage else L
+    states = [init_state(blk.att, B, tokens.device, dtype, mcfg, cap)
               for blk in model.blocks]
+    cell = _cell_fn(mcfg.compile_cell)
     outs = []
-    for pos0 in range(0, L, bl):
+    n_alive = 0                       # python-side static bookkeeping
+    for bi, pos0 in enumerate(range(0, L, bl)):
+        n_alive += bl
+        do_manage = manage and (bi + 1) % mcfg.manage_every == 0
+        r = n_alive - mcfg.budget if do_manage else 0
         xb = x[:, pos0:pos0 + bl]
         for li, blk in enumerate(model.blocks):
             ts = states[li].tensors()
             if use_checkpoint and torch.is_grad_enabled():
-                res = checkpoint(_block_cell, blk, xb, pos0, mcfg, manage,
-                                 health, *ts, use_reentrant=False)
+                res = checkpoint(cell, blk, xb, pos0, mcfg, do_manage,
+                                 max(r, 0), health, *ts, use_reentrant=False)
             else:
-                res = _block_cell(blk, xb, pos0, mcfg, manage, health, *ts)
+                res = cell(blk, xb, pos0, mcfg, do_manage, max(r, 0),
+                           health, *ts)
             assert res is not None   # checkpoint's stub says Optional
             xb, states[li] = res[0], LayerState.from_tensors(res[1:])
+        if do_manage and r > 0:
+            n_alive = mcfg.budget
         outs.append(xb)
     return model.rms_head(torch.cat(outs, dim=1))

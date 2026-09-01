@@ -311,3 +311,26 @@ def test_ledger_keeps_pool_intermediates_small():
                       manage=True, health=h_on)
     assert h_on.pool_t1_max < h_off.pool_t1_max * 0.5 or \
         h_off.pool_t1_max < 10, (h_on.pool_t1_max, h_off.pool_t1_max)
+
+
+# ---- sprint acceptance: compiled cell ≡ eager ----
+
+def test_compiled_cell_matches_eager():
+    import infra.components.unified as U
+    U._COMPILED_CELL = None
+    model, x = tiny_model(), tokens(B=1, L=256)
+    kw = dict(block_len=64, budget=64, ring_window=16, demote=True)
+    with torch.no_grad():
+        a = stream_hidden(model, x, ManageCfg(**kw, compile_cell=False),
+                          manage=True)
+        b = stream_hidden(model, x, ManageCfg(**kw, compile_cell=True),
+                          manage=True)
+    diff = (a - b).abs().max().item()
+    assert diff < 5e-4, f'compiled cell diverges from eager: {diff}'
+    # gate-1 under compile: manage off, compiled ≡ stateless forward
+    with torch.no_grad():
+        ref = model(x, return_hidden=True)
+        c = stream_hidden(model, x, ManageCfg(**kw, compile_cell=True),
+                          manage=False)
+    assert (ref - c).abs().max().item() < 5e-4
+    U._COMPILED_CELL = None

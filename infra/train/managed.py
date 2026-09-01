@@ -64,6 +64,8 @@ class ManagedConfig(TrainConfig):
     pool_gate: str = 'static'    # 'static' (v2) | 'stepped' (v3 per-band gate)
     pool_write: str = 'hebbian'  # 'hebbian' | 'delta' (v4 whitened slopes)
     pool_norm: str = 'ledger'    # v2.2 write normalization ('ledger' | 'off')
+    manage_every: int = 1        # sprint lever: manage every k-th boundary
+    compile_cell: bool = False   # sprint: torch.compile the block cell
     slope_eps: float = 1e-3      # v2 P0/P1 slope-degeneracy threshold
     # kill condition (uct v2 restart plan item 1): if set, the pre-clip
     # grad norm at step 100 must be <= this, else checkpoint + exit(3)
@@ -206,7 +208,9 @@ def train(config: ManagedConfig):
                      lam=config.lam, slope_eps=config.slope_eps,
                      pool_gate=config.pool_gate,
                      pool_write=config.pool_write,
-                     pool_norm=config.pool_norm)
+                     pool_norm=config.pool_norm,
+                     manage_every=config.manage_every,
+                     compile_cell=config.compile_cell)
     if config.manage == 'triage':
         net: nn.Module = StreamWrapper(model, mcfg)
     else:

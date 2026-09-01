@@ -35,12 +35,18 @@ def main():
     ap.add_argument('--budget', type=int, default=512)
     ap.add_argument('--block', type=int, default=256)
     ap.add_argument('--seq', type=int, default=2048)
+    ap.add_argument('--bench', action='store_true',
+                    help='timing-only mode: no profiler, wall-clock Mtok/s')
+    ap.add_argument('--compile', action='store_true')
+    ap.add_argument('--manage_every', type=int, default=1)
     args = ap.parse_args()
 
     device = torch.device('cuda')
     model, _ = load_model(args.ckpt, device)
     model.train()
-    mcfg = ManageCfg(block_len=args.block, budget=args.budget)
+    mcfg = ManageCfg(block_len=args.block, budget=args.budget,
+                     manage_every=args.manage_every,
+                     compile_cell=args.compile)
 
     U._manage = _mark('PHASE_scoring_manage', U._manage)
     U._measure_stats = _mark('PHASE_measure_stats', U._measure_stats)
@@ -61,8 +67,24 @@ def main():
         loss.backward()
         return loss
 
-    step()                                   # warmup
+    step()                                   # warmup (incl. compile)
+    step()
     torch.cuda.synchronize()
+
+    if args.bench:
+        import time
+        t0 = time.perf_counter()
+        for _ in range(args.steps):
+            step()
+        torch.cuda.synchronize()
+        dt = time.perf_counter() - t0
+        n_tok = args.steps * args.batch * args.seq
+        print(f'BENCH block={args.block} budget={args.budget} '
+              f'manage_every={args.manage_every} compile={args.compile} '
+              f'micro={args.batch}: {n_tok} tok / {dt:.2f}s = '
+              f'{n_tok/dt/1e6:.4f} Mtok/s per GPU '
+              f'(x4 GPU x accum -> step-level x4)')
+        return
 
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
                  with_stack=False) as prof:
@@ -75,7 +97,7 @@ def main():
     print(ka.table(sort_by='cuda_time_total', row_limit=40))
     print('\n=== phase attribution (of TRAIN_STEP wall) ===')
     tot_cpu = {e.key: e.cpu_time_total for e in ka}
-    step_t = tot_cpu.get('TRAIN_STEP', 1)
+    step_t = max(tot_cpu.get('TRAIN_STEP', 0), 1)
     for k in ['PHASE_readout', 'PHASE_scoring_manage', 'PHASE_measure_stats',
               'PHASE_transport']:
         e = next((r for r in ka if r.key == k), None)
