@@ -181,12 +181,34 @@ plain-ct2B-s43, step 100: loss 2.4258 (ema 2.4241), gnorm 0.11,
 0.23 Mtok/s — clean continuation of the 2.4235 endpoint, no warmup
 spike. Plain arms complete 2B in ~2.4h (before the maintenance wall).
 
+### Gate 2 — pilot verdict: stable loss, pathological gradients
+
+Both unified arms at step 100 (02:07): loss s43 2.5964 (ema 2.5698),
+s44 2.5466 (ema 2.5664) — finite, non-diverging, sitting ≈0.15 nat
+above the plain arm at the same step (2.4258), i.e. exactly the frozen
+m512 management gap before any adaptation. Formally gate 2 passes
+(no divergence). BUT: **gnorm ~1.6e14 / 5.0e13** (plain arm: 0.11).
+Root cause (same disease as the PPL finding, backward face): demoted
+high-mean-logit atoms (sinks) enter the pool with weight
+w = c·e^a ~ e^25; gradients through the pool moments back into k/v
+carry the unbalanced factor e^(a − M_t) whenever the atom's absorbed
+logit scale a exceeds the readout-time alive max M_t. grad_clip=1.0
+keeps the run alive but the clipped update direction is dominated by
+this garbage — closed-loop adaptation signal is drowned. Verdict:
+tonight's unified segments are **pilot-only and will not be resumed**;
+v2 relaunches both seeds fresh. The principled fix is the same one the
+PPL result demands — price demotion on a long-horizon transported
+ensemble, which makes sinks expensive to demote and keeps e^a inside
+the pool bounded relative to the live partition function — plus a
+numerical belt (bound pooled weights relative to a running Z̄, or
+log-domain pool accumulators).
+
 ### Unified-arm throughput (tonight's run)
 
 Eager streaming: ~95 s/step ≈ 0.0055 Mtok/s (4 GPUs at 51–71%,
 25.8/40GB — the memory model held). Tonight's 6h window yields ~0.1B
 tokens per unified arm: enough for gate 2 (loss sanity under
-management) but not 2B. Post-maintenance v2 performance pass before
+management) but not 2B. Post-maintenance v2 pass (correctness first, then speed) before
 relaunching the arms: bf16 logit matmuls under autocast (the current
 fp32 einsums bypass tensor cores; bf16 logits are the training-native
 numerics — SDPA does the same), micro-batch back to 16, optionally
