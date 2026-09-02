@@ -81,8 +81,9 @@ current query's softmax — so the gradient reaching any surviving
 | 29876412 | bench-evict: 6-cell throughput/memory grid (1×A100) | COMPLETED (grid below); its pytest step was skipped (no pytest in raven's venv then) |
 | 29876584 / 29876672 | tests/test_evict.py on a GPU node | 8/9 then **9/9 PASSED** (the compiled-cell check moved to CUDA: raven nodes have no CPU-inductor toolchain; the login node kills the suite silently) |
 | 29876414 | eval-evict-fp: frozen SAX2 + plain-ct s43/s44, budgets {32,64,128,256,512} × scores {lin, p2}, L∈{2048,4096} → runs/eval/evict_frozen_plain.json | running |
-| 29876528 | evict-ct2B-m128-s43 (4×A100, 24h wall, resumes on resubmit) | RUNNING from 20:26 on ravg1158 — **gate 2 passed** (see below) |
-| 29876531 | evict-ct2B-m128-s44 | RUNNING from 20:26 on ravg1184 — **gate 2 passed** |
+| 29876528 | evict-ct2B-m128-s43 (4×A100) | COMPLETED 05:27:55, 2.000B tokens, final loss 2.3944 (ema 2.4197), gnorm 0.10–0.12 throughout → runs/evict-ct2B-m128-s43-e67641d2/ckpt-00003814.pt — **gate 2 passed** (see below) |
+| 29876531 | evict-ct2B-m128-s44 | COMPLETED 05:29:56, 2.000B tokens, final loss 2.4507 (ema 2.4162) → runs/evict-ct2B-m128-s44-e67641d2/ckpt-00003814.pt — **gate 2 passed** |
+| 29882377 / 29882410 | eval-evict-s43 / s44: budgets {32,64,128,256,512} × {lin, p2}, L∈{2048,4096} → runs/eval/evict_ct_s4{3,4}.json | submitted 2026-09-03 01:55 |
 
 ### Gate 2 at scale — PASSED (prediction 1 confirmed), 2026-09-02 20:36
 
