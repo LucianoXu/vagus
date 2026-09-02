@@ -78,10 +78,11 @@ current query's softmax — so the gradient reaching any surviving
 
 | job | what | outcome |
 |---|---|---|
-| 29876412 | bench-evict: 6-cell throughput/memory grid (1×A100) | COMPLETED (grid below); the pytest step was skipped (no pytest in raven's venv) |
+| 29876412 | bench-evict: 6-cell throughput/memory grid (1×A100) | COMPLETED (grid below); its pytest step was skipped (no pytest in raven's venv then) |
+| 29876584 / 29876672 | tests/test_evict.py on a GPU node | 8/9 then **9/9 PASSED** (the compiled-cell check moved to CUDA: raven nodes have no CPU-inductor toolchain; the login node kills the suite silently) |
 | 29876414 | eval-evict-fp: frozen SAX2 + plain-ct s43/s44, budgets {32,64,128,256,512} × scores {lin, p2}, L∈{2048,4096} → runs/eval/evict_frozen_plain.json | running |
-| 29876528 | evict-ct2B-m128-s43 (4×A100, 24h wall, resumes on resubmit) | queued 2026-09-02 20:20 |
-| 29876531 | evict-ct2B-m128-s44 | queued 2026-09-02 20:20 |
+| 29876528 | evict-ct2B-m128-s43 (4×A100, 24h wall, resumes on resubmit) | RUNNING from 20:26 on ravg1158 |
+| 29876531 | evict-ct2B-m128-s44 | RUNNING from 20:26 on ravg1184 |
 
 ### Bench (job 29876412, 340M, one A100-40GB, per-GPU Mtok/s, 5 steps)
 
@@ -103,20 +104,37 @@ works in this cell (the tier-1 metadata clash does not recur) but
 costs 40% throughput; not used. Prediction 2's 0.06 target was not
 met; 2B tokens ≈ 4.0 h on 4 GPUs.
 
-### Frozen SAX2 evict-only floors (job 29876414, partial; L2048, nats)
+### Evict-only floors (job 29876414, complete → runs/eval/evict_frozen_plain.json; nats, gap vs own full in parentheses)
 
-| budget | lin | p2 | tier-1 (p2 form) |
-|---|---|---|---|
-| full | 2.4244 | — | 2.4244 |
-| 512 | 2.4378 | 2.4370 | 2.4370 |
-| 256 | 2.4525 | 2.4508 | 2.4508 |
-| 128 | 2.4694 | 2.4669 | 2.4669 |
-| 64 | 2.4858 | 2.4835 | 2.4835 |
-| 32 | 2.5027 | 2.5010 | 2.5010 |
+| ckpt | L | score | full | m32 | m64 | m128 | m256 | m512 |
+|---|---|---|---|---|---|---|---|---|
+| frozen | 2048 | lin | 2.4244 | 2.5027 (+.078) | 2.4858 (+.061) | **2.4694 (+.045)** | 2.4525 (+.028) | 2.4378 (+.013) |
+| frozen | 2048 | p2 | 2.4244 | 2.5010 (+.077) | 2.4835 (+.059) | 2.4669 (+.043) | 2.4508 (+.026) | 2.4370 (+.013) |
+| frozen | 4096 | lin | 2.4591 | 2.5060 (+.047) | 2.4883 (+.029) | 2.4721 (+.013) | 2.4546 (−.005) | 2.4408 (−.018) |
+| frozen | 4096 | p2 | 2.4591 | 2.5050 (+.046) | 2.4861 (+.027) | 2.4692 (+.010) | 2.4527 (−.006) | 2.4398 (−.019) |
+| plain-s43 | 2048 | lin | 2.4000 | 2.4781 (+.078) | 2.4609 (+.061) | **2.4445 (+.045)** | 2.4275 (+.028) | 2.4131 (+.013) |
+| plain-s43 | 2048 | p2 | 2.4000 | 2.4762 (+.076) | 2.4582 (+.058) | 2.4421 (+.042) | 2.4258 (+.026) | 2.4122 (+.012) |
+| plain-s43 | 4096 | lin | 2.4403 | 2.4814 (+.041) | 2.4633 (+.023) | 2.4470 (+.007) | 2.4295 (−.011) | 2.4158 (−.025) |
+| plain-s43 | 4096 | p2 | 2.4403 | 2.4802 (+.040) | 2.4608 (+.021) | 2.4440 (+.004) | 2.4276 (−.013) | 2.4147 (−.026) |
+| plain-s44 | 2048 | lin | 2.3997 | 2.4779 (+.078) | 2.4609 (+.061) | **2.4443 (+.045)** | 2.4272 (+.028) | 2.4127 (+.013) |
+| plain-s44 | 2048 | p2 | 2.3997 | 2.4760 (+.076) | 2.4581 (+.058) | 2.4418 (+.042) | 2.4256 (+.026) | 2.4118 (+.012) |
+| plain-s44 | 4096 | lin | 2.4401 | 2.4815 (+.041) | 2.4632 (+.023) | 2.4467 (+.007) | 2.4292 (−.011) | 2.4155 (−.025) |
+| plain-s44 | 4096 | p2 | 2.4401 | 2.4803 (+.040) | 2.4605 (+.020) | 2.4437 (+.004) | 2.4274 (−.013) | 2.4144 (−.026) |
 
-`p2` reproduces every tier-1 cell to the last digit (port anchor at
-scale; gate 0 at scale via `full`). Side finding: on SAX2-340M the
-squared form is 0.001–0.003 nat *better* than `lin` at every budget —
-the opposite direction from E1 on Llama/Qwen, at a magnitude below
-what matters here. The training arm keeps the pre-registered `lin`;
-the gap it has to close at m128/L2048 is **+0.045 nat**.
+Readings:
+
+1. **Port anchor at scale**: every frozen `p2` cell equals the tier-1
+   byte-fair / m<b>e number to the last digit; `full` = 2.4244 /
+   2.4591 (gate 0 at scale).
+2. **Plain CT is gap-invariant at every budget and length** (frozen vs
+   plain gaps agree to ≤ 0.002 at L2048; at L4096 plain CT even widens
+   the *negative* gaps slightly). Both seeds agree to ≤ 0.0003. The
+   closed-loop test is therefore sharp: the evict arm's own
+   m128e_lin − full at L2048 must fall below **+0.044** to count.
+3. **Score form**: `p2` (squared mass × squared displacement) beats
+   `lin` by 0.001–0.003 nat at every cell on SAX2-340M — the opposite
+   sign from E1 on Llama/Qwen, at a magnitude below what matters
+   here. The training arm keeps the pre-registered `lin`.
+4. **Beyond the trained context evict-only beats full** from m256 up
+   (L4096: −0.005 frozen, −0.011 plain-CT at m256; −0.018 / −0.025 at
+   m512) — the tier-1 side fact, now on the compacted SDPA path.
