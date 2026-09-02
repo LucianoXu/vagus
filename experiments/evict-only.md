@@ -81,8 +81,29 @@ current query's softmax — so the gradient reaching any surviving
 | 29876412 | bench-evict: 6-cell throughput/memory grid (1×A100) | COMPLETED (grid below); its pytest step was skipped (no pytest in raven's venv then) |
 | 29876584 / 29876672 | tests/test_evict.py on a GPU node | 8/9 then **9/9 PASSED** (the compiled-cell check moved to CUDA: raven nodes have no CPU-inductor toolchain; the login node kills the suite silently) |
 | 29876414 | eval-evict-fp: frozen SAX2 + plain-ct s43/s44, budgets {32,64,128,256,512} × scores {lin, p2}, L∈{2048,4096} → runs/eval/evict_frozen_plain.json | running |
-| 29876528 | evict-ct2B-m128-s43 (4×A100, 24h wall, resumes on resubmit) | RUNNING from 20:26 on ravg1158 |
-| 29876531 | evict-ct2B-m128-s44 | RUNNING from 20:26 on ravg1184 |
+| 29876528 | evict-ct2B-m128-s43 (4×A100, 24h wall, resumes on resubmit) | RUNNING from 20:26 on ravg1158 — **gate 2 passed** (see below) |
+| 29876531 | evict-ct2B-m128-s44 | RUNNING from 20:26 on ravg1184 — **gate 2 passed** |
+
+### Gate 2 at scale — PASSED (prediction 1 confirmed), 2026-09-02 20:36
+
+TensorBoard scalars, steps 40–90, both seeds (plain arm reference:
+gnorm 0.11, loss ema 2.424 at step 100):
+
+| arm | grad_norm (pre-clip) | loss ema | agg Mtok/s |
+|---|---|---|---|
+| evict s43 | 0.094 – 0.116 | 2.456 – 2.462 | 0.097 – 0.111 |
+| evict s44 | 0.096 – 0.118 | 2.457 – 2.461 | 0.096 – 0.106 |
+| tier-1 uct v1 pilot | 1.6e14 → 2.6e16 | 2.60 → 3.27 | 0.0055 |
+| tier-1 uct v2.1 | 807 / 851,281 | 2.45 – 2.50 | — |
+
+The gradient norm of eviction-only management-aware training is
+**indistinguishable from plain continued training** (0.09–0.12 vs
+0.11) from the first logged step. The two tier-1 amplifiers were the
+pool path; hard selection itself never was one. Loss sits ~0.035
+above plain's ema, i.e. within the m128 frozen gap (+0.045) — the
+managed cache is what the loss sees. Throughput 0.10 Mtok/s aggregate
+(DDP + accumulation + real data; the single-GPU bench gave 0.035/GPU),
+2B tokens ≈ 5.6 h.
 
 ### Bench (job 29876412, 340M, one A100-40GB, per-GPU Mtok/s, 5 steps)
 
