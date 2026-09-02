@@ -76,4 +76,47 @@ current query's softmax — so the gradient reaching any surviving
 
 ## Runs
 
-(filled as jobs land; see the raven queue)
+| job | what | outcome |
+|---|---|---|
+| 29876412 | bench-evict: 6-cell throughput/memory grid (1×A100) | COMPLETED (grid below); the pytest step was skipped (no pytest in raven's venv) |
+| 29876414 | eval-evict-fp: frozen SAX2 + plain-ct s43/s44, budgets {32,64,128,256,512} × scores {lin, p2}, L∈{2048,4096} → runs/eval/evict_frozen_plain.json | running |
+| 29876528 | evict-ct2B-m128-s43 (4×A100, 24h wall, resumes on resubmit) | queued 2026-09-02 20:20 |
+| 29876531 | evict-ct2B-m128-s44 | queued 2026-09-02 20:20 |
+
+### Bench (job 29876412, 340M, one A100-40GB, per-GPU Mtok/s, 5 steps)
+
+| config | Mtok/s/GPU | peak GiB |
+|---|---|---|
+| plain stateless, compiled, micro 8 (reference) | 0.0603 | 17.0 |
+| **evict m128 block256, compile, no ckpt, micro 8 (recipe)** | **0.0346** | **26.3** |
+| evict m128 block512, compile, no ckpt, micro 8 | 0.0384 | 26.6 |
+| evict m512 block256, compile, no ckpt, micro 8 | 0.0301 | 33.0 |
+| evict m128 block256, compile + activation ckpt, micro 8 | 0.0208 | 6.7 |
+| evict m128 block256, eager, no ckpt, micro 8 | 0.0165 | 32.6 |
+| evict m128 block256, compile, no ckpt, micro 16 | OOM | > 39.5 |
+
+Reading: 2.9× the tier-1 sprint's best (0.0119) and 6× its eager
+baseline; 57% of the plain forward. Block 512 buys only 11%, so the
+launch storm is gone and the remaining gap is real compute (masked
+SDPA over cap slots + scoring). compile × non-reentrant checkpoint
+works in this cell (the tier-1 metadata clash does not recur) but
+costs 40% throughput; not used. Prediction 2's 0.06 target was not
+met; 2B tokens ≈ 4.0 h on 4 GPUs.
+
+### Frozen SAX2 evict-only floors (job 29876414, partial; L2048, nats)
+
+| budget | lin | p2 | tier-1 (p2 form) |
+|---|---|---|---|
+| full | 2.4244 | — | 2.4244 |
+| 512 | 2.4378 | 2.4370 | 2.4370 |
+| 256 | 2.4525 | 2.4508 | 2.4508 |
+| 128 | 2.4694 | 2.4669 | 2.4669 |
+| 64 | 2.4858 | 2.4835 | 2.4835 |
+| 32 | 2.5027 | 2.5010 | 2.5010 |
+
+`p2` reproduces every tier-1 cell to the last digit (port anchor at
+scale; gate 0 at scale via `full`). Side finding: on SAX2-340M the
+squared form is 0.001–0.003 nat *better* than `lin` at every budget —
+the opposite direction from E1 on Llama/Qwen, at a magnitude below
+what matters here. The training arm keeps the pre-registered `lin`;
+the gap it has to close at m128/L2048 is **+0.045 nat**.
