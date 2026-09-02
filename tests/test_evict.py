@@ -166,9 +166,12 @@ def test_backward_finite_checkpoint_matches_and_gnorm_sane():
 
 
 def test_compiled_cell_matches_eager():
+    '''On CUDA when available (the inductor backend that trains); CPU
+    inductor needs a host C++ toolchain, absent on raven's nodes.'''
     import infra.components.evict as E
     E._COMPILED_CELL = None
-    model, x = tiny_model(), tokens(B=1, L=256)
+    dev = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model, x = tiny_model().to(dev), tokens(B=1, L=256).to(dev)
     kw = dict(block_len=64, budget=64, ring_window=16)
     with torch.no_grad():
         a = stream_hidden(model, x, EvictCfg(**kw, compile_cell=False), manage=True)
