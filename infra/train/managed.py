@@ -6,12 +6,16 @@
 #   1. init_ckpt — start a FRESH run (fresh optimizer/schedule/loader)
 #      from the weights of a finished run's checkpoint (continued
 #      pretraining), instead of main.py's own-run-dir resume.
-#   2. manage: 'unified' — the forward is the differentiable
+#   2. manage: 'triage' — the forward is the differentiable
 #      block-streaming path of components/unified.py (atoms + P=1 pool,
 #      evict/demote by the error-law scores, hard selection, BPTT with
 #      per-cell checkpointing). Loss stays next-token CE on all
 #      positions; positions beyond the first blocks read a managed cache,
 #      which is the closed-loop training signal.
+#      manage: 'evict' — the eviction-only path of components/evict.py
+#      (branch evict-only, 2026-09-02): same contract, no pool/demotion,
+#      fused SDPA readout, compiled cell; knobs score / gumbel_tau /
+#      lookahead / use_checkpoint below.
 #   3. manage: 'none' — the stateless forward, byte-identical batches:
 #      the paired control arm that separates "2B more tokens" from
 #      "management-aware 2B tokens". Both arms live here so the loop,
@@ -36,6 +40,8 @@ from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from ..components.losses import make_ce
+from ..components.evict import EvictCfg, Health as EvictHealth
+from ..components.evict import stream_hidden as stream_evict
 from ..components.unified import Health, ManageCfg, stream_hidden
 from ..dataset.loader import TokenStore, WindowLoader
 from ..models import build_model
@@ -55,7 +61,7 @@ class ManagedConfig(TrainConfig):
     # management algorithm is 'triage' (this repo implements the
     # evict+demote sub-family; 'full-triage' adds merge). 'unified' is
     # kept as a read alias so in-flight recipes/jobs keep working.
-    manage: str = 'triage'           # 'triage' | 'none' ('unified' = alias)
+    manage: str = 'triage'           # 'triage' | 'evict' | 'none' ('unified' = alias)
     block_len: int = 256
     budget: int = 512
     ring_window: int = 32
@@ -67,6 +73,11 @@ class ManagedConfig(TrainConfig):
     manage_every: int = 1        # sprint lever: manage every k-th boundary
     compile_cell: bool = False   # sprint: torch.compile the block cell
     slope_eps: float = 1e-3      # v2 P0/P1 slope-degeneracy threshold
+    # evict-only path (manage: evict)
+    score: str = 'lin'           # 'lin' | 'sq' | 'p2' (components/evict.py)
+    gumbel_tau: float = 0.0      # > 0: perturbed top-k during training
+    lookahead: int = 0           # transport horizon beyond the block end
+    use_checkpoint: bool = True  # per-cell activation checkpointing
     # kill condition (uct v2 restart plan item 1): if set, the pre-clip
     # grad norm at step 100 must be <= this, else checkpoint + exit(3)
     gnorm_gate: float | None = None
@@ -88,18 +99,23 @@ class ManagedConfig(TrainConfig):
 
 
 class StreamWrapper(nn.Module):
-    '''DDP-dispatchable forward for the streaming path (calling inner
-    submodules directly would bypass DDP's reducer hookup).'''
+    '''DDP-dispatchable forward for a streaming path (calling inner
+    submodules directly would bypass DDP's reducer hookup). `fn` is the
+    path's stream_hidden, `health_cls` its counter class.'''
 
-    def __init__(self, model, mcfg: ManageCfg):
+    def __init__(self, model, cfg, fn=stream_hidden, health_cls=Health,
+                 use_checkpoint: bool = True):
         super().__init__()
         self.model = model
-        self.mcfg = mcfg
-        self.health = Health()
+        self.cfg = cfg
+        self.fn = fn
+        self.health_cls = health_cls
+        self.use_checkpoint = use_checkpoint
+        self.health = health_cls()
 
     def forward(self, tokens):
-        return stream_hidden(self.model, tokens, self.mcfg, manage=True,
-                             use_checkpoint=True, health=self.health)
+        return self.fn(self.model, tokens, self.cfg, manage=True,
+                       use_checkpoint=self.use_checkpoint, health=self.health)
 
 
 def train(config: ManagedConfig):
@@ -107,9 +123,10 @@ def train(config: ManagedConfig):
     is_main = rank == 0
     if config.manage == 'unified':   # legacy alias -> canonical name
         config.manage = 'triage'
-    assert config.manage in ('triage', 'none')
-    if config.manage == 'triage':
-        assert not config.compile, 'streaming path is eager; set compile: false'
+    assert config.manage in ('triage', 'evict', 'none')
+    if config.manage != 'none':
+        assert not config.compile, \
+            'streaming paths do not use model.compile_blocks; set compile: false'
         assert config.context_len % config.block_len == 0
 
     if world != config.world_size:
@@ -169,7 +186,9 @@ def train(config: ManagedConfig):
     sched = build_schedule(config.schedule_name, config.schedule_args)
 
     log(f'run {run_dir.name} | manage={config.manage} budget={config.budget} '
-        f'block={config.block_len} | device {device} x{world} | '
+        f'block={config.block_len} score={config.score} '
+        f'gumbel_tau={config.gumbel_tau} compile_cell={config.compile_cell} '
+        f'use_checkpoint={config.use_checkpoint} | device {device} x{world} | '
         f'{param_count:,} params | data {store.total_tokens:,} tokens')
     log(f'plan: {steps_total:,} steps x {tokens_per_step:,} tokens/step')
 
@@ -213,6 +232,15 @@ def train(config: ManagedConfig):
                      compile_cell=config.compile_cell)
     if config.manage == 'triage':
         net: nn.Module = StreamWrapper(model, mcfg)
+    elif config.manage == 'evict':
+        ecfg = EvictCfg(block_len=config.block_len, budget=config.budget,
+                        ring_window=config.ring_window,
+                        lookahead=config.lookahead, score=config.score,
+                        gumbel_tau=config.gumbel_tau,
+                        manage_every=config.manage_every,
+                        compile_cell=config.compile_cell)
+        net = StreamWrapper(model, ecfg, stream_evict, EvictHealth,
+                            use_checkpoint=config.use_checkpoint)
     else:
         if config.compile and hasattr(model, 'compile_blocks'):
             model.compile_blocks()  # type: ignore
@@ -263,7 +291,7 @@ def train(config: ManagedConfig):
                         if is_dist and micro < config.grad_accum_steps - 1
                         else nullcontext())
                 with sync, autocast:
-                    if config.manage == 'triage':
+                    if config.manage != 'none':
                         hidden = net(x)
                     else:
                         hidden = net(x, return_hidden=True)
@@ -302,12 +330,12 @@ def train(config: ManagedConfig):
                 if is_dist:
                     dist.destroy_process_group()
                 raise SystemExit(3)
-            if is_main and config.manage == 'triage' \
+            if is_main and config.manage != 'none' \
                     and step % config.slow_interval == 0:
                 w = unwrap(net)
                 if isinstance(w, StreamWrapper):
                     log(f'health {w.health.as_dict()}')
-                    w.health = Health()
+                    w.health = w.health_cls()
 
             if is_main and config.permanent_ckpt_interval \
                     and step % config.permanent_ckpt_interval == 0 and step < steps_total:
