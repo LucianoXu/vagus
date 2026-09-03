@@ -253,3 +253,82 @@ trainable" — yes, stably, at 0.10 Mtok/s.
 - Checkpoints: `runs/evict-ct2B-m128-s4{3,4}-e67641d2/ckpt-00003814.pt` (raven)
 - Evals: `runs/eval/evict_frozen_plain.json`, `runs/eval/evict_ct_s4{3,4}.json` (raven; local copies in this session's tmp)
 - Code: branch `evict-only`, commits e67641d … (this file's history)
+
+## Recall probe (job 29893848, 2026-09-03 → runs/eval/recall_probe.json)
+
+`infra/eval/recall_probe.py`: passkey (5-digit key in natural filler,
+question at the end, teacher-forced digit accuracy; exact = greedy
+would answer) and kv (16 random (key, value) token pairs, 8 queried,
+induction-head copying). 5 checkpoints × L∈{1024, 2048, 4096} ×
+{full, m32e, m128e, m512e} × 5 depths × 16 trials. Groups are seed
+means (plain = s43/s44, evict = s43/s44). Chance level for a digit
+token ≈ 0.10. Depth 0.9 puts the needle in the last block (always
+visible) and is not a test; L4096 is beyond the trained length and
+breaks full attention itself (kv: 0 everywhere; passkey: only ≤ 1200
+tokens), so the evidence is L1024/L2048, depths ≤ 0.7.
+
+Passkey token accuracy; columns = needle→question distance in tokens
+(rounds = eviction decisions the needle must survive):
+
+```
+L1024  distance:        889    691    494    296
+       rounds @m512:      1      1      1      1     (first eviction after block 2)
+       rounds @m128:      3      2      2      1
+full     all groups    1.00   1.00   1.00   1.00
+m512e    frozen        0.09   0.05   0.11   0.38
+m512e    plain-ct      0.08   0.04   0.10   0.24
+m512e    evict-ct      0.78   0.78   0.75   0.76     exact 0.25 0.22 0.03 0.19
+m128e    frozen        0.07   0.03   0.07   0.10
+m128e    plain-ct      0.07   0.03   0.06   0.14
+m128e    evict-ct      0.09   0.19   0.56   0.48
+m32e     all groups    ≤0.11 everywhere
+
+L2048  distance:       1810   1408   1006    603
+       rounds @m512:      5      5      4      2
+full     all groups    1.00   1.00   1.00   1.00
+m512e    frozen/plain  ≤0.10 everywhere
+m512e    evict-ct      0.03   0.06   0.29   0.52
+m128e    evict-ct      0.01   0.04   0.06   0.12
+```
+
+kv: under full attention all groups ≈ 0.6 at L1024 and decay with
+distance at L2048 (0.16–0.67); under any eviction protocol ≤ 0.03 for
+every group including evict-ct (except depth 0.9, pairs in the last
+block). L4096/full passkey at 2000-token distance: frozen 0.04, plain
+0.10, **evict-ct 0.42** (same sharpening that lets it live with 128
+atoms helps against the diffuse attention of the base model beyond its
+trained length).
+
+### Verdicts
+
+1. **Blind eviction has no recall.** Frozen and plain-CT drop to chance
+   at every budget ≤ L/2 as soon as the needle leaves the current
+   block, even at budget 512 of 1024 — a clean synthetic replica of
+   Report §10.2's RULER collapse. The transported error-law score keeps
+   what recent filler queries attend to; the needle is not that.
+2. **The closed loop learns exact recall that nothing else here has.**
+   Same policy, same budget, same model family: evict-ct retrieves
+   78% of digits (25% whole keys) through an eviction round at budget
+   512, and 48–56% at the trained budget 128 over one to two rounds,
+   where frozen/plain sit at chance. No passkey-like supervision
+   existed in the 2B fineweb-edu tokens; the behavior was induced by
+   next-token loss under management alone. This is the first evidence
+   that eviction-managed softmax can be *learned selective exact
+   memory* rather than a compression heuristic — the property that
+   separates it from a trained linear state.
+3. **But it is short-horizon and content-specific.** Survival decays
+   roughly geometrically with eviction rounds (m512: 1 round ≈ 0.78,
+   2 ≈ 0.52, 4 ≈ 0.29, 5 ≈ 0.05; m128: 1 ≈ 0.5, 2 ≈ 0.1–0.5, 3 ≈
+   chance) and applies to a number embedded in a sentence, not to
+   random-token associations (kv stays at 0). The model learned to
+   carry salient natural-language facts a few blocks — exactly where
+   the PPL credit lives — not to keep arbitrary needles indefinitely.
+4. **What would grow it.** The training distribution decides what is
+   worth keeping. Levers, in order of expected leverage: (a) mix
+   retrieval-demanding data into the CT stream (synthetic passkey/kv
+   or QA-with-distant-evidence) so long-horizon keeping is rewarded;
+   (b) curriculum over budget and window length so more rounds are
+   seen per needle; (c) more tokens (2B is tiny); (d) tiering
+   (`_late` resurrection) for whatever the hot tier still drops. The
+   equal-bytes comparison against a trained linear model on this same
+   probe is the remaining piece of the positioning argument.
