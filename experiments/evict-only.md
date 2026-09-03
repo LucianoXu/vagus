@@ -83,7 +83,7 @@ current query's softmax — so the gradient reaching any surviving
 | 29876414 | eval-evict-fp: frozen SAX2 + plain-ct s43/s44, budgets {32,64,128,256,512} × scores {lin, p2}, L∈{2048,4096} → runs/eval/evict_frozen_plain.json | running |
 | 29876528 | evict-ct2B-m128-s43 (4×A100) | COMPLETED 05:27:55, 2.000B tokens, final loss 2.3944 (ema 2.4197), gnorm 0.10–0.12 throughout → runs/evict-ct2B-m128-s43-e67641d2/ckpt-00003814.pt — **gate 2 passed** (see below) |
 | 29876531 | evict-ct2B-m128-s44 | COMPLETED 05:29:56, 2.000B tokens, final loss 2.4507 (ema 2.4162) → runs/evict-ct2B-m128-s44-e67641d2/ckpt-00003814.pt — **gate 2 passed** |
-| 29882377 / 29882410 | eval-evict-s43 / s44: budgets {32,64,128,256,512} × {lin, p2}, L∈{2048,4096} → runs/eval/evict_ct_s4{3,4}.json | submitted 2026-09-03 01:55 |
+| 29882377 / 29882410 | eval-evict-s43 / s44: budgets {32,64,128,256,512} × {lin, p2}, L∈{2048,4096} → runs/eval/evict_ct_s4{3,4}.json | COMPLETED 2026-09-03 ~02:30 (results below) |
 
 ### Gate 2 at scale — PASSED (prediction 1 confirmed), 2026-09-02 20:36
 
@@ -160,3 +160,96 @@ Readings:
 4. **Beyond the trained context evict-only beats full** from m256 up
    (L4096: −0.005 frozen, −0.011 plain-CT at m256; −0.018 / −0.025 at
    m512) — the tier-1 side fact, now on the compacted SDPA path.
+
+## Results — closed-loop adaptation confirmed (2026-09-03)
+
+Seed-mean NLL (nats), score `lin`, same holdout / protocol as every
+table above; `evict − plain` is the paired difference at equal extra
+tokens (2B), i.e. the management-awareness credit.
+
+```
+L2048        full   m32e   m64e   m128e  m256e  m512e   gap@m128
+frozen      2.4244 2.5027 2.4858 2.4694 2.4525 2.4378   +0.045
+plain-ct    2.3998 2.4780 2.4609 2.4444 2.4274 2.4129   +0.045
+evict-ct    2.4288 2.4572 2.4364 2.4221 2.4147 2.4150   -0.007
+evict-plain +.029  -.021  -.025  -.022  -.013  +.002
+
+L4096        full   m32e   m64e   m128e  m256e  m512e   gap@m128
+frozen      2.4591 2.5060 2.4883 2.4721 2.4546 2.4408   +0.013
+plain-ct    2.4402 2.4814 2.4633 2.4469 2.4294 2.4157   +0.007
+evict-ct    2.4930 2.4582 2.4370 2.4227 2.4154 2.4180   -0.070
+evict-plain +.053  -.023  -.026  -.024  -.014  +.002
+```
+
+Paired per-sequence bootstrap at the deployment cell m128e_lin
+(evict-ct vs plain-ct, same seed, same sequences):
+
+| L | seed | mean Δ | 95% CI | sequences improved |
+|---|---|---|---|---|
+| 2048 | 43 | −0.0221 | [−0.0251, −0.0193] | 124 / 128 |
+| 2048 | 44 | −0.0224 | [−0.0256, −0.0196] | 128 / 128 |
+| 4096 | 43 | −0.0241 | [−0.0275, −0.0209] | 64 / 64 |
+| 4096 | 44 | −0.0244 | [−0.0280, −0.0210] | 64 / 64 |
+
+Seeds agree to ≤ 0.0005 in every cell.
+
+### Verdicts on the three registered predictions
+
+1. **Gate 2 / stability — confirmed.** gnorm 0.09–0.12 for all 3,814
+   steps on both seeds, identical to plain CT (0.11). The tier-1
+   amplifiers (807 – 2.6e16) were the pool path, not hard selection.
+2. **Throughput — partially.** 0.035 Mtok/s/GPU single-GPU (2.9× the
+   tier-1 sprint), 0.10 aggregate in the 4-GPU trainer; 2B tokens in
+   5.5 h. The 0.06/GPU target was not met.
+3. **Closed-loop signal — confirmed, and inverted.** The criterion was
+   m128e − full < +0.044 in the evict arm. Observed **−0.007** (L2048),
+   **−0.070** (L4096). The gap did not shrink; it changed sign.
+
+### What the model learned (readings)
+
+- **Management-aware CT beats plain CT under management by 0.022–0.026
+  nat at every budget 32–256**, both lengths, all sequences. The credit
+  is not "2B more tokens" (the plain control has them); it is the
+  closed loop: the model learned to write kv that survives the
+  transported error-law eviction. This is the first direct evidence
+  for theory §2's closed-loop claim and §7′(c)'s "the model learns to
+  write memory in a form that survives management".
+- **Transfer is asymmetric in budget.** Trained at m=128, the credit
+  is essentially constant at 32–128 (−0.021 … −0.025), halves at 256,
+  and vanishes at 512 (+0.002). Loosening the budget beyond ~2× the
+  trained one buys nothing; the model has become a 128-atom model.
+- **Length-invariant quality.** evict-ct at L4096 equals itself at
+  L2048 to ≤ 0.003 at every budget (it only ever sees 128 + block
+  atoms). Consequence: beyond the trained context the **128-atom
+  managed model beats plain CT with full attention** (2.4227 vs
+  2.4402, −0.018) and beats the frozen full model by −0.036.
+- **The price is full attention.** evict-ct under an unmanaged cache
+  is +0.029 (L2048) / +0.053 (L4096) worse than plain CT and worse
+  than the frozen origin: a large visible set is now off-distribution.
+  The model's own optimum sits at m256 (2.4147), below its full
+  (2.4288) and below the frozen full (2.4244). This is E6's
+  "light compression beats full" effect trained into the weights, and
+  it argues for a **mixed-budget curriculum** (some windows at full,
+  some managed, or budget sampled per window) if a single checkpoint
+  must serve both regimes.
+- **Score form after adaptation**: `p2` vs `lin` differences are
+  ≤ 0.004 and change sign across budgets — the model adapted to the
+  selection it was trained under; the score form is not a lever here.
+
+### What this does not show (recorded for the positioning question)
+
+PPL is a smooth-regime metric. Whether the closed loop also buys
+*recall* — the one property that separates learned selective exact
+memory from a trained linear state — is untested: this arm needs a
+passkey / MQAR-style probe on the same checkpoints (frozen, plain-ct,
+evict-ct under m128 and under full). That probe, and the equal-bytes
+comparison against a from-scratch linear / 1:3 hybrid (E8 stage 3),
+are the two experiments that decide the "why eviction at all"
+question; this arm answers only "is the closed-loop channel real and
+trainable" — yes, stably, at 0.10 Mtok/s.
+
+### Artifacts
+
+- Checkpoints: `runs/evict-ct2B-m128-s4{3,4}-e67641d2/ckpt-00003814.pt` (raven)
+- Evals: `runs/eval/evict_frozen_plain.json`, `runs/eval/evict_ct_s4{3,4}.json` (raven; local copies in this session's tmp)
+- Code: branch `evict-only`, commits e67641d … (this file's history)
