@@ -34,6 +34,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from ..components.losses import make_ce
 from ..dataset.loader import TokenStore, WindowLoader
 from ..models import build_model
+from ..models.io import export_slim
 from ..optimizer import build_optimizer
 from ..utils import atomic_write, git_state
 from .metrics import FAST_METRICS, SLOW_METRICS, MetricCtx, Monitor
@@ -456,6 +457,11 @@ def train(config: TrainConfig):
                                 model, optimizer, loader, config)
             log(f'final {kind} checkpoint: {p.name} | '
                 f'{tokens_seen/1e9:.3f}B tokens seen')
+            if kind == 'permanent':
+                # the inference/archival artifact (weights + args, fp32):
+                # what load_model and the registry's model-final.pt mean
+                export_slim(p, run_dir / 'model-final.pt')
+                log('wrote model-final.pt (slim)')
     finally:
         monitor.close()
         if is_dist:

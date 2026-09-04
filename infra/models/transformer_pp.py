@@ -8,6 +8,7 @@ from ..components.pos_embed import RoPE
 from ..components.norm_layer import RMSNorm
 from ..components.attention import SoftmaxAttention 
 from ..components.ffn import FFN
+from .decodable import Decodable
 
 class Block(nn.Module):
     '''
@@ -94,7 +95,7 @@ class Block(nn.Module):
 
 
 
-class TransformerPP(nn.Module):
+class TransformerPP(nn.Module, Decodable):
     def __init__(self,
             vocab_size: int,
             dim: int,
@@ -193,14 +194,23 @@ class TransformerPP(nn.Module):
     def export_cache(self) -> dict:
         return {'blocks': [blk.export_cache() for blk in self.blocks]}  # type: ignore
 
+    @property
+    def max_stream_len(self) -> int:
+        # the trained window; reset_cache with a larger max_cache_len
+        # extends the RoPE table (extrapolation, not a supported regime)
+        return self.config['context_len']
+
     @torch.no_grad()
-    def decode_step(self, tokens):
-        # tokens: the next block of the stream, (B, L) int64
+    def decode_step(self, tokens, return_logits: bool = True):
+        # tokens: the next block of the stream, (B, L) int64; L == 0 is a
+        # no-op. return_logits=False advances the state only (prefill):
+        # no (B, L, vocab) projection is ever materialised for a prompt.
         x = self.embedding(tokens)
         for blk in self.blocks:
             x = blk.decode_step(x)  # type: ignore
-        x = self.rms_head(x)
-        return self.head(x)
+        if not return_logits:
+            return None
+        return self.head(self.rms_head(x))
 
     # training
 
