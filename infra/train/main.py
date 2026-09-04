@@ -190,6 +190,10 @@ def save_checkpoint(run_dir: Path, kind: str, step: int, tokens_seen: int,
         'tokens_seen': tokens_seen,
         'model_name': config.model_name,
         'model_args': config.model_args,
+        # identity of the token stream's vocabulary, so a checkpoint can be
+        # assembled for generation without outside knowledge
+        # (Generator.from_checkpoint); same fields as meta.json
+        'tokenizer': {k: loader.store.manifest['tokenizer'][k] for k in ('id', 'sha256')},
         'model': unwrap(model).state_dict(),
         'optimizer': optimizer.state_dict(),
         'loader': loader.state_dict(),

@@ -21,6 +21,7 @@
 # rows cannot be left-padded. Rows stop together: the stream ends when
 # every row has emitted a stop id or max_new_tokens is reached.
 
+from pathlib import Path
 from typing import TYPE_CHECKING, Iterator, Sequence
 
 import torch
@@ -67,6 +68,24 @@ class Generator:
         self.fed_len = 0                     # tokens the model has consumed
         self.pending: torch.Tensor | None = None
         self.stop_reason: str | None = None  # 'stop_id' | 'max_new_tokens' | 'capacity'
+
+    @classmethod
+    def from_checkpoint(cls, path: 'str | Path', device: 'str | torch.device' = 'cpu',
+                        dtype: 'str | torch.dtype | None' = None,
+                        tokenizer_id: str | None = None) -> 'Generator':
+        '''Model, tokenizer and stream conventions from one checkpoint.
+        The tokenizer id comes from the checkpoint (written by the training
+        loop); tokenizer_id overrides it, and is required for checkpoints
+        that predate the field.'''
+        from ..models.io import load_model
+        from .. import tokenizers
+        model, meta = load_model(path, device=device, dtype=dtype)
+        if tokenizer_id is None:
+            if meta['tokenizer'] is None:
+                raise ValueError(f'{path} records no tokenizer; pass tokenizer_id=')
+            tokenizer_id = meta['tokenizer']['id']
+        start_id, stop_ids = tokenizers.stream_conventions(tokenizer_id)
+        return cls(model, tokenizers.load(tokenizer_id), start_id=start_id, stop_ids=stop_ids)
 
     # --- state -------------------------------------------------------
 

@@ -13,5 +13,10 @@
     "add_eos": false,
     "note": "BOS baked into the post_processor: plain encode() prepends <s>; packed streams use BOS as the document separator."
   },
+  "stream": {
+    "start": 1,
+    "stop": [1],
+    "note": "Generation-side view of the same convention: a document begins with BOS and the next BOS is what the model emits at its end. EOS never occurs in training streams."
+  },
   "lineage": "Mistral-7B-v0.1 vocab+merges verbatim (verified identical), serialized in the legacy LlamaTokenizer scheme (Prepend/Replace normalizer, no Metaspace). NOT byte-identical in behavior to mistralai/Mistral-7B-v0.1@main current serialization on whitespace edge cases (leading spaces, whitespace-only strings). This exact file is the flame framework default (--model.tokenizer_path fla-hub/transformer-1.3B-100B), i.e. the fla-org linear-attention benchmark line."
 }

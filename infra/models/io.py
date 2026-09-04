@@ -2,8 +2,10 @@
 #
 # full  — what train/main.py writes (ckpt-STEP.pt, recent.pt): model +
 #         optimizer + loader + rng + resolved config. Resume material.
-# slim  — model-final.pt: model_name, model_args, model (state_dict), step,
-#         tokens_seen. Inference and archival material; ~1/3 the bytes.
+# slim  — model-final.pt: model_name, model_args, tokenizer, model
+#         (state_dict), step, tokens_seen. Inference and archival material;
+#         ~1/3 the bytes. `tokenizer` ({id, sha256}) is absent in
+#         checkpoints written before 2026-09-04.
 #
 # Both share model_name / model_args / model, so load_model accepts either
 # and the generator never sees the difference. export_slim is the path
@@ -18,7 +20,7 @@ from torch import nn
 from . import build_model
 from ..utils import atomic_write
 
-SLIM_KEYS = ('model_name', 'model_args', 'model', 'step', 'tokens_seen')
+SLIM_KEYS = ('model_name', 'model_args', 'tokenizer', 'model', 'step', 'tokens_seen')
 
 _DTYPES = {
     'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16,
@@ -45,8 +47,8 @@ def load_model(path: str | Path, device: str | torch.device = 'cpu',
                dtype: str | torch.dtype | None = None) -> tuple[nn.Module, dict]:
     '''Rebuild the model from a full or slim checkpoint.
 
-    Returns (model, meta) with meta = {model_name, model_args, step,
-    tokens_seen, format}. dtype None keeps the stored precision (fp32
+    Returns (model, meta) with meta = {model_name, model_args, tokenizer,
+    step, tokens_seen, format}; tokenizer is None for old checkpoints. dtype None keeps the stored precision (fp32
     master weights); 'bfloat16' casts for inference. The model comes back
     in eval mode with grads enabled — the generator runs under no_grad,
     and continual learning can train it as is.'''
@@ -59,6 +61,7 @@ def load_model(path: str | Path, device: str | torch.device = 'cpu',
     meta = {
         'model_name': state['model_name'],
         'model_args': state['model_args'],
+        'tokenizer': state.get('tokenizer'),
         'step': state.get('step'),
         'tokens_seen': state.get('tokens_seen'),
         'format': 'full' if is_full_checkpoint(state) else 'slim',

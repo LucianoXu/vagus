@@ -135,16 +135,17 @@ def test_sample_knobs():
 
 def test_checkpoint_formats(model, tmp_path):
     full = {'step': 5, 'tokens_seen': 10, 'model_name': 'TransformerPP', 'model_args': ARGS,
+            'tokenizer': {'id': 'mistral32k', 'sha256': 'x'},
             'model': model.state_dict(), 'optimizer': {}, 'loader': {}, 'rng': {}, 'config': {}}
     torch.save(full, tmp_path / 'ckpt-00000005.pt')
     slim = export_slim(tmp_path / 'ckpt-00000005.pt', tmp_path / 'model-final.pt', dtype='bfloat16')
     s = torch.load(slim, weights_only=False)
-    assert set(s) == {'model_name', 'model_args', 'model', 'step', 'tokens_seen'}
+    assert set(s) == {'model_name', 'model_args', 'tokenizer', 'model', 'step', 'tokens_seen'}
     assert s['model']['blocks.0.att.wq.weight'].dtype == torch.bfloat16
     m_full, meta_full = load_model(tmp_path / 'ckpt-00000005.pt')
     m_slim, meta_slim = load_model(slim, dtype='float32')
     assert meta_full['format'] == 'full' and meta_slim['format'] == 'slim'
-    assert meta_slim['step'] == 5
+    assert meta_slim['step'] == 5 and meta_slim['tokenizer']['id'] == 'mistral32k'
     ids = torch.randint(2, 101, (1, 4))
     a = Generator(m_full).generate_ids(ids, SamplingConfig(max_new_tokens=3, temperature=0, stop_ids=()))
     b = Generator(m_slim).generate_ids(ids, SamplingConfig(max_new_tokens=3, temperature=0, stop_ids=()))
@@ -185,3 +186,27 @@ def test_text_roundtrip_and_stream(model):
     g.reset(1); assert g.gen_ids(cfg).shape == (1, 6)
     with pytest.raises(ValueError):
         g.reset(2); g.prefill(['a', 'a much longer prompt'])
+
+
+def test_stream_conventions():
+    from infra import tokenizers
+    assert tokenizers.stream_conventions('mistral32k') == (1, (1,))
+    with pytest.raises(KeyError):
+        tokenizers.stream_conventions('nope')
+
+
+def test_from_checkpoint(tmp_path):
+    torch.manual_seed(0)
+    m = build_model('TransformerPP', dict(ARGS, vocab_size=32000)).eval()
+    torch.save({'model_name': 'TransformerPP', 'model_args': dict(ARGS, vocab_size=32000),
+                'model': m.state_dict()}, tmp_path / 'old.pt')          # no tokenizer field
+    with pytest.raises(ValueError):
+        Generator.from_checkpoint(tmp_path / 'old.pt')
+    g = Generator.from_checkpoint(tmp_path / 'old.pt', tokenizer_id='mistral32k')
+    assert (g.start_id, g.stop_ids) == (1, (1,)) and g.tokenizer is not None
+    torch.save({'model_name': 'TransformerPP', 'model_args': dict(ARGS, vocab_size=32000),
+                'tokenizer': {'id': 'mistral32k', 'sha256': 'x'},
+                'model': m.state_dict()}, tmp_path / 'new.pt')
+    g = Generator.from_checkpoint(tmp_path / 'new.pt')
+    out = g.generate('hello', SamplingConfig(max_new_tokens=3, temperature=0))
+    assert len(out) == 1 and g.stream_len == 1 + len(g.tokenizer.encode('hello', add_special_tokens=False).ids) + 3
