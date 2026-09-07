@@ -22,13 +22,17 @@ data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
 data_shards: null          # all 20 shards (16.7B tokens); 15B => 0.9 epoch
 
 context_len: 2048
-# 4 GPUs, single node; global batch = 4 * 16 * 4 * 2048 = 0.5M tokens.
-# micro 16 as SAX1; the GDN chunk path stores per-chunk states instead
-# of the (B, H, L, L)-free SDPA workspace — memory expected at or below
-# SAX1's 40.1 GB peak, confirm on the pilot.
+# 4 GPUs, single node; global batch = 4 * 8 * 8 * 2048 = 0.5M tokens.
+# micro 8 / accum 8 (SAX1 ran 16 / 4): KDA at micro 16 OOMs on A100-40GB
+# at the first step (38 GB allocated — per-channel gates, conv/l2norm
+# intermediates and the kernel's saved chunk states on top of SAX1's
+# 40.1 GB-peak footprint; jobs 30066917/18). The loader assigns each
+# optimizer step the same global window set for 8x8 and 16x4 (rank-
+# interleaved slices of the shuffled order), so the SAX1 batch pairing
+# holds; only the micro-batch partition of each step differs.
 world_size: 4
-batch_size: 16             # per-rank micro-batch
-grad_accum_steps: 4
+batch_size: 8              # per-rank micro-batch
+grad_accum_steps: 8
 global_batch_tokens: 524288
 train_tokens: 15_000_000_000
 seed: 42

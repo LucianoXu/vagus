@@ -20,9 +20,10 @@ data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
 data_shards: null
 
 context_len: 2048
+# micro 8 / accum 8: micro 16 OOMs for KDA on A100-40GB (see fwe15B recipe)
 world_size: 4
-batch_size: 16
-grad_accum_steps: 4
+batch_size: 8
+grad_accum_steps: 8
 global_batch_tokens: 524288
 train_tokens: 1_000_000_000
 seed: 42
