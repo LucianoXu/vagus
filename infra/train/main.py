@@ -354,13 +354,11 @@ def train(config: TrainConfig):
                 if amp_dtype is not torch.float32 else nullcontext())
     assert amp_dtype is not torch.float16, 'fp16 (GradScaler) path not implemented'
 
-    margs = config.model_args
     ctx = MetricCtx(
         model=unwrap(model), optimizer=optimizer, world_size=world,
         device_type=device.type, param_count=param_count,
         peak_tflops=config.peak_tflops,
-        attn_flops_per_tok=(12 * margs['layer_count'] * margs['dim'] * config.context_len
-                            if {'layer_count', 'dim'} <= margs.keys() else 0))
+        attn_flops_per_tok=unwrap(model).attn_flops_per_token(config.context_len))  # type: ignore[attr-defined]
     # constructed on every rank (its loss all-reduce is a collective);
     # only rank 0 gets the tb writer, and log() is already rank-gated.
     # models contribute architecture-specific hooks via the optional

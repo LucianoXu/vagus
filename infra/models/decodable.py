@@ -1,4 +1,6 @@
-# The streaming-inference protocol every registered model implements.
+# The streaming-inference protocol every registered model implements:
+# WithCache (components/cache.py — the state handling shared with blocks
+# and mixers) plus the model-level decode step and its length limit.
 #
 # Generation (infra/inference) is written once against this protocol; the
 # architecture-specific part — what "state" is — stays inside the model:
@@ -14,21 +16,18 @@
 from typing import Protocol, runtime_checkable
 
 import torch
-from torch import nn
+
+from ..components.cache import WithCache, missing_members
 
 
 @runtime_checkable
-class Decodable(Protocol):
+class Decodable(WithCache, Protocol):
 
-    # hard upper bound on the stream length this model was built for
-    # (context_len for softmax attention: RoPE table + trained length);
-    # None for models with no positional limit (pure linear attention)
-    max_stream_len: int | None
-
-    def reset_cache(self, batch_size: int, max_cache_len: int) -> None:
-        '''Allocate an empty state for `batch_size` streams. max_cache_len
-        bounds the number of tokens the state can hold; models with a
-        fixed-size state accept and ignore it.'''
+    @property
+    def max_stream_len(self) -> int | None:
+        '''Hard upper bound on the stream length this model was built for
+        (context_len for softmax attention: RoPE table + trained length);
+        None for models with no positional limit (pure linear attention).'''
         ...
 
     def decode_step(self, tokens: torch.Tensor, return_logits: bool = True) -> torch.Tensor | None:
@@ -38,23 +37,10 @@ class Decodable(Protocol):
         whatever the output side costs (the vocab projection, mainly).'''
         ...
 
-    def export_cache(self) -> dict:
-        '''A compact, self-contained copy of the state (tensors cloned).'''
-        ...
-
-    def load_cache(self, cache: dict, max_cache_len: int) -> None:
-        '''Restore a state exported by export_cache, allocating for
-        max_cache_len tokens (must be >= the exported prefix length).'''
-        ...
-
 
 def missing_decodable(obj) -> list[str]:
-    '''Names of protocol members `obj` lacks (empty = conforms).
-
-    Models declare conformance by inheriting Decodable explicitly
-    (class TransformerPP(nn.Module, Decodable)), which makes isinstance()
-    hold nominally. This structural check exists for the duck-typed case:
-    since 3.12 isinstance() against a runtime_checkable Protocol uses
-    static attribute lookup and misses members nn.Module
-    resolves dynamically (submodules, buffers).'''
-    return [a for a in sorted(Decodable.__protocol_attrs__) if not hasattr(obj, a)]
+    '''Names of Decodable members `obj` lacks (empty = conforms). Models
+    also inherit Decodable explicitly (class TransformerPP(nn.Module,
+    Decodable)) for the nominal isinstance(); see
+    components.cache.missing_members for why both checks exist.'''
+    return missing_members(Decodable, obj)

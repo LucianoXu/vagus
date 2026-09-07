@@ -1,0 +1,61 @@
+# LAX1-340M lr pilot @ 3.0e-3 — 1B tokens on 4xA100. Siblings: lr10 / lr17.
+#
+# Same three-arm ladder SAX1 ran (pilot_lr10/17/30), same purpose:
+# STABILITY GATE + coarse ranking for lax1_340M_fwe15B, not an argmax.
+# The lr law behind 1.75e-3 was fitted on transformers; GDN's gates
+# (A_log / dt_bias / the d x H projections under AdamW) and its
+# fixed-size state are new stability surfaces, so the ladder is re-run
+# rather than inherited. Watch, beyond the SAX signals: gdn/state_rms_max
+# (state blow-up), gdn/mem_len_median (gates collapsing to 1 = no
+# forgetting, or to ~1-token memory), gdn/beta_mean.
+#
+# warmup 0.1 = 100M tokens (held near the main run's 150M warmup TOKEN
+# count, as in the SAX1 pilots). Batch layout / data / seed identical to
+# SAX1's pilots: the runs are batch-paired.
+
+run_name: lax1-340M-pilot-lr30
+model_recipe: ../model/lax1_340M.yaml
+
+data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+data_shards: null
+
+context_len: 2048
+world_size: 4
+batch_size: 16
+grad_accum_steps: 4
+global_batch_tokens: 524288
+train_tokens: 1_000_000_000
+seed: 42
+
+optimizer_name: muon
+optimizer_args:
+  lr: 3.0e-3
+  momentum: 0.95
+  weight_decay: 0.1
+  lr_adjust: rms
+  ns_coeffs: polar_express
+  adamw:
+    lr: 3.0e-3
+    betas: [0.9, 0.95]
+    weight_decay: 0.1
+
+schedule_name: linear
+schedule_args:
+  warmup: 0.1
+  min_ratio: 0.05
+
+grad_clip: 1.0
+z_loss: 1e-4
+ce_impl: liger
+
+device: auto
+dtype: bfloat16
+compile: true
+tf32: true
+
+out_root: runs
+log_interval: 10
+slow_interval: 100
+permanent_ckpt_interval: null    # final checkpoint only
+recent_ckpt_minutes: 30
+peak_tflops: 312

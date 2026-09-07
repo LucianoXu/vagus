@@ -210,3 +210,7 @@ def test_from_checkpoint(tmp_path):
     g = Generator.from_checkpoint(tmp_path / 'new.pt')
     out = g.generate('hello', SamplingConfig(max_new_tokens=3, temperature=0))
     assert len(out) == 1 and g.stream_len == 1 + len(g.tokenizer.encode('hello', add_special_tokens=False).ids) + 3
+
+
+def test_attn_flops_per_token(model):
+    assert model.attn_flops_per_token(48) == 12 * 2 * 64 * 48

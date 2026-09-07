@@ -1,99 +1,15 @@
 # The recipe of Transformer++
 
-import math
+from typing import Any
+
 import torch
 from torch import nn
 
 from ..components.pos_embed import RoPE
 from ..components.norm_layer import RMSNorm
-from ..components.attention import SoftmaxAttention 
-from ..components.ffn import FFN
+from ..components.attention import SoftmaxAttention
+from ..components.block import Block
 from .decodable import Decodable
-
-class Block(nn.Module):
-    '''
-    The default values corresponds to Transformer++ standard.
-    '''
-    def __init__(
-            self,
-            dim: int,
-            head_dim: int,
-            ffn_hidden_dim: int | None = None,
-            kv_head_count: int | None = None,
-            rmsnorm_eps: float = 1e-6,
-            qk_norm: bool = False,
-            *,
-            rope: RoPE,
-            layer_count: int | None
-        ):
-        super().__init__()
-
-        assert dim % head_dim == 0
-        head_count = dim // head_dim
-        kv_head_count = kv_head_count or head_count
-        # Llama's SwiGLU sizing: 8/3 * dim, rounded up to a multiple of 256
-        ffn_hidden_dim = ffn_hidden_dim or math.ceil(int(8 * dim / 3) / 256) * 256
-
-        self.rmsnorm1 = RMSNorm(dim, rmsnorm_eps)
-        self.att = SoftmaxAttention(
-            dim=dim,
-            head_count=head_count,
-            kv_head_count=kv_head_count,
-            v_dim_mult=1,
-            short_conv_size=None,
-            qk_norm=qk_norm,
-            rope=rope,
-            init_std=0.02,
-            layer_count=layer_count
-        )
-        self.rmsnorm2 = RMSNorm(dim, rmsnorm_eps)
-        self.ffn = FFN(
-            dim=dim,
-            hidden_dim=ffn_hidden_dim,
-            init_std=0.02,
-            layer_count=layer_count
-        )
-
-    def forward(self, x, is_causal: bool = True):
-        dx = self.rmsnorm1(x)
-        dx = self.att(dx, is_causal)
-        x = x + dx
-
-        dx = self.rmsnorm2(x)
-        dx = self.ffn(dx)
-        x = x + dx
-        
-        return x
-
-    def reset_cache(self, batch_size: int, max_cache_len: int):
-        self.att.reset_cache(batch_size, max_cache_len)
-
-    def load_cache(self, cache: dict, max_cache_len: int):
-        self.att.load_cache(
-            cache['att'],
-            max_cache_len=max_cache_len
-        )
-
-    def export_cache(self) -> dict:
-
-        return {
-            'att': self.att.export_cache()
-        }
-
-
-    @torch.no_grad()
-    def decode_step(self, x):
-        dx = self.rmsnorm1(x)
-        dx = self.att.decode_step(dx)
-        x = x + dx
-
-        dx = self.rmsnorm2(x)
-        dx = self.ffn(dx)
-        x = x + dx
-        
-        return x
-
-
 
 class TransformerPP(nn.Module, Decodable):
     def __init__(self,
@@ -111,7 +27,7 @@ class TransformerPP(nn.Module, Decodable):
         ):
         super().__init__()
 
-        self.config = dict(
+        self.config: dict[str, Any] = dict(
             vocab_size=vocab_size,
             dim=dim,
             head_dim=head_dim,
@@ -128,17 +44,26 @@ class TransformerPP(nn.Module, Decodable):
         # constructing the pipeline
         self.embedding = nn.Embedding(vocab_size, dim)
         self.rope = RoPE(dim, head_dim, context_len, base=rope_base)
+        assert dim % head_dim == 0
+        head_count = dim // head_dim
         self.blocks = nn.ModuleList([
             Block(
                 dim=dim,
-                head_dim=head_dim,
                 ffn_hidden_dim=ffn_hidden_dim,
-                kv_head_count=kv_head_count,
                 rmsnorm_eps=rmsnorm_eps,
-                qk_norm=qk_norm,
-                rope=self.rope,
-                layer_count=layer_count   # total depth for the 1/sqrt(2L)
-            )                          # residual scaling, same for every layer
+                mixer=SoftmaxAttention(
+                    dim=dim,
+                    head_count=head_count,
+                    kv_head_count=kv_head_count,
+                    v_dim_mult=1,
+                    short_conv_size=None,
+                    qk_norm=qk_norm,
+                    rope=self.rope,
+                    init_std=0.02,
+                    layer_count=layer_count   # total depth for the 1/sqrt(2L)
+                ),                            # residual scaling, same for every layer
+                layer_count=layer_count
+            )
             for _ in range(layer_count)
         ])
         self.rms_head = RMSNorm(dim, rmsnorm_eps)
@@ -198,7 +123,7 @@ class TransformerPP(nn.Module, Decodable):
     def max_stream_len(self) -> int:
         # the trained window; reset_cache with a larger max_cache_len
         # extends the RoPE table (extrapolation, not a supported regime)
-        return self.config['context_len']
+        return int(self.config['context_len'])
 
     @torch.no_grad()
     def decode_step(self, tokens, return_logits: bool = True):
@@ -228,6 +153,12 @@ class TransformerPP(nn.Module, Decodable):
             'adamw_no_decay': adamw_no_decay,
         }
 
+    def attn_flops_per_token(self, context_len: int) -> float:
+        '''Attention matmul FLOPs per token (fwd + bwd), for the MFU
+        estimate: QK^T and PV are 2 * d * L each forward, x3 with the
+        backward, per layer — the PaLM 12 * layers * d * L term.'''
+        return float(12 * int(self.config['layer_count']) * int(self.config['dim']) * context_len)
+
     def metric_hooks(self) -> dict:
         return {'slow': [self._metric_max_attn_logit]}
 
@@ -243,7 +174,7 @@ class TransformerPP(nn.Module, Decodable):
         x = self.embedding(tokens[:1])
         worst = None
         for blk in self.blocks:
-            assert isinstance(blk, Block)
+            assert isinstance(blk, Block) and isinstance(blk.att, SoftmaxAttention)
             h = blk.rmsnorm1(x)
             m = blk.att.max_attn_logit(h)
             worst = m if worst is None else torch.maximum(worst, m)

@@ -7,12 +7,13 @@ from torch.nn.attention.bias import causal_lower_right
 import math
 
 from ..utils import infer_device, infer_dtype
+from .mixer import Mixer
 from .norm_layer import RMSNorm
 from .opt import ShortConv
 from .pos_embed import RoPE
 
 
-class SoftmaxAttention(nn.Module):
+class SoftmaxAttention(nn.Module, Mixer):
     '''
     Multi-head softmax attention with RoPE, grouped-query attention
     (kv_head_count < head_count shares each K/V head across a group of

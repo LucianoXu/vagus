@@ -15,7 +15,8 @@ class RMSNorm(nn.Module):
     def forward(self, x):
         # x : (..., d)
         orig_dtype = x.dtype
-        x = x.float()
+        # at least fp32 for the statistics; fp64 stays fp64 (exactness tests)
+        x = x.to(torch.promote_types(orig_dtype, torch.float32))
         rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
         x = x * rms 
         x = x.to(orig_dtype)

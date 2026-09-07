@@ -1,0 +1,67 @@
+# LAX1-340M on FineWeb-Edu, 15B tokens — the LAX series opener, paired
+# against sax1-340M-fwe15B-74b227a9 (loss_ce tail5 2.4007): same data,
+# token budget, batch layout, seed and optimizer recipe, so the delta is
+# the mixer (Gated DeltaNet vs softmax attention). COMPARE ON loss_ce.
+#
+# Recipe = SAX1's verbatim (Muon polar-express + AdamW, shared lr via
+# rms adjust, linear decay 1% warmup / 0.05 floor, z-loss 1e-4, wd 0.1),
+# with the model's own routing: the d x H gate projections and the
+# conv weights train under AdamW, A_log / dt_bias / norm gammas are
+# never decayed (GDNLM.param_groups). lr 1.75e-3 is provisional until
+# the lax1_340M_pilot_* ladder has cleared it (see those files).
+#
+# Expected reading (GDN paper, fla-hub 340M@15B numbers): loss_ce at or
+# slightly under the softmax pair. That parity says nothing about exact
+# recall, which is where linear attention is known to lose; a recall
+# probe (MQAR-style) is a separate eval, not this run.
+
+run_name: lax1-340M-fwe15B
+model_recipe: ../model/lax1_340M.yaml
+
+data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+data_shards: null          # all 20 shards (16.7B tokens); 15B => 0.9 epoch
+
+context_len: 2048
+# 4 GPUs, single node; global batch = 4 * 16 * 4 * 2048 = 0.5M tokens.
+# micro 16 as SAX1; the GDN chunk path stores per-chunk states instead
+# of the (B, H, L, L)-free SDPA workspace — memory expected at or below
+# SAX1's 40.1 GB peak, confirm on the pilot.
+world_size: 4
+batch_size: 16             # per-rank micro-batch
+grad_accum_steps: 4
+global_batch_tokens: 524288
+train_tokens: 15_000_000_000
+seed: 42
+
+optimizer_name: muon
+optimizer_args:
+  lr: 1.75e-3
+  momentum: 0.95
+  weight_decay: 0.1
+  lr_adjust: rms
+  ns_coeffs: polar_express
+  adamw:
+    lr: 1.75e-3
+    betas: [0.9, 0.95]
+    weight_decay: 0.1
+
+schedule_name: linear
+schedule_args:
+  warmup: 0.01             # 150M tokens
+  min_ratio: 0.05
+
+grad_clip: 1.0
+z_loss: 1e-4
+ce_impl: liger
+
+device: auto
+dtype: bfloat16
+compile: true
+tf32: true
+
+out_root: runs
+log_interval: 10
+slow_interval: 100
+permanent_ckpt_interval: 5000
+recent_ckpt_minutes: 30
+peak_tflops: 312           # A100 bf16 dense; only feeds the MFU metric

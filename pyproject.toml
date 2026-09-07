@@ -23,6 +23,10 @@ dependencies = [
 # - triton, flash_attn: CUDA-only, unresolvable on macOS. Import-guarded at
 #   their use sites (infra/meter/examples); on GPU boxes they come from the
 #   cluster module or a manual install.
+# - flash-linear-attention (import `fla`): the Triton chunk kernels behind
+#   GatedDeltaNet's training path; import-guarded in
+#   infra/components/linear_attention.py, which falls back to its torch
+#   chunk reference. Cluster-side `pip install flash-linear-attention`.
 # - On MPCDF the training env is the site pytorch module, not this uv env;
 #   uv manages the laptop / login-node / any full-control machine.
 
