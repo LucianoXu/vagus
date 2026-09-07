@@ -15,9 +15,7 @@
 #SBATCH --error=runs/slurm-%x-%j.err
 
 set -uo pipefail
-# runs in the checkout it was submitted from (LAX lives in a worktree next
-# to the main checkout on raven); falls back to the main checkout
-cd "${SLURM_SUBMIT_DIR:-$HOME/work/vagus}"
+cd "$HOME/work/vagus"
 
 module purge
 module load python-waterboa/2025.06

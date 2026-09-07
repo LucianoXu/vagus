@@ -1,19 +1,28 @@
-# LAX1-340M on FineWeb-Edu, 15B tokens — the LAX series opener, paired
-# against sax1-340M-fwe15B-74b227a9 (loss_ce tail5 2.4007): same data,
-# token budget, batch layout, seed and optimizer recipe, so the delta is
-# the mixer (Kimi Delta Attention vs softmax attention). COMPARE ON loss_ce.
+# LAX1-340M on FineWeb-Edu, 15B tokens — the LAX series opener, batch-
+# paired against the SAX generation runs: same data, token budget, global
+# batch, seed and optimizer recipe, so the delta is the mixer (Kimi Delta
+# Attention vs softmax attention). COMPARE ON loss_ce.
 #
-# Recipe = SAX1's verbatim (Muon polar-express + AdamW, shared lr via
-# rms adjust, linear decay 1% warmup / 0.05 floor, z-loss 1e-4, wd 0.1),
-# with the model's own routing: the d x H gate projections and the
-# conv weights train under AdamW, A_log / dt_bias / norm gammas are
-# never decayed (GDNLM.param_groups). lr 1.75e-3 is provisional until
-# the lax1_340M_pilot_* ladder has cleared it (see those files).
+# Schedule: WSD, as SAX2 (warmup 1%, flat, linear cooldown over the last
+# 15% to 0) — the user's call for the long-horizon series: the stable-
+# phase permanent checkpoints (every 5000 steps; decay starts at 85% =
+# step 24318) are the trunk for cooldown-branch experiments, and the
+# schedule shape is the one the 1.3B flagship will use. So the primary
+# pair is sax2-340M-fwe15B-79629bc6 (WSD, loss_ce tail5 2.4153); the
+# linear-decay reference is sax1-340M-fwe15B-74b227a9 (2.4007; SAX2
+# trailed it by 0.015 nat with this short cooldown).
+#
+# Optimizer recipe = SAX1/SAX2's (Muon polar-express + AdamW, shared lr
+# via rms adjust, z-loss 1e-4, wd 0.1), with the model's own routing:
+# the low-rank gate projections and beta projection train under AdamW,
+# A_log / per-channel dt_bias / norm gammas are never decayed
+# (GDNLM.param_groups). lr 1.75e-3 is provisional until the
+# lax1_340M_pilot_* ladder has cleared it (see those files).
 #
 # Expected reading (GDN paper / Kimi Linear numbers at 340M-1.4B):
-# loss_ce at or slightly under the softmax pair. That parity says nothing about exact
-# recall, which is where linear attention is known to lose; a recall
-# probe (MQAR-style) is a separate eval, not this run.
+# loss_ce at or slightly under the softmax pair. That parity says nothing
+# about exact recall, which is where linear attention is known to lose; a
+# recall probe (MQAR-style) is a separate eval, not this run.
 
 run_name: lax1-340M-fwe15B
 model_recipe: ../model/lax1_340M.yaml
@@ -49,10 +58,11 @@ optimizer_args:
     betas: [0.9, 0.95]
     weight_decay: 0.1
 
-schedule_name: linear
+schedule_name: wsd
 schedule_args:
-  warmup: 0.01             # 150M tokens
-  min_ratio: 0.05
+  warmup: 0.01             # 150M tokens, same as SAX1/SAX2
+  decay: 0.15              # linear cooldown over the last 2.25B tokens (SAX2)
+  min_ratio: 0.0
 
 grad_clip: 1.0
 z_loss: 1e-4
