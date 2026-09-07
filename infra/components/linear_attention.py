@@ -219,6 +219,8 @@ def chunk_scan_vec(q, k, v, g, beta, S0, *, scale: float, delta: bool, chunk_siz
     if delta:
         assert beta is not None
         beta = beta.to(dt).view(B, N, C, H).permute(0, 3, 1, 2)          # (B, H, N, C)
+    else:
+        beta = None                                                       # no erase, no W
 
     S = torch.zeros(B, H, dk, dv, device=dev, dtype=dt) if S0 is None else S0.to(dt)
     outs = []
