@@ -1,8 +1,10 @@
-# Gated DeltaNet language model — the LAX series' architecture: the
+# Gated delta-rule language model — the LAX series' architecture: the
 # Transformer++ skeleton (pre-norm blocks, SwiGLU FFN, tied embedding,
-# RMSNorm head) with GatedDeltaNet as the token mixer. layer_pattern
-# admits softmax layers for hybrids ('gdn,gdn,gdn,softmax' cycles over
-# depth); a pure pattern has no positional encoding and no length limit.
+# RMSNorm head) with the GatedDeltaNet mixer family as the token mixer:
+# gate='vector' is Kimi Delta Attention (LAX1), 'scalar' Gated DeltaNet,
+# 'none' DeltaNet. layer_pattern admits softmax layers for hybrids
+# ('gdn,gdn,gdn,softmax' cycles over depth); a pure pattern has no
+# positional encoding and no length limit.
 
 from typing import Any
 
@@ -28,8 +30,9 @@ class GDNLM(nn.Module, Decodable):
             value_head_dim: int,
             ffn_hidden_dim: int | None = None,
             short_conv_size: int | None = 4,
-            gate: bool = True,
+            gate: str | bool = 'vector',
             delta: bool = True,
+            gate_rank: int = 64,
             chunk_size: int = 64,
             la_impl: str = 'auto',
             layer_pattern: str = 'gdn',
@@ -47,7 +50,7 @@ class GDNLM(nn.Module, Decodable):
             vocab_size=vocab_size, dim=dim, layer_count=layer_count,
             head_count=head_count, key_head_dim=key_head_dim, value_head_dim=value_head_dim,
             ffn_hidden_dim=ffn_hidden_dim, short_conv_size=short_conv_size,
-            gate=gate, delta=delta, chunk_size=chunk_size, la_impl=la_impl,
+            gate=gate, delta=delta, gate_rank=gate_rank, chunk_size=chunk_size, la_impl=la_impl,
             layer_pattern=layer_pattern, softmax_head_dim=softmax_head_dim,
             context_len=context_len, rope_base=rope_base, rmsnorm_eps=rmsnorm_eps,
             tie_embedding=tie_embedding, gate_proj_optimizer=gate_proj_optimizer,
@@ -68,7 +71,7 @@ class GDNLM(nn.Module, Decodable):
                 return GatedDeltaNet(
                     dim=dim, head_count=head_count, key_head_dim=key_head_dim,
                     value_head_dim=value_head_dim, short_conv_size=short_conv_size,
-                    gate=gate, delta=delta, chunk_size=chunk_size, impl=la_impl,
+                    gate=gate, delta=delta, gate_rank=gate_rank, chunk_size=chunk_size, impl=la_impl,
                     init_std=0.02, layer_count=layer_count)
             assert self.rope is not None
             return SoftmaxAttention(
@@ -172,8 +175,9 @@ class GDNLM(nn.Module, Decodable):
     def _metric_gates(self, ctx) -> dict:
         '''Gate health on one sequence of the trainer's last micro-batch:
         mean decay a (all gdn layers), the median / max effective memory
-        length 1/(1 - a) over heads, mean write strength b, and the worst
-        end-of-sequence state RMS over layers. Runs the fp32 torch path
+        length 1/(1 - a) over heads (over channels for a vector gate),
+        mean write strength b, and the worst end-of-sequence state RMS
+        over layers. Runs the fp32 torch path
         on submodules directly, outside the compiled block graphs.'''
         tokens = ctx.last_batch
         if tokens is None:

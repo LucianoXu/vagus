@@ -8,17 +8,20 @@ import pytest
 import torch
 
 from infra.components.linear_attention import (
-    GatedDeltaNet, HAS_FLA, chunk_scan, recurrent_scan)
+    GATES, GatedDeltaNet, HAS_FLA, chunk_scan, chunk_scan_vec, recurrent_scan)
 
-FLAGS = list(itertools.product([True, False], [True, False]))   # (gate, delta)
+FLAGS = list(itertools.product(GATES, [True, False]))   # (gate, delta)
 
 
-def inputs(B=2, L=37, H=3, dk=8, dv=12, dtype=torch.float64, seed=0):
+def inputs(B=2, L=37, H=3, dk=8, dv=12, dtype=torch.float64, seed=0, gate='scalar'):
     torch.manual_seed(seed)
     q = torch.randn(B, L, H, dk, dtype=dtype)
     k = torch.nn.functional.normalize(torch.randn(B, L, H, dk, dtype=dtype), dim=-1)
     v = torch.randn(B, L, H, dv, dtype=dtype)
-    g = torch.nn.functional.logsigmoid(torch.randn(B, L, H, dtype=dtype) + 2.0)   # a in (0,1)
+    gshape = (B, L, H, dk) if gate == 'vector' else (B, L, H)
+    g = torch.nn.functional.logsigmoid(torch.randn(*gshape, dtype=dtype) + 2.0)   # a in (0,1)
+    if gate == 'none':
+        g = None
     beta = torch.sigmoid(torch.randn(B, L, H, dtype=dtype))
     S0 = 0.3 * torch.randn(B, H, dk, dv, dtype=dtype)
     return q, k, v, g, beta, S0
@@ -27,8 +30,7 @@ def inputs(B=2, L=37, H=3, dk=8, dv=12, dtype=torch.float64, seed=0):
 @pytest.mark.parametrize('gate,delta', FLAGS)
 @pytest.mark.parametrize('chunk', [8, 64])       # L=37: partial chunks, and one chunk
 def test_chunk_matches_recurrent(gate, delta, chunk):
-    q, k, v, g, beta, S0 = inputs()
-    g = g if gate else None
+    q, k, v, g, beta, S0 = inputs(gate=gate)
     kw = dict(scale=0.5, delta=delta)
     o_r, S_r = recurrent_scan(q, k, v, g, beta, S0, **kw)
     o_c, S_c = chunk_scan(q, k, v, g, beta, S0, chunk_size=chunk, **kw)
@@ -43,12 +45,12 @@ def test_chunk_matches_recurrent(gate, delta, chunk):
 
 @pytest.mark.parametrize('gate,delta', FLAGS)
 def test_chunk_gradients_match_recurrent(gate, delta):
-    q, k, v, g, beta, S0 = inputs(L=19)
-    leaves = [t.requires_grad_() for t in (q, k, v, beta, S0)] + ([g.requires_grad_()] if gate else [])
+    q, k, v, g, beta, S0 = inputs(L=19, gate=gate)
+    leaves = [t.requires_grad_() for t in (q, k, v, beta, S0)] + ([g.requires_grad_()] if g is not None else [])
     kw = dict(scale=0.5, delta=delta)
 
     def loss(fn, **extra):
-        o, S = fn(q, k, v, g if gate else None, beta, S0, **kw, **extra)
+        o, S = fn(q, k, v, g, beta, S0, **kw, **extra)
         return (o * torch.arange(1, o.shape[1] + 1, dtype=o.dtype)[None, :, None, None]).sum() + S.pow(2).sum()
 
     gr = torch.autograd.grad(loss(recurrent_scan), leaves, allow_unused=True)
@@ -58,6 +60,19 @@ def test_chunk_gradients_match_recurrent(gate, delta):
             assert b is None or b.abs().max() == 0
             continue
         assert torch.allclose(a, b, atol=1e-11, rtol=1e-11)
+
+
+def test_vector_gate_reduces_to_scalar():
+    '''A channel-constant vector gate must reproduce the scalar chunk path.'''
+    q, k, v, g, beta, S0 = inputs(L=21)
+    gv = g[..., None].expand(*g.shape, q.shape[-1]).contiguous()
+    for delta in (True, False):
+        o_s, S_s = chunk_scan(q, k, v, g, beta, S0, scale=0.5, delta=delta, chunk_size=8)
+        o_v, S_v = chunk_scan_vec(q, k, v, gv, beta, S0, scale=0.5, delta=delta, chunk_size=8)
+        assert torch.allclose(o_s, o_v, atol=1e-12) and torch.allclose(S_s, S_v, atol=1e-12)
+    # dispatch: a 4-D g through chunk_scan lands on the vector path
+    o_d, _ = chunk_scan(q, k, v, gv, beta, S0, scale=0.5, delta=True, chunk_size=8)
+    assert torch.equal(o_d, chunk_scan_vec(q, k, v, gv, beta, S0, scale=0.5, delta=True, chunk_size=8)[0])
 
 
 def test_scan_empty_and_no_initial_state():
@@ -72,11 +87,11 @@ def test_scan_empty_and_no_initial_state():
 
 # --- the module ----------------------------------------------------------
 
-def make(gate=True, delta=True, conv=4, seed=0, **kw):
+def make(gate='vector', delta=True, conv=4, seed=0, **kw):
     torch.manual_seed(seed)
     m = GatedDeltaNet(dim=32, head_count=2, key_head_dim=8, value_head_dim=16,
-                      short_conv_size=conv, gate=gate, delta=delta, chunk_size=8,
-                      impl='torch', layer_count=4, **kw)
+                      short_conv_size=conv, gate=gate, delta=delta, gate_rank=4,
+                      chunk_size=8, impl='torch', layer_count=4, **kw)
     return m.double().eval()
 
 
@@ -125,15 +140,24 @@ def test_module_grad_flows_everywhere():
         assert p.grad is not None and p.grad.abs().sum() > 0, n
 
 
-def test_gate_init_and_stats():
-    m = make()
-    a0 = torch.exp(-m.A_log.exp() * torch.nn.functional.softplus(m.dt_bias))   # a at zero input
-    assert (a0 > 0.8).all() and (a0 < 1.0).all()          # dt in [1e-3, 1e-1], A in [1, 16]
+@pytest.mark.parametrize('gate', ['vector', 'scalar'])
+def test_gate_init_and_stats(gate):
+    m = make(gate=gate)
+    A = m.A_log.exp() if gate == 'scalar' else m.A_log.exp().repeat_interleave(8)
+    a0 = torch.exp(-A * torch.nn.functional.softplus(m.dt_bias))   # a at zero input
+    assert (a0 > 0.19).all() and (a0 < 1.0).all()         # exp(-16 * 0.1) < a0 < exp(-1 * 1e-3)
+    assert m.dt_bias.shape == ((16,) if gate == 'vector' else (2,)) and m.A_log.shape == (2,)
     st = m.gate_stats(torch.randn(1, 30, 32, dtype=torch.float64))
     assert set(st) == {'state_rms', 'alpha', 'mem_len', 'beta'}
-    assert st['alpha'].shape == (2,) and (st['mem_len'] > 1).all()
-    assert set(make(gate=False, delta=False).gate_stats(torch.randn(1, 5, 32, dtype=torch.float64))) == {'state_rms'}
-    assert len(m.gate_projections) == 2 and len(make(gate=False).gate_projections) == 1
+    assert st['alpha'].shape == ((16,) if gate == 'vector' else (2,)) and (st['mem_len'] > 1).all()
+    assert len(m.gate_projections) == (3 if gate == 'vector' else 2)
+
+
+def test_legacy_bool_gate_and_none():
+    assert make(gate=True).gate == 'scalar' and make(gate=False).gate == 'none'
+    m = make(gate='none', delta=False)
+    assert set(m.gate_stats(torch.randn(1, 5, 32, dtype=torch.float64))) == {'state_rms'}
+    assert len(m.gate_projections) == 0
 
 
 def test_impl_selection():
@@ -144,13 +168,13 @@ def test_impl_selection():
 
 
 @pytest.mark.skipif(not (HAS_FLA and torch.cuda.is_available()), reason='needs fla + CUDA')
-@pytest.mark.parametrize('gate,delta', FLAGS)
+@pytest.mark.parametrize('gate,delta', [f for f in FLAGS if not (f[0] == 'vector' and not f[1])])
 def test_fla_matches_torch(gate, delta):
     from infra.components.linear_attention import fla_scan
-    q, k, v, g, beta, S0 = inputs(B=2, L=200, H=4, dk=64, dv=128, dtype=torch.float32)
+    q, k, v, g, beta, S0 = inputs(B=2, L=200, H=4, dk=64, dv=128, dtype=torch.float32, gate=gate)
     dev = 'cuda'
     q, k, v, beta, S0 = (t.to(dev) for t in (q, k, v, beta, S0))
-    g = g.to(dev) if gate else None
+    g = None if g is None else g.to(dev)
     kw = dict(scale=64 ** -0.5, delta=delta)
     o_t, S_t = chunk_scan(q, k, v, g, beta, S0, chunk_size=64, **kw)
     o_f, S_f = fla_scan(q.bfloat16(), k.bfloat16(), v.bfloat16(), g, beta, S0, **kw)

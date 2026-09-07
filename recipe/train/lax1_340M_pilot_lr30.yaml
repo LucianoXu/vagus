@@ -2,8 +2,8 @@
 #
 # Same three-arm ladder SAX1 ran (pilot_lr10/17/30), same purpose:
 # STABILITY GATE + coarse ranking for lax1_340M_fwe15B, not an argmax.
-# The lr law behind 1.75e-3 was fitted on transformers; GDN's gates
-# (A_log / dt_bias / the d x H projections under AdamW) and its
+# The lr law behind 1.75e-3 was fitted on transformers; KDA's gates
+# (A_log / per-channel dt_bias / the low-rank projections under AdamW) and its
 # fixed-size state are new stability surfaces, so the ladder is re-run
 # rather than inherited. Watch, beyond the SAX signals: gdn/state_rms_max
 # (state blow-up), gdn/mem_len_median (gates collapsing to 1 = no

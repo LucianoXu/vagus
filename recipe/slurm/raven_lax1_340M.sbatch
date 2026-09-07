@@ -1,5 +1,5 @@
 #!/bin/bash -l
-# LAX1-340M (Gated DeltaNet) on FineWeb-Edu — Raven, 1 node x 4xA100.
+# LAX1-340M (Kimi Delta Attention) on FineWeb-Edu — Raven, 1 node x 4xA100.
 # Submit from the repo root; an optional argument picks the train recipe:
 #   main run:  sbatch recipe/slurm/raven_lax1_340M.sbatch
 #   lr pilots: sbatch -J lax1pilot17 -t 03:00:00 \
@@ -33,7 +33,7 @@ module purge
 module load python-waterboa/2025.06
 source .venv/bin/activate
 # the training path needs the fla Triton kernels (one-time, login node):
-#   pip install flash-linear-attention   # import name `fla`
+#   pip install fla-core   # import name `fla` (kernels only)
 # without it la_impl=auto silently runs the torch chunk reference
 python -c "import fla" 2>/dev/null || echo "WARNING: fla not installed; torch reference path (slow)"
 

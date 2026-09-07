@@ -1,7 +1,7 @@
 # LAX1-340M on FineWeb-Edu, 15B tokens — the LAX series opener, paired
 # against sax1-340M-fwe15B-74b227a9 (loss_ce tail5 2.4007): same data,
 # token budget, batch layout, seed and optimizer recipe, so the delta is
-# the mixer (Gated DeltaNet vs softmax attention). COMPARE ON loss_ce.
+# the mixer (Kimi Delta Attention vs softmax attention). COMPARE ON loss_ce.
 #
 # Recipe = SAX1's verbatim (Muon polar-express + AdamW, shared lr via
 # rms adjust, linear decay 1% warmup / 0.05 floor, z-loss 1e-4, wd 0.1),
@@ -10,8 +10,8 @@
 # never decayed (GDNLM.param_groups). lr 1.75e-3 is provisional until
 # the lax1_340M_pilot_* ladder has cleared it (see those files).
 #
-# Expected reading (GDN paper, fla-hub 340M@15B numbers): loss_ce at or
-# slightly under the softmax pair. That parity says nothing about exact
+# Expected reading (GDN paper / Kimi Linear numbers at 340M-1.4B):
+# loss_ce at or slightly under the softmax pair. That parity says nothing about exact
 # recall, which is where linear attention is known to lose; a recall
 # probe (MQAR-style) is a separate eval, not this run.
 

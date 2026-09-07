@@ -11,7 +11,7 @@ from infra.optimizer import build_optimizer
 from infra.train.metrics import MetricCtx
 
 ARGS = dict(vocab_size=101, dim=64, layer_count=3, head_count=2, key_head_dim=16,
-            value_head_dim=32, chunk_size=8, la_impl='torch', context_len=48)
+            value_head_dim=32, gate_rank=8, chunk_size=8, la_impl='torch', context_len=48)
 
 
 def build(**over):
@@ -61,7 +61,7 @@ def test_optimizer_coverage_and_gate_routing():
     m = build()
     groups = m.param_groups()
     n_gate = sum(1 for blk in m.blocks for _ in blk.att.gate_projections)
-    assert n_gate == 6
+    assert n_gate == 9                                  # wa1, wa2, wb per layer
     assert all(id(p) not in {id(q) for q in groups['muon']}
                for blk in m.blocks for p in blk.att.gate_projections)
     assert all(p.dim() == 2 for p in groups['muon'])
@@ -95,11 +95,12 @@ def test_metric_hook_and_flops():
     assert 0 < out['gdn/alpha_mean'] < 1 and out['gdn/mem_len_max'] >= out['gdn/mem_len_median'] > 1
     assert m.metric_hooks()['slow'][0](MetricCtx(model=m)) == {}
     assert m.attn_flops_per_token(2048) == 2 * 18 * 2 * 16 * 32 + 12 * 64 * 2048
-    assert set(build(gate=False, delta=False).metric_hooks()['slow'][0](ctx)) == {'gdn/state_rms_max'}
+    assert set(build(gate='none', delta=False).metric_hooks()['slow'][0](ctx)) == {'gdn/state_rms_max'}
+    assert set(build(gate='scalar').metric_hooks()['slow'][0](ctx)) == set(out)
 
 
 def test_config_roundtrip():
-    m = build(layer_pattern='gdn,softmax', gate=False)
+    m = build(layer_pattern='gdn,softmax', gate='scalar')
     m2 = type(m).from_config(m.config)
     assert m2.kinds == m.kinds and [p.shape for p in m2.parameters()] == [p.shape for p in m.parameters()]
 

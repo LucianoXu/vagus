@@ -16,7 +16,7 @@ Run (cluster, one A100, via SLURM):
     python -m infra.meter.examples.bench_linear_attention --which train --batch 16
 
 Defaults are the LAX1-340M layer shape (dim 1024, 4 heads, dk 128,
-dv 256, conv 4) at the training context (2048). fla variants need CUDA
+dv 256, conv 4, vector gate = KDA) at the training context (2048). fla variants need CUDA
 + bf16 + flash-linear-attention installed and are skipped otherwise.
 '''
 
@@ -60,7 +60,7 @@ def fla_reason(device, dtype) -> str | None:
 def make_gdn(args, impl, device, dtype) -> GatedDeltaNet:
     torch.manual_seed(0)
     m = GatedDeltaNet(args.dim, args.heads, args.dk, args.dv, args.conv or None,
-                      gate=not args.no_gate, delta=not args.no_delta,
+                      gate=args.gate, delta=not args.no_delta,
                       chunk_size=args.chunk, impl=impl, layer_count=24)
     return m.to(device=device, dtype=dtype)
 
@@ -165,7 +165,7 @@ def main():
     p.add_argument('--dv', type=int, default=256)
     p.add_argument('--conv', type=int, default=4, help='short conv kernel, 0 = off')
     p.add_argument('--chunk', type=int, default=64)
-    p.add_argument('--no-gate', action='store_true')
+    p.add_argument('--gate', choices=['vector', 'scalar', 'none'], default='vector')
     p.add_argument('--no-delta', action='store_true')
     p.add_argument('--dtype', choices=DTYPES, default='bf16')
     p.add_argument('--device', default=None)
@@ -180,7 +180,7 @@ def main():
     probe = make_gdn(args, 'torch', 'cpu', torch.float32)
     n_params = sum(p.numel() for p in probe.parameters())
     print(f'GatedDeltaNet dim={args.dim} heads={args.heads} dk={args.dk} dv={args.dv} '
-          f'conv={args.conv or None} gate={not args.no_gate} delta={not args.no_delta} '
+          f'conv={args.conv or None} gate={args.gate} delta={not args.no_delta} '
           f'({n_params / 1e6:.1f}M params) {args.dtype} | fla installed: {HAS_FLA}')
 
     if args.which in ('train', 'all'):

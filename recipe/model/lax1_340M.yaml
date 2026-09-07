@@ -1,29 +1,37 @@
 # LAX1-340M — opener of the LAX series: frontier-design tracking for
 # linear-attention LLMs, the counterpart of SAX for softmax attention.
-# Architecture: Gated DeltaNet (arXiv:2412.06464) — scalar forget gate
-# + delta-rule write — on the Transformer++ skeleton, pure (no softmax
-# layers, no positional encoding). Paired against SAX1-340M: same 24 x
-# 1024 coordinate, tied embedding, same FFN, same data/recipe, so the
-# loss delta is attributable to the mixer.
+# Architecture: Kimi Delta Attention (Kimi Linear, arXiv:2510.26692) —
+# per-channel forget gate + delta-rule write — on the Transformer++
+# skeleton, pure (no softmax layers, no positional encoding). Paired
+# against SAX1-340M: same 24 x 1024 coordinate, tied embedding, same
+# FFN, same data/recipe, so the loss delta is attributable to the mixer.
 #
 # Mixer layout (GLA's parameter-matching trick): 4 heads, key head 128,
 # value head 256, i.e. q/k project to d/2 and v/gate/o to d. The mixer is
-# then 4 d^2 params like MHA, and the whole model lands at 341.5M vs
-# SAX1's 341.1M (+0.12%) with the FFN untouched. Small heads are the
-# wrong economy here: per-head memory is a dk x dv matrix, so 16 heads
-# of 64 would quarter the state at equal params.
+# then 4 d^2 params like MHA plus ~0.1M for the low-rank forget gate,
+# and the whole model lands at 343.8M vs SAX1's 341.1M (+0.8%) with the
+# FFN untouched. Small heads are the wrong economy here: per-head memory is
+# a dk x dv matrix, so 16 heads of 64 would quarter the state at equal
+# params.
+#
+# KDA vs Gated DeltaNet (the 2026-09-07 decision): the gate goes from
+# one scalar per head to one per key channel (d_k = 128 of them), the
+# fine-grained control Kimi Linear reports as the win over GDN at 1.4B;
+# the rest of the mixer (conv, L2-normalised q/k, sigmoid beta, gated
+# RMSNorm output) is unchanged. gate: scalar reproduces GDN as an
+# ablation from the same module.
 #
 # Considered and NOT taken (2026-09-07):
 #   expand_v 2 (fla default, value head 2x key head at 8 heads): +30%
 #     params, leaves the coordinate.
 #   8 heads of 128/128: +7.6% params; state size equal, more heads —
 #     an ablation candidate at pilot scale, not the anchor.
-#   hybrid (softmax every 4th layer): the known fix for the exact-recall
-#     gap; separate LAX entry so the pure number exists first.
-#   vector (per-channel) gate (GLA/KDA): not implemented yet; the module
-#     covers GDN / DeltaNet / SSD-style / plain via gate+delta flags.
+#   hybrid (softmax every 4th layer, Kimi's 3:1): the known fix for the
+#     exact-recall gap; separate LAX entry so the pure number exists first.
+#   gate_rank: 64 is our choice (fla-core ships no KDA layer to copy;
+#     GLA used 16 for its gate). ~0.1M params per layer either way.
 
-model_name: GDNLM
+model_name: GDNLM            # gated delta-rule family; KDA via gate: vector
 model_args:
   vocab_size: 32000        # mistral32k tokenizer
   dim: 1024
@@ -33,7 +41,8 @@ model_args:
   value_head_dim: 256
   ffn_hidden_dim: 2816     # same as SAX1
   short_conv_size: 4       # causal depthwise conv on q/k/v (GDN ablation: essential)
-  gate: true               # scalar forget gate (Mamba2 dt/A parameterisation)
+  gate: vector             # per-channel forget gate (KDA); scalar = GDN, none = DeltaNet
+  gate_rank: 64            # low-rank bottleneck of the vector gate projection
   delta: true              # delta-rule write
   chunk_size: 64
   la_impl: auto            # fla kernels on cuda/bf16, torch chunk reference elsewhere
