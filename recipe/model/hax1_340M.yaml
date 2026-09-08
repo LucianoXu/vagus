@@ -1,0 +1,85 @@
+# HAX1-340M — opener of the HAX series: hybrid attention (softmax +
+# linear) on the 340M coordinate. Third member of the batch-paired
+# 340M trio: SAX (softmax, sax2-340M-fwe15B) / LAX (linear, LAX1 =
+# Kimi Delta Attention) / HAX (their hybrid) — same 24 x 1024, tied
+# embedding, same FFN, same data/recipe, so the loss delta is the
+# mixing strategy alone. 343.6M params (LAX1 343.8M, SAX1 341.1M).
+#
+# Architecture (the 2026-09-08 decisions; the literature behind each is
+# in the session record and the module headers):
+#
+#   Intra-layer (parallel) hybrid blocks, 1:2 — 8 of the 24 layers are
+#   ParallelMixer: a half-width (512) softmax attention branch and a
+#   half-width KDA branch read the same normalised input side by side,
+#   each output RMSNormed, concatenated, one shared d x d output
+#   projection. The other 16 layers are LAX1's pure KDA mixer. Hymba and
+#   the Meta hybrid study (arXiv:2510.04800) find the parallel fusion on
+#   the quality/efficiency Pareto front over layer interleaving at equal
+#   FLOPs. Budget: 8 half-width softmax branches cost the attention
+#   FLOPs and KV cache of 4 full-width layers, i.e. two thirds of a
+#   Kimi Linear / Qwen3-Next 3:1 interleave (6 full layers).
+#
+#   Non-uniform placement: parallel blocks at 0-indexed layers
+#   4, 6, 9, 11, 14, 16, 19, 21 — evenly spread over the middle 75% of
+#   depth, none in the first four layers, none in the last two. Meta:
+#   Transformer blocks in the front layers cost quality (early softmax
+#   attention is near-uniform and fights the recurrent layers' local
+#   bias), and hybrid blocks bunched at either end are the worst layout;
+#   Jet-Nemotron's learned placements land at 60-85% depth.
+#
+#   NoPE global attention: softmax_rope false. The KDA branches and pure
+#   layers (causal conv + decay) are the position-aware operators, as in
+#   Kimi Linear's MLA layers; an unrotated softmax branch has no trained
+#   context window, so the model keeps max_stream_len None (a KV cache
+#   is still bounded by the generator's max_len). qk-norm stays on the
+#   softmax branch for logit stability under Muon's lr.
+#
+# Branch layout at the parallel blocks (1:1 width split, the study's
+# recommended ratio): softmax 8 heads x 64 (q/k/v 1024 -> 512, no wo);
+# KDA 2 heads x (dk 128, dv 256) (q/k 1024 -> 256, v/gate 1024 -> 512,
+# no wo); shared wo 1024 x 1024. Mixer = 4.28M params vs the pure KDA
+# mixer's 4.31M, so a parallel layer keeps the layer's budget. The KDA
+# branch's two heads carry half the recurrent state of a pure layer —
+# the price of the split, flagged in the design discussion and
+# accepted.
+#
+# Pure KDA layers: LAX1's exactly (4 heads x (128 x 256), vector gate
+# rank 64, delta rule, short conv 4).
+#
+# Considered and NOT taken (2026-09-08):
+#   3:1 whole-layer interleave (Kimi Linear / Qwen3-Next): the mainstream
+#     layout; the user chose the parallel block on the Pareto evidence.
+#     Available as layer_kinds with 'softmax' entries for an ablation.
+#   uniform placement (every 3rd/4th layer): see the placement evidence.
+#   RoPE global layers: Kimi's NoPE argument won; RoPE is the ablation
+#     (softmax_rope: true, then context_len binds the stream).
+#   NHA-style single-softmax unification: the user's Engram work found
+#     no advantage for a unified architecture.
+
+model_name: GDNLM
+model_args:
+  vocab_size: 32000        # mistral32k tokenizer
+  dim: 1024
+  layer_count: 24
+  head_count: 4            # pure KDA layers: 4 heads x (128 x 256), as LAX1
+  key_head_dim: 128
+  value_head_dim: 256
+  ffn_hidden_dim: 2816     # same as SAX1 / LAX1
+  short_conv_size: 4
+  gate: vector             # KDA: per-channel forget gate
+  gate_rank: 64
+  delta: true
+  chunk_size: 64
+  la_impl: auto            # fla kernels on cuda/bf16, torch chunk reference elsewhere
+  # 0-indexed parallel blocks at 4, 6, 9, 11, 14, 16, 19, 21 (1:2)
+  layer_kinds: [gdn, gdn, gdn, gdn, parallel, gdn, parallel, gdn,
+                gdn, parallel, gdn, parallel, gdn, gdn, parallel, gdn,
+                parallel, gdn, gdn, parallel, gdn, parallel, gdn, gdn]
+  parallel_width: 512      # 1:1 split of dim between the two branches
+  softmax_head_dim: 64     # softmax branch: 8 heads x 64
+  softmax_rope: false      # NoPE global attention
+  context_len: 2048        # unused under NoPE (no positional limit)
+  rope_base: 10000         # unused under NoPE
+  rmsnorm_eps: 1.0e-6
+  tie_embedding: true
+  gate_proj_optimizer: adamw   # the low-rank gate / beta matrices train under AdamW

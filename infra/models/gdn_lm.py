@@ -1,10 +1,20 @@
-# Gated delta-rule language model — the LAX series' architecture: the
-# Transformer++ skeleton (pre-norm blocks, SwiGLU FFN, tied embedding,
-# RMSNorm head) with the GatedDeltaNet mixer family as the token mixer:
-# gate='vector' is Kimi Delta Attention (LAX1), 'scalar' Gated DeltaNet,
-# 'none' DeltaNet. layer_pattern admits softmax layers for hybrids
-# ('gdn,gdn,gdn,softmax' cycles over depth); a pure pattern has no
-# positional encoding and no length limit.
+# Gated delta-rule language model — the LAX / HAX series' architecture:
+# the Transformer++ skeleton (pre-norm blocks, SwiGLU FFN, tied
+# embedding, RMSNorm head) with the GatedDeltaNet mixer family as the
+# token mixer: gate='vector' is Kimi Delta Attention (LAX1), 'scalar'
+# Gated DeltaNet, 'none' DeltaNet.
+#
+# Layer kinds (per layer, from layer_kinds or the cyclic layer_pattern):
+#     gdn       the linear mixer alone (a pure model has no positional
+#               encoding and no length limit)
+#     softmax   a whole softmax-attention layer (inter-layer hybrid, the
+#               Kimi Linear / Qwen3-Next 3:1 layout)
+#     parallel  ParallelMixer: half-width softmax attention and half-width
+#               linear mixer side by side in one layer (intra-layer
+#               hybrid, the HAX series' block)
+# softmax_rope=False makes every softmax branch NoPE (Kimi Linear's
+# choice for its global layers: the recurrent mixer is the position-
+# aware operator, and an unrotated global layer has no context window).
 
 from typing import Any
 
@@ -16,8 +26,11 @@ from ..components.block import Block
 from ..components.linear_attention import GatedDeltaNet
 from ..components.mixer import Mixer
 from ..components.norm_layer import RMSNorm
+from ..components.parallel_mixer import ParallelMixer
 from ..components.pos_embed import RoPE
 from .decodable import Decodable
+
+KINDS = ('gdn', 'softmax', 'parallel')
 
 
 class GDNLM(nn.Module, Decodable):
@@ -36,7 +49,10 @@ class GDNLM(nn.Module, Decodable):
             chunk_size: int = 64,
             la_impl: str = 'auto',
             layer_pattern: str = 'gdn',
+            layer_kinds: list[str] | None = None,
             softmax_head_dim: int = 64,
+            softmax_rope: bool = True,
+            parallel_width: int | None = None,
             context_len: int = 2048,
             rope_base: float = 10000,
             rmsnorm_eps: float = 1e-6,
@@ -51,33 +67,59 @@ class GDNLM(nn.Module, Decodable):
             head_count=head_count, key_head_dim=key_head_dim, value_head_dim=value_head_dim,
             ffn_hidden_dim=ffn_hidden_dim, short_conv_size=short_conv_size,
             gate=gate, delta=delta, gate_rank=gate_rank, chunk_size=chunk_size, la_impl=la_impl,
-            layer_pattern=layer_pattern, softmax_head_dim=softmax_head_dim,
+            layer_pattern=layer_pattern, layer_kinds=layer_kinds,
+            softmax_head_dim=softmax_head_dim, softmax_rope=softmax_rope,
+            parallel_width=parallel_width,
             context_len=context_len, rope_base=rope_base, rmsnorm_eps=rmsnorm_eps,
             tie_embedding=tie_embedding, gate_proj_optimizer=gate_proj_optimizer,
         )
 
-        kinds = [t.strip() for t in layer_pattern.split(',')]
-        assert kinds and all(k in ('gdn', 'softmax') for k in kinds), layer_pattern
-        self.kinds = [kinds[i % len(kinds)] for i in range(layer_count)]
+        if layer_kinds is not None:
+            kinds = [k.strip() for k in layer_kinds]
+            assert len(kinds) == layer_count, \
+                f'layer_kinds has {len(kinds)} entries for layer_count {layer_count}'
+        else:
+            cycle = [t.strip() for t in layer_pattern.split(',')]
+            assert cycle, layer_pattern
+            kinds = [cycle[i % len(cycle)] for i in range(layer_count)]
+        assert all(k in KINDS for k in kinds), kinds
+        self.kinds = kinds
+
+        has_softmax = any(k != 'gdn' for k in kinds)
+        pw = parallel_width or dim // 2
+        if 'parallel' in kinds:
+            assert pw % softmax_head_dim == 0 and pw % value_head_dim == 0, \
+                f'parallel_width {pw} must hold whole softmax ({softmax_head_dim}) and value ({value_head_dim}) heads'
+        self.parallel_width = pw
 
         self.embedding = nn.Embedding(vocab_size, dim)
         self.rope = None
-        if 'softmax' in self.kinds:
+        if has_softmax and softmax_rope:
             assert dim % softmax_head_dim == 0
             self.rope = RoPE(dim, softmax_head_dim, context_len, base=rope_base)
 
+        def linear(width: int, out_proj: bool) -> GatedDeltaNet:
+            assert width % value_head_dim == 0
+            return GatedDeltaNet(
+                dim=dim, head_count=width // value_head_dim, key_head_dim=key_head_dim,
+                value_head_dim=value_head_dim, short_conv_size=short_conv_size,
+                gate=gate, delta=delta, gate_rank=gate_rank, chunk_size=chunk_size, impl=la_impl,
+                init_std=0.02, layer_count=layer_count, out_proj=out_proj)
+
+        def softmax(width: int, out_proj: bool) -> SoftmaxAttention:
+            assert width % softmax_head_dim == 0
+            return SoftmaxAttention(
+                dim=width, head_count=width // softmax_head_dim, kv_head_count=None,
+                v_dim_mult=1, short_conv_size=None, qk_norm=True, rope=self.rope,
+                init_std=0.02, layer_count=layer_count, in_dim=dim, out_proj=out_proj)
+
         def mixer(kind: str) -> Mixer:
             if kind == 'gdn':
-                return GatedDeltaNet(
-                    dim=dim, head_count=head_count, key_head_dim=key_head_dim,
-                    value_head_dim=value_head_dim, short_conv_size=short_conv_size,
-                    gate=gate, delta=delta, gate_rank=gate_rank, chunk_size=chunk_size, impl=la_impl,
-                    init_std=0.02, layer_count=layer_count)
-            assert self.rope is not None
-            return SoftmaxAttention(
-                dim=dim, head_count=dim // softmax_head_dim, kv_head_count=None,
-                v_dim_mult=1, short_conv_size=None, qk_norm=True, rope=self.rope,
-                init_std=0.02, layer_count=layer_count)
+                return linear(head_count * value_head_dim, True)
+            if kind == 'softmax':
+                return softmax(dim, True)
+            return ParallelMixer(dim, att=softmax(pw, False), la=linear(pw, False),
+                                 rmsnorm_eps=rmsnorm_eps, init_std=0.02, layer_count=layer_count)
 
         self.blocks = nn.ModuleList([
             Block(dim=dim, ffn_hidden_dim=ffn_hidden_dim, rmsnorm_eps=rmsnorm_eps,
@@ -110,12 +152,31 @@ class GDNLM(nn.Module, Decodable):
             return x
         return self.head(x)
 
+    # --- the mixers by role -----------------------------------------------
+
+    @staticmethod
+    def _linear_of(mixer) -> GatedDeltaNet | None:
+        if isinstance(mixer, GatedDeltaNet):
+            return mixer
+        if isinstance(mixer, ParallelMixer):
+            return mixer.la
+        return None
+
+    @staticmethod
+    def _softmax_of(mixer) -> SoftmaxAttention | None:
+        if isinstance(mixer, SoftmaxAttention):
+            return mixer
+        if isinstance(mixer, ParallelMixer):
+            return mixer.att
+        return None
+
     # streaming inference
 
     @property
     def max_stream_len(self) -> int | None:
-        # fixed-size state everywhere: no limit. A hybrid inherits the
-        # softmax layers' RoPE window.
+        # fixed-size state everywhere, or NoPE softmax: no positional
+        # limit (a KV cache still needs max_len from the caller). RoPE
+        # softmax layers bound the stream to their trained window.
         return int(self.config['context_len']) if self.rope is not None else None
 
     def reset_cache(self, batch_size: int, max_cache_len: int):
@@ -160,40 +221,55 @@ class GDNLM(nn.Module, Decodable):
 
     def attn_flops_per_token(self, context_len: int) -> float:
         '''Mixer matmul FLOPs per token (fwd + bwd), for the MFU estimate.
-        GDN: state write, delta read-back and query read-out are each
-        2 * H * dk * dv per token; softmax layers use the 12 * d * L term.'''
+        Linear: state write, delta read-back and query read-out are each
+        2 * H * dk * dv per token; softmax: the 12 * width * L term. A
+        parallel layer is the sum of its half-width branches.'''
         c = self.config
-        H, dk, dv, dim = (int(c[k]) for k in ('head_count', 'key_head_dim', 'value_head_dim', 'dim'))
-        gdn = (18 if c['delta'] else 12) * H * dk * dv
-        sm = 12 * dim * context_len
-        return float(sum(gdn if k == 'gdn' else sm for k in self.kinds))
+        dk, dv, dim = (int(c[k]) for k in ('key_head_dim', 'value_head_dim', 'dim'))
+        per_head = (18 if c['delta'] else 12) * dk * dv
+
+        def flops(kind: str) -> float:
+            if kind == 'gdn':
+                return per_head * int(c['head_count'])
+            if kind == 'softmax':
+                return 12 * dim * context_len
+            return per_head * (self.parallel_width // dv) + 12 * self.parallel_width * context_len
+
+        return float(sum(flops(k) for k in self.kinds))
 
     def metric_hooks(self) -> dict:
-        return {'slow': [self._metric_gates]}
+        return {'slow': [self._metric_probe]}
 
     @torch.no_grad()
-    def _metric_gates(self, ctx) -> dict:
-        '''Gate health on one sequence of the trainer's last micro-batch:
-        mean decay a (all gdn layers), the median / max effective memory
-        length 1/(1 - a) over heads (over channels for a vector gate),
-        mean write strength b, and the worst end-of-sequence state RMS
-        over layers. Runs the fp32 torch path
-        on submodules directly, outside the compiled block graphs.'''
+    def _metric_probe(self, ctx) -> dict:
+        '''Health probe on one sequence of the trainer's last micro-batch,
+        calling submodules directly (outside the compiled block graphs).
+        Gates, over every linear mixer (pure layers and parallel
+        branches): mean decay a, the median / max effective memory length
+        1/(1 - a) over heads (over channels for a vector gate), mean write
+        strength b, and the worst end-of-sequence state RMS. Softmax: the
+        global max pre-softmax logit (the quantity qk-norm / z-loss bound).'''
         tokens = ctx.last_batch
         if tokens is None:
             return {}
         x = self.embedding(tokens[:1])
         alpha, mem, beta, srms = [], [], [], []
+        worst = None
         for blk in self.blocks:
             assert isinstance(blk, Block)
             h = blk.rmsnorm1(x)
-            if isinstance(blk.att, GatedDeltaNet):
-                st = blk.att.gate_stats(h)
+            la = self._linear_of(blk.att)
+            if la is not None:
+                st = la.gate_stats(h)
                 srms.append(float(st['state_rms']))
                 if 'alpha' in st:
                     alpha.append(st['alpha']); mem.append(st['mem_len'])
                 if 'beta' in st:
                     beta.append(st['beta'])
+            sm = self._softmax_of(blk.att)
+            if sm is not None:
+                m = sm.max_attn_logit(h)
+                worst = m if worst is None else torch.maximum(worst, m)
             x = x + blk.att(h)
             x = x + blk.ffn(blk.rmsnorm2(x))
         out = {}
@@ -206,4 +282,6 @@ class GDNLM(nn.Module, Decodable):
                         'gdn/mem_len_max': float(m.max())})
         if beta:
             out['gdn/beta_mean'] = float(torch.cat(beta).float().mean())
+        if worst is not None:
+            out['attn_logit_max'] = float(worst)
         return out

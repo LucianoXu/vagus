@@ -15,7 +15,9 @@ from .pos_embed import RoPE
 
 class SoftmaxAttention(nn.Module, Mixer):
     '''
-    Multi-head softmax attention with RoPE, grouped-query attention
+    Multi-head softmax attention with RoPE (or NoPE: rope=None leaves q/k
+    unrotated — for hybrids where a recurrent mixer carries position, as
+    Kimi Linear's global layers), grouped-query attention
     (kv_head_count < head_count shares each K/V head across a group of
     query heads; None or == head_count is plain MHA), optionally widened
     V heads (v_dim_mult) and a depthwise short conv on the q/k/v
@@ -31,6 +33,12 @@ class SoftmaxAttention(nn.Module, Mixer):
 
     forward() is the stateless training/prefill path; decode_step() streams
     blocks against a preallocated KV cache (reset_cache/load_cache first).
+
+    Widths: `dim` is the inner (q) width, head_count * head_dim; in_dim
+    (default dim) is the input width, so a narrower attention can read a
+    wider residual stream (a branch of ParallelMixer). out_proj=False
+    drops wo and returns the head concat of width out_width =
+    dim * v_dim_mult, for a caller that owns the output projection.
 
     torch.compile: forward compiles as-is. For decode_step, cache_len is a
     python int attribute that changes every step, and dynamo specializes
@@ -58,9 +66,11 @@ class SoftmaxAttention(nn.Module, Mixer):
             short_conv_size: int | None = None,
             qk_norm: bool = False,
             *,
-            rope: RoPE,
+            rope: RoPE | None,
             init_std: float = 0.02,
             layer_count: int | None = None,
+            in_dim: int | None = None,
+            out_proj: bool = True,
         ):
         super().__init__()
 
@@ -70,9 +80,12 @@ class SoftmaxAttention(nn.Module, Mixer):
         assert dim % head_count == 0
         assert head_count % kv_head_count == 0
         assert v_dim_mult > 0
-        assert rope.head_dim == dim // head_count
+        assert rope is None or rope.head_dim == dim // head_count
 
         self.dim = dim
+        self.in_dim = in_dim or dim
+        self.out_proj = out_proj
+        self.out_width = dim * v_dim_mult
         self.v_dim_mult = v_dim_mult
         self.head_count = head_count
         self.kv_head_count = kv_head_count
@@ -85,28 +98,29 @@ class SoftmaxAttention(nn.Module, Mixer):
 
 
         self.wq = nn.Linear(
-            in_features=self.dim,
+            in_features=self.in_dim,
             out_features=self.dim,
             bias = False
         )
 
         self.wk = nn.Linear(
-            in_features=self.dim,
+            in_features=self.in_dim,
             out_features=Dh * self.kv_head_count,
             bias = False
         )
 
         self.wv = nn.Linear(
-            in_features=self.dim,
+            in_features=self.in_dim,
             out_features=Dh * self.kv_head_count * self.v_dim_mult,
             bias = False
         )
 
-        self.wo = nn.Linear(
-            in_features=self.dim * self.v_dim_mult,
-            out_features=self.dim,
-            bias = False
-        )
+        if self.out_proj:
+            self.wo = nn.Linear(
+                in_features=self.out_width,
+                out_features=self.dim,
+                bias = False
+            )
 
         if self.short_conv_size is not None:
             self.conv_q = ShortConv(self.dim, self.short_conv_size)
@@ -123,8 +137,9 @@ class SoftmaxAttention(nn.Module, Mixer):
         # stream keeps O(1) variance at init regardless of depth
         for lin in (self.wq, self.wk, self.wv):
             nn.init.normal_(lin.weight, std=init_std)
-        wo_std = init_std / math.sqrt(2 * layer_count) if layer_count else init_std
-        nn.init.normal_(self.wo.weight, std=wo_std)
+        if self.out_proj:
+            wo_std = init_std / math.sqrt(2 * layer_count) if layer_count else init_std
+            nn.init.normal_(self.wo.weight, std=wo_std)
 
 
         # KV cache in (B, H, T, Dh) layout so slices feed SDPA without copies.
@@ -162,8 +177,9 @@ class SoftmaxAttention(nn.Module, Mixer):
         k = kp.reshape(B, L, H_kv, Dh).transpose(1, 2)                      # (B, H_kv, L, Dh)
         if self.qk_norm:
             q, k = self.q_norm(q), self.k_norm(k)
-        q = self.rope(q)
-        k = self.rope(k)
+        if self.rope is not None:
+            q = self.rope(q)
+            k = self.rope(k)
         v = vp.reshape(B, L, H_kv, Dvh).transpose(1, 2)                     # (B, H_kv, L, Dvh)
 
         # fused scaled-dot-product attention (Flash-style): never materialises
@@ -172,6 +188,8 @@ class SoftmaxAttention(nn.Module, Mixer):
 
         out = out.transpose(1, 2).reshape(B, L, -1)   # (B, H, L, Dvh) -> (B, L, dim*v_dim_mult)
 
+        if not self.out_proj:
+            return out
         x = self.wo(out)   # (B, L, dim*v_dim_mult) -> (B, L, dim)
 
         return x
@@ -194,8 +212,9 @@ class SoftmaxAttention(nn.Module, Mixer):
         k = kp.reshape(B, L, H_kv, Dh).transpose(1, 2)
         if self.qk_norm:
             q, k = self.q_norm(q), self.k_norm(k)
-        q = self.rope(q)
-        k = self.rope(k)
+        if self.rope is not None:
+            q = self.rope(q)
+            k = self.rope(k)
         if H_kv != H:
             k = k.repeat_interleave(H // H_kv, dim=1)
 
@@ -220,7 +239,8 @@ class SoftmaxAttention(nn.Module, Mixer):
             self.kp_cache = torch.zeros(batch_size, self.short_conv_size, Dh * H_kv, device=device, dtype=dtype)
             self.vp_cache = torch.zeros(batch_size, self.short_conv_size, Dvh * H_kv, device=device, dtype=dtype)
 
-        self.rope.prepare_m(max_cache_len)
+        if self.rope is not None:
+            self.rope.prepare_m(max_cache_len)
 
 
     def load_cache(self, cache: dict, max_cache_len: int):
@@ -306,8 +326,9 @@ class SoftmaxAttention(nn.Module, Mixer):
         k = kp.reshape(B, L, H_kv, Dh).transpose(1, 2)                           # (B, H_kv, L, Dh)
         if self.qk_norm:
             q, k = self.q_norm(q), self.k_norm(k)
-        q = self.rope(q, offset)
-        k = self.rope(k, offset)
+        if self.rope is not None:
+            q = self.rope(q, offset)
+            k = self.rope(k, offset)
         v = vp.reshape(B, L, H_kv, Dvh).transpose(1, 2)                          # (B, H_kv, L, Dvh)
 
         # keys are cached post-RoPE: each key's rotation is fixed by its
@@ -333,6 +354,8 @@ class SoftmaxAttention(nn.Module, Mixer):
 
         out = out.transpose(1, 2).reshape(B, L, -1)   # (B, H, L, Dvh) -> (B, L, dim*v_dim_mult)
 
+        if not self.out_proj:
+            return out
         x = self.wo(out)   # (B, L, dim*v_dim_mult) -> (B, L, dim)
 
         return x

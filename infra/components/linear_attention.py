@@ -311,6 +311,10 @@ class GatedDeltaNet(nn.Module, Mixer):
     Parameter sizing at dim d: q, k are d x (H dk); v, gate, o are
     d x (H dv). With H dk = d/2 and H dv = d (the GLA layout) the mixer
     has 4 d^2 params, matching MHA at the same dim.
+
+    out_proj=False drops wo: forward returns the gated, normalised head
+    concat of width out_width = H dv, for a caller that owns the output
+    projection (a branch of ParallelMixer).
     '''
 
     def __init__(
@@ -330,6 +334,7 @@ class GatedDeltaNet(nn.Module, Mixer):
             layer_count: int | None = None,
             A_init_range: tuple[float, float] = (1.0, 16.0),
             dt_init_range: tuple[float, float] = (1e-3, 1e-1),
+            out_proj: bool = True,
         ):
         super().__init__()
         if isinstance(gate, bool):          # legacy spelling: True = scalar (GDN)
@@ -351,13 +356,16 @@ class GatedDeltaNet(nn.Module, Mixer):
         self.chunk_size = chunk_size
         self.impl = impl
         self.scale = key_head_dim ** -0.5
+        self.out_proj = out_proj
+        self.out_width = head_count * value_head_dim
 
         H, dk, dv = head_count, key_head_dim, value_head_dim
         self.wq = nn.Linear(dim, H * dk, bias=False)
         self.wk = nn.Linear(dim, H * dk, bias=False)
         self.wv = nn.Linear(dim, H * dv, bias=False)
         self.wg = nn.Linear(dim, H * dv, bias=False)      # output gate
-        self.wo = nn.Linear(H * dv, dim, bias=False)
+        if out_proj:
+            self.wo = nn.Linear(H * dv, dim, bias=False)
         self.o_norm = RMSNorm(dv)                         # per-head, gamma shared
 
         if short_conv_size is not None:
@@ -385,8 +393,9 @@ class GatedDeltaNet(nn.Module, Mixer):
         for name in ('wa', 'wa1', 'wa2', 'wb'):
             if hasattr(self, name):
                 nn.init.normal_(getattr(self, name).weight, std=init_std)
-        wo_std = init_std / math.sqrt(2 * layer_count) if layer_count else init_std
-        nn.init.normal_(self.wo.weight, std=wo_std)
+        if out_proj:
+            wo_std = init_std / math.sqrt(2 * layer_count) if layer_count else init_std
+            nn.init.normal_(self.wo.weight, std=wo_std)
 
         # recurrent state (fp32) + conv tails; allocated by reset_cache
         self.cache_len = 0
@@ -452,8 +461,8 @@ class GatedDeltaNet(nn.Module, Mixer):
     def _output(self, o, x):
         B, L = x.shape[0], x.shape[1]
         gate = F.silu(self.wg(x)).view(B, L, self.head_count, self.value_head_dim)
-        o = self.o_norm(o.to(gate.dtype)) * gate
-        return self.wo(o.reshape(B, L, -1))
+        o = (self.o_norm(o.to(gate.dtype)) * gate).reshape(B, L, -1)
+        return self.wo(o) if self.out_proj else o
 
     # --- training / stateless -----------------------------------------
 

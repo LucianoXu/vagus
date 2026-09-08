@@ -90,13 +90,15 @@ def test_metric_hook_and_flops():
     m = build(layer_pattern='gdn,gdn,softmax')
     ctx = MetricCtx(model=m, last_batch=torch.randint(2, 101, (2, 30)))
     out = m.metric_hooks()['slow'][0](ctx)
-    assert set(out) == {'gdn/state_rms_max', 'gdn/alpha_mean', 'gdn/mem_len_median',
-                        'gdn/mem_len_max', 'gdn/beta_mean'}
+    GATES = {'gdn/state_rms_max', 'gdn/alpha_mean', 'gdn/mem_len_median',
+             'gdn/mem_len_max', 'gdn/beta_mean'}
+    assert set(out) == GATES | {'attn_logit_max'}
     assert 0 < out['gdn/alpha_mean'] < 1 and out['gdn/mem_len_max'] >= out['gdn/mem_len_median'] > 1
     assert m.metric_hooks()['slow'][0](MetricCtx(model=m)) == {}
     assert m.attn_flops_per_token(2048) == 2 * 18 * 2 * 16 * 32 + 12 * 64 * 2048
     assert set(build(gate='none', delta=False).metric_hooks()['slow'][0](ctx)) == {'gdn/state_rms_max'}
-    assert set(build(gate='scalar').metric_hooks()['slow'][0](ctx)) == set(out)
+    assert set(build(gate='scalar').metric_hooks()['slow'][0](ctx)) == GATES
+    assert set(build().metric_hooks()['slow'][0](ctx)) == GATES          # pure: no softmax probe
 
 
 def test_config_roundtrip():
@@ -122,3 +124,65 @@ def test_mixer_protocol():
     assert isinstance(m.blocks[0].att, GatedDeltaNet) and isinstance(m.blocks[1].att, SoftmaxAttention)
     with pytest.raises(TypeError, match='not a Mixer'):
         Block(dim=16, mixer=nn.Linear(16, 16), layer_count=1)
+
+
+# --- intra-layer hybrid (parallel kind) + NoPE ---------------------------
+
+PAR = dict(layer_kinds=['gdn', 'parallel', 'gdn'], softmax_head_dim=16, softmax_rope=False)
+
+
+def test_layer_kinds_and_parallel_shapes():
+    from infra.components.parallel_mixer import ParallelMixer
+    m = build(**PAR)
+    assert m.kinds == ['gdn', 'parallel', 'gdn'] and m.rope is None and m.max_stream_len is None
+    par = m.blocks[1].att
+    assert isinstance(par, ParallelMixer)
+    assert par.att.head_count == 2 and par.att.in_dim == 64 and par.att.out_width == 32
+    assert par.la.head_count == 1 and par.la.out_width == 32
+    assert not hasattr(par.att, 'wo') and not hasattr(par.la, 'wo') and par.wo.weight.shape == (64, 64)
+    # a parallel layer keeps the softmax layer's 4 d^2 budget (+ gates/norms)
+    n_par = sum(p.numel() for p in par.parameters())
+    n_sm = sum(p.numel() for p in build(layer_pattern='gdn,softmax,gdn', softmax_head_dim=16).blocks[1].att.parameters())
+    assert 4 * 64 * 64 <= n_par < n_sm + 3000
+    with pytest.raises(AssertionError, match='layer_kinds'):
+        build(layer_kinds=['gdn', 'parallel'])
+    with pytest.raises(AssertionError, match='parallel_width'):
+        build(layer_kinds=['gdn', 'parallel', 'gdn'], softmax_head_dim=64)
+    # RoPE hybrid keeps the window; NoPE whole-softmax layer has none
+    assert build(layer_kinds=['gdn', 'parallel', 'gdn'], softmax_head_dim=16).max_stream_len == 48
+    assert build(layer_pattern='gdn,softmax', softmax_rope=False).max_stream_len is None
+
+
+@pytest.mark.parametrize('kinds', [['gdn', 'parallel', 'gdn'], ['softmax', 'gdn', 'parallel']])
+def test_parallel_generation_matches_full_forward(kinds):
+    m = build(**{**PAR, 'layer_kinds': kinds})
+    g = Generator(m)
+    ids = torch.randint(2, 101, (2, 7))
+    cfg = SamplingConfig(max_new_tokens=10, temperature=0, stop_ids=())
+    out = g.generate_ids(ids, cfg, max_len=64)
+    assert torch.equal(out, ref_greedy(m, ids, 10)[:, 7:])
+    g.reset(2, max_len=64); g.prefill_ids(ids[:, :3]); g.prefill_ids(ids[:, 3:])
+    snap = g.export_state()
+    assert set(snap['cache']['blocks'][kinds.index('parallel')]['att']) == {'att', 'la'}
+    a = g.gen_ids(cfg)
+    h = Generator(m); h.load_state(snap)
+    assert torch.equal(a, h.gen_ids(cfg)) and torch.equal(a, out)
+
+
+def test_parallel_metrics_flops_and_groups():
+    m = build(**PAR)
+    ctx = MetricCtx(model=m, last_batch=torch.randint(2, 101, (2, 30)))
+    out = m.metric_hooks()['slow'][0](ctx)
+    assert 'attn_logit_max' in out and 'gdn/alpha_mean' in out
+    # 2 pure layers (2 heads) + parallel: 1 linear head + softmax at width 32
+    assert m.attn_flops_per_token(2048) == 2 * 18 * 2 * 16 * 32 + 18 * 16 * 32 + 12 * 32 * 2048
+    groups = m.param_groups()
+    par = m.blocks[1].att
+    muon_ids = {id(p) for p in groups['muon']}
+    assert all(id(p) not in muon_ids for p in par.gate_projections)      # branch gates -> AdamW
+    assert id(par.wo.weight) in muon_ids and id(par.att.wq.weight) in muon_ids
+    opt = build_optimizer('muon', m, dict(lr=1e-3, momentum=0.95, weight_decay=0.1,
+                                          adamw=dict(lr=1e-3, weight_decay=0.1)))
+    assert sum(len(g['params']) for g in opt.param_groups) == sum(1 for _ in m.parameters())
+    m2 = type(m).from_config(m.config)
+    assert m2.kinds == m.kinds and [p.shape for p in m2.parameters()] == [p.shape for p in m.parameters()]
