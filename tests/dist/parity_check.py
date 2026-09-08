@@ -176,7 +176,10 @@ def check_regimes(log):
             for (l0, g0), (l1, g1) in zip(ddp_trace, trace):
                 assert abs(l0 - l1) <= ltol * (1 + abs(l0)), f'{optimizer} shard {shard}: loss {l0} vs {l1}'
                 assert abs(g0 - g1) <= gtol * (1 + abs(g0)), f'{optimizer} shard {shard}: gnorm {g0} vs {g1}'
-            worst = compare(f'{optimizer} shard {shard}', ddp_sd, sd, ptol, ptol / 10)
+            # abs band: AdamW-driven params (embedding, gate matrices) move ~lr
+            # per step whichever way a rounded near-zero gradient falls
+            atol = ptol / 10 if optimizer == 'adamw' else OPT['lr'] * steps
+            worst = compare(f'{optimizer} shard {shard}', ddp_sd, sd, ptol, atol)
             log(f'{optimizer} shard_size {shard} (fp32): matches DDP; params within {worst:.2f}x of tol')
     steps = 6
     # 3. bf16 autocast + bf16 FSDP compute copies of the matrices (the
