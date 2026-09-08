@@ -28,6 +28,15 @@
 # FSDP precision: blocks compute on a bf16 copy of the sharded fp32
 # masters (fsdp_param_dtype), gradients reduce in fp32; the residual
 # stream and embedding/head stay fp32, as under the DDP runs.
+#
+# Smokes (2026-09-08, 30-60 steps, micro 8): 1 node DDP 0.154 Mtok/s at
+# 29.9 GB; 1 node FSDP2 0.156 (reshard) / 0.160 (no reshard) at 23 GB;
+# 2 nodes HSDP 0.311 Mtok/s, 1.69 s/step — 2.0x, the cross-node reduce
+# fully hidden; NCCL on IB with GPU Direct RDMA. The loss at step 30 is
+# the same under DDP and FSDP on the same data order (6.321 / 6.319).
+# So FSDP costs nothing here; the ~0.28 MFU vs SAX2's 0.535 is the KDA
+# kernels' time per FLOP and the two half-width kernels of a parallel
+# block (see the session record). Expected: 15B in ~13.5 h.
 
 run_name: hax1-340M-fwe15B
 model_recipe: ../model/hax1_340M.yaml
@@ -40,6 +49,7 @@ world_size: 8              # 2 nodes x 4 A100
 shard_size: 4              # HSDP: shard inside the node, replicate across
 fsdp_param_dtype: bfloat16
 fsdp_reduce_dtype: float32
+fsdp_reshard_after_forward: false   # +2% step time, +0.6 GB (smoke 30084080 vs 30083903)
 batch_size: 8              # per-rank micro-batch (LAX1's; KDA at micro 16 OOMs)
 grad_accum_steps: 4
 global_batch_tokens: 524288

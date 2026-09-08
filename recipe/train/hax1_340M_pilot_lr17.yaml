@@ -23,6 +23,7 @@ world_size: 8
 shard_size: 4
 fsdp_param_dtype: bfloat16
 fsdp_reduce_dtype: float32
+fsdp_reshard_after_forward: false   # +2% step time, +0.6 GB (smoke 30084080 vs 30083903)
 batch_size: 8
 grad_accum_steps: 4
 global_batch_tokens: 524288
