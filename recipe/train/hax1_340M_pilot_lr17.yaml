@@ -1,0 +1,63 @@
+# HAX1-340M lr pilot @ 1.75e-3 — 1B tokens on 2 nodes x 4 A100 (HSDP).
+# The optional STABILITY GATE before hax1_340M_fwe15B: the parallel
+# block is a new stability surface (two normalised branches into one
+# projection; NoPE softmax under Muon's lr), so one arm of the SAX/LAX
+# ladder is re-run rather than inherited. Batch layout / data / seed
+# identical to the SAX1 / LAX1 pilots (same global window set per step
+# at micro 8, see the fwe15B recipe), so the runs are batch-paired:
+# LAX1 lr17 pilot loss_ce tail5 2.7938, SAX1 2.8037.
+#
+# Watch: attn_logit_max (the NoPE branch; qk-norm should hold it in the
+# SAX band ~26), gdn/state_rms_max, gdn/mem_len_median, gdn/beta_mean,
+# pnorm/embedding, and the multi-node throughput (tokens_per_s, mfu).
+# warmup 0.1 = 100M tokens, as in the SAX1/LAX1 pilots.
+
+run_name: hax1-340M-pilot-lr17
+model_recipe: ../model/hax1_340M.yaml
+
+data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+data_shards: null
+
+context_len: 2048
+world_size: 8
+shard_size: 4
+fsdp_param_dtype: bfloat16
+fsdp_reduce_dtype: float32
+batch_size: 8
+grad_accum_steps: 4
+global_batch_tokens: 524288
+train_tokens: 1_000_000_000
+seed: 42
+
+optimizer_name: muon
+optimizer_args:
+  lr: 1.75e-3
+  momentum: 0.95
+  weight_decay: 0.1
+  lr_adjust: rms
+  ns_coeffs: polar_express
+  adamw:
+    lr: 1.75e-3
+    betas: [0.9, 0.95]
+    weight_decay: 0.1
+
+schedule_name: linear
+schedule_args:
+  warmup: 0.1
+  min_ratio: 0.05
+
+grad_clip: 1.0
+z_loss: 1e-4
+ce_impl: liger
+
+device: auto
+dtype: bfloat16
+compile: true
+tf32: true
+
+out_root: runs
+log_interval: 10
+slow_interval: 100
+permanent_ckpt_interval: null
+recent_ckpt_minutes: 30
+peak_tflops: 312

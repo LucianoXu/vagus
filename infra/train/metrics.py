@@ -24,11 +24,35 @@
 
 import math
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable
 
 import torch
 import torch.distributed as dist
+from torch.distributed.tensor import DTensor
+
+
+def _scalar(t) -> float:
+    '''A reduced scalar as a float. Under FSDP2 the parameters (and the
+    optimizer state) are DTensors, so a per-tensor reduction comes back
+    as a partial DTensor; full_tensor() completes it over the mesh — a
+    collective, which is safe because every rank runs the hooks.'''
+    if isinstance(t, DTensor):
+        t = t.full_tensor()
+    return float(t)
+
+
+def _sum(parts) -> float:
+    '''Sum of per-tensor reductions: DTensor partials are added first so
+    a group costs one collective rather than one per parameter.'''
+    parts = list(parts)
+    if not parts:
+        return 0.0
+    total = parts[0]
+    for x in parts[1:]:
+        total = total + x
+    return _scalar(total)
 
 
 @dataclass
@@ -55,6 +79,9 @@ class MetricCtx:
     step_ms: float = 0.0
     last_batch: Any = None           # most recent input ids (one rank's micro-
                                      # batch), for probe-style slow hooks
+    slow_context: Any = None         # optional () -> context manager wrapped
+                                     # around the slow hooks (FSDP: unshard
+                                     # the params so probes can call submodules)
 
 
 def metric_core(c: MetricCtx) -> dict:
@@ -87,11 +114,11 @@ def metric_param_norms(c: MetricCtx) -> dict:
     health signal), plus the embedding norm on its own.'''
     out = {}
     for g in c.optimizer.param_groups:
-        sq = sum(float(p.detach().float().pow(2).sum()) for p in g['params'])
+        sq = _sum(p.detach().float().pow(2).sum() for p in g['params'])
         out[f"pnorm/{g['name']}"] = math.sqrt(sq)
     emb = getattr(c.model, 'embedding', None)
     if emb is not None:
-        out['pnorm/embedding'] = float(emb.weight.detach().float().norm())
+        out['pnorm/embedding'] = math.sqrt(_scalar(emb.weight.detach().float().pow(2).sum()))
     return out
 
 
@@ -108,19 +135,19 @@ def metric_update_ratio(c: MetricCtx) -> dict:
     state = c.optimizer.state          # MuonAdamW: merged read-only view
     for g in c.optimizer.param_groups:
         lr = g['lr']
-        upd_sq = pnorm_sq = 0.0
+        upd_sq = 0.0
+        adam_parts = []
+        pnorm_sq = _sum(p.detach().float().pow(2).sum() for p in g['params'])
         for p in g['params']:
-            pnorm_sq += float(p.detach().float().pow(2).sum())
             s = state.get(p)
             if not s:
                 continue               # before the first step
             if 'exp_avg' in s:         # AdamW
                 beta1, beta2 = g['betas']
-                t = float(s['step'])
+                t = float(_scalar(s['step']))
                 m_hat = s['exp_avg'].float() / (1 - beta1 ** t)
                 v_hat = s['exp_avg_sq'].float() / (1 - beta2 ** t)
-                upd_sq += lr * lr * float(
-                    (m_hat / (v_hat.sqrt() + g['eps'])).pow(2).sum())
+                adam_parts.append((m_hat / (v_hat.sqrt() + g['eps'])).pow(2).sum())
             elif 'momentum_buffer' in s:   # Muon: analytic estimate
                 m, n = p.shape
                 if g['lr_adjust'] == 'rms':
@@ -128,6 +155,8 @@ def metric_update_ratio(c: MetricCtx) -> dict:
                 else:                  # 'shape': ~unit spectral norm output
                     scale = max(1.0, m / n) ** 0.5
                     upd_sq += (lr * scale) ** 2 * min(m, n)
+        if adam_parts:
+            upd_sq += lr * lr * _sum(adam_parts)
         if pnorm_sq > 0 and upd_sq > 0:
             out[f"upd_ratio/{g['name']}"] = math.sqrt(upd_sq / pnorm_sq)
     return out
@@ -221,8 +250,9 @@ class Monitor:
         for fn in self.fast:
             scalars |= fn(c)
         if step % self.slow_interval == 0:
-            for fn in self.slow:
-                scalars |= fn(c)
+            with (c.slow_context() if c.slow_context is not None else nullcontext()):
+                for fn in self.slow:
+                    scalars |= fn(c)
         if self.writer is not None:
             for k, v in scalars.items():
                 self.writer.add_scalar(k, v, step)

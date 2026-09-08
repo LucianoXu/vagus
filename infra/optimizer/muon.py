@@ -8,12 +8,27 @@
 # Schulz runs once per (shape, dtype, device) bucket on a stacked batch —
 # a transformer's many identically-shaped block matrices share one
 # batched matmul chain instead of launching a small chain each.
+#
+# Two distributed regimes, chosen per parameter by its type:
+#   plain tensors (DDP: every rank holds the full param and grad) —
+#     muon_update shards the Newton-Schulz WORK across the world and
+#     all-gathers the results, so replicas apply byte-identical updates.
+#   DTensors (FSDP2 / HSDP: the param and its grad are row-sharded over
+#     the mesh's shard dim, replicated over any other dim) —
+#     muon_update_sharded keeps momentum and decay on the local shard,
+#     all-gathers the bf16 momentum of each same-shape bucket over the
+#     shard group, splits Newton-Schulz across that group as above, and
+#     each rank applies its own row slice of the orthogonalised update
+#     (Moonlight's "distributed Muon", arXiv:2502.16982). The traffic is
+#     2x the matrix bytes per step on the shard group's links, which
+#     HSDP places inside the node.
 
 import functools
 
 import torch
 import torch.distributed as dist
 from torch import Tensor
+from torch.distributed.tensor import DTensor, Shard
 from torch.optim.optimizer import Optimizer, ParamsT
 
 
@@ -144,6 +159,113 @@ def muon_update(
             alpha=-lr * scale)
 
 
+def _shard_layout(p: DTensor):
+    '''(group, world_size, rank) of the mesh dim a DTensor is sharded
+    over; (None, 1, 0) when it is replicated everywhere. Only row
+    sharding (Shard(0), FSDP2's layout) on a single mesh dim is
+    supported.'''
+    dims = [i for i, pl in enumerate(p.placements) if isinstance(pl, Shard)]
+    if not dims:
+        return None, 1, 0
+    assert len(dims) == 1 and p.placements[dims[0]].dim == 0, \
+        f'Muon expects row sharding on one mesh dim, got {p.placements}'
+    mesh = p.device_mesh
+    return mesh.get_group(dims[0]), mesh.size(dims[0]), mesh.get_local_rank(dims[0])
+
+
+def _lr_scale(shape, lr_adjust: str) -> float:
+    if lr_adjust == 'shape':
+        # Reference impl (Jordan): unit spectral-ish norm, boosted for
+        # tall matrices so row-wise RMS survives m > n.
+        return max(1.0, shape[0] / shape[1]) ** 0.5
+    # 'rms' — Moonlight/Kimi: match AdamW's ~0.2 update RMS so Muon can
+    # reuse AdamW's lr and schedule directly.
+    return 0.2 * max(shape[0], shape[1]) ** 0.5
+
+
+def muon_update_sharded(
+    params: list[DTensor],
+    grads: list[DTensor],
+    momentum_bufs: list[DTensor],
+    *,
+    lr: float,
+    momentum: float,
+    weight_decay: float,
+    nesterov: bool,
+    ns_steps: int,
+    eps: float,
+    lr_adjust: str = 'shape',
+    ns_coeffs: str = 'jordan',
+    compile_ns: bool = False,
+) -> None:
+    '''muon_update for row-sharded DTensor params (FSDP2). Elementwise
+    work (momentum, decay, the final add) runs on the local shards;
+    Newton-Schulz needs whole matrices, so per bucket the bf16 momentum
+    shards are all-gathered over the shard group, NS is split across
+    that group and its outputs all-gathered back. Every rank of the
+    shard group must call this with the same params in the same order
+    (the DDP invariant, now per shard group); the replicate groups do
+    identical work on identical inputs.
+
+    Requires each matrix's row count to be a multiple of the shard
+    group size (FSDP2 pads uneven shards; the stacked gather here needs
+    equal local shapes) — true for every block matrix at our widths,
+    and any skinny exception belongs to AdamW anyway.'''
+    P = [p.to_local() for p in params]
+    G = [g.to_local() for g in grads]
+    Bf = [b.to_local() for b in momentum_bufs]
+    for p, g, b in zip(params, grads, momentum_bufs):
+        assert g.placements == p.placements and b.placements == p.placements, \
+            f'grad/momentum layout {g.placements}/{b.placements} differs from param {p.placements}'
+
+    torch._foreach_lerp_(Bf, G, 1 - momentum)  # type: ignore[attr-defined]
+    if nesterov:
+        updates = torch._foreach_lerp(G, Bf, momentum)  # type: ignore[attr-defined]
+    else:
+        updates = Bf
+    if weight_decay != 0:
+        torch._foreach_mul_(P, 1 - lr * weight_decay)  # type: ignore[attr-defined]
+
+    ns = _compiled_newton_schulz() if compile_ns else newton_schulz
+
+    buckets: dict[tuple, list[int]] = {}
+    for i, p in enumerate(params):
+        buckets.setdefault((tuple(p.shape), p.dtype, p.device, id(p.device_mesh), p.placements), []).append(i)
+    for (shape, dtype, device, _, _), idx in buckets.items():
+        group, ws, rank = _shard_layout(params[idx[0]])
+        rows, cols = shape
+        n = len(idx)
+        # NS runs in bf16; gathering bf16 halves the traffic at no cost
+        local = torch.stack([updates[i] for i in idx]).to(torch.bfloat16)   # (n, rows_l, cols)
+        if ws > 1:
+            rows_l = rows // ws
+            assert rows % ws == 0 and local.shape[1] == rows_l, \
+                f'{shape} is not evenly row-sharded {ws} ways (local {tuple(local.shape[1:])})'
+            gathered = torch.empty((ws * n, rows_l, cols), dtype=torch.bfloat16, device=device)
+            dist.all_gather_into_tensor(gathered, local.contiguous(), group=group)
+            full = gathered.view(ws, n, rows_l, cols).transpose(0, 1).reshape(n, rows, cols)
+        else:
+            rows_l = rows
+            full = local
+
+        chunk = -(-n // ws)                     # ceil; NS of the zero padding is zero
+        mine = full[rank * chunk:(rank + 1) * chunk]
+        if mine.size(0) < chunk:
+            mine = torch.cat([mine, full.new_zeros((chunk - mine.size(0), rows, cols))])
+        mine = ns(mine, steps=ns_steps, eps=eps, scheme=ns_coeffs)
+        if ws > 1:
+            out = torch.empty((chunk * ws, rows, cols), dtype=mine.dtype, device=device)
+            dist.all_gather_into_tensor(out, mine.contiguous(), group=group)
+            O = out[:n, rank * rows_l:(rank + 1) * rows_l]
+        else:
+            O = mine[:n]
+
+        torch._foreach_add_(  # type: ignore[attr-defined]
+            [P[i] for i in idx],
+            list(O.to(dtype).unbind(0)),
+            alpha=-lr * _lr_scale(shape, lr_adjust))
+
+
 class Muon(Optimizer):
     '''Muon for 2D parameters. Everything of dim != 2 is rejected at
     construction — route those params to AdamW (see MuonAdamW).'''
@@ -219,27 +341,32 @@ class Muon(Optimizer):
             params: list[Tensor] = []
             grads: list[Tensor] = []
             bufs: list[Tensor] = []
+            sharded: list[DTensor] = []
+            sgrads: list[DTensor] = []
+            sbufs: list[DTensor] = []
             for p in group['params']:
                 if p.grad is None:
                     continue
                 if p.grad.is_sparse:
                     raise RuntimeError('Muon does not support sparse gradients')
                 state = self.state[p]
-                if not state:              # lazy init, like Adam
-                    state['momentum_buffer'] = torch.zeros_like(p)
-                params.append(p)
-                grads.append(p.grad)
-                bufs.append(state['momentum_buffer'])
+                if not state:              # lazy init, like Adam (a DTensor
+                    state['momentum_buffer'] = torch.zeros_like(p)   # param gets a DTensor buffer)
+                if isinstance(p, DTensor):
+                    sharded.append(p); sgrads.append(p.grad); sbufs.append(state['momentum_buffer'])
+                else:
+                    params.append(p); grads.append(p.grad); bufs.append(state['momentum_buffer'])
+            common = dict(
+                lr=group['lr'], momentum=group['momentum'],
+                weight_decay=group['weight_decay'],
+                nesterov=group['nesterov'], ns_steps=group['ns_steps'],
+                eps=group['eps'], lr_adjust=group['lr_adjust'],
+                ns_coeffs=group['ns_coeffs'], compile_ns=self._compile_ns)
             if params:
-                muon_update(
-                    params, grads, bufs,
-                    lr=group['lr'], momentum=group['momentum'],
-                    weight_decay=group['weight_decay'],
-                    nesterov=group['nesterov'], ns_steps=group['ns_steps'],
-                    eps=group['eps'], lr_adjust=group['lr_adjust'],
-                    ns_coeffs=group['ns_coeffs'],
-                    compile_ns=self._compile_ns,
-                    world_size=world_size, rank=rank)
+                muon_update(params, grads, bufs, **common,
+                            world_size=world_size, rank=rank)
+            if sharded:
+                muon_update_sharded(sharded, sgrads, sbufs, **common)
         return loss
 
 
@@ -256,6 +383,12 @@ class MuonAdamW:
     @property
     def param_groups(self):
         return self.muon.param_groups + self.adamw.param_groups
+
+    @property
+    def members(self) -> list[torch.optim.Optimizer]:
+        '''The torch optimizers inside, for APIs that want real
+        Optimizer objects (the DCP state-dict functions).'''
+        return [self.muon, self.adamw]
 
     @property
     def state(self):

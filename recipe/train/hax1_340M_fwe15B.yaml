@@ -1,0 +1,81 @@
+# HAX1-340M on FineWeb-Edu, 15B tokens — the HAX series opener and the
+# first multi-node run: 2 nodes x 4 A100 under HSDP. Batch-paired with
+# the SAX2 / LAX1 15B runs: same data, token budget, global batch, seed
+# and optimizer recipe, so the delta is the mixer. COMPARE ON loss_ce
+# (primary pair sax2-340M-fwe15B-79629bc6, loss_ce tail5 2.4153; LAX1
+# lax1-340M-fwe15B-c9af2f44 when it lands) — and, because the hybrid
+# literature finds LM loss nearly flat across hybrid ratios while recall
+# is not, the recall probe is where HAX1 vs LAX1 will actually be
+# decided (still a separate eval; not in this run).
+#
+# Layout: world 8 = 2 nodes x 4; shard_size 4 = one node per FSDP shard
+# group, replicated across the two nodes (HSDP). global batch =
+# 8 * 8 * 4 * 2048 = 0.5M tokens, as SAX/LAX. Pairing across the layout
+# change: the loader hands optimizer step s the windows
+# order[256 s : 256 (s+1)] whatever the (world, accum) split at micro 8
+# (rank slices interleave per micro-step), so each step sees the same
+# global window set as the 4-GPU runs; only the micro partition differs.
+# The loader fingerprint includes world_size, so a checkpoint of this
+# run resumes only on 8 ranks.
+#
+# Optimizer / schedule = LAX1 15B's: Muon polar-express + AdamW at a
+# shared lr 1.75e-3 (rms adjust), WSD (warmup 1%, flat, linear cooldown
+# over the last 15%), z-loss 1e-4, wd 0.1. lr 1.75e-3 is inherited from
+# the SAX1 law and the LAX1 pilot ladder (all three arms stable, KDA
+# monotone to 3e-3); the parallel softmax branch carries qk-norm as
+# SAX1 does. hax1_340M_pilot_lr17 is the optional stability gate.
+#
+# FSDP precision: blocks compute on a bf16 copy of the sharded fp32
+# masters (fsdp_param_dtype), gradients reduce in fp32; the residual
+# stream and embedding/head stay fp32, as under the DDP runs.
+
+run_name: hax1-340M-fwe15B
+model_recipe: ../model/hax1_340M.yaml
+
+data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+data_shards: null          # all 20 shards (16.7B tokens); 15B => 0.9 epoch
+
+context_len: 2048
+world_size: 8              # 2 nodes x 4 A100
+shard_size: 4              # HSDP: shard inside the node, replicate across
+fsdp_param_dtype: bfloat16
+fsdp_reduce_dtype: float32
+batch_size: 8              # per-rank micro-batch (LAX1's; KDA at micro 16 OOMs)
+grad_accum_steps: 4
+global_batch_tokens: 524288
+train_tokens: 15_000_000_000
+seed: 42
+
+optimizer_name: muon
+optimizer_args:
+  lr: 1.75e-3
+  momentum: 0.95
+  weight_decay: 0.1
+  lr_adjust: rms
+  ns_coeffs: polar_express
+  adamw:
+    lr: 1.75e-3
+    betas: [0.9, 0.95]
+    weight_decay: 0.1
+
+schedule_name: wsd
+schedule_args:
+  warmup: 0.01             # 150M tokens, same as SAX/LAX
+  decay: 0.15              # linear cooldown over the last 2.25B tokens
+  min_ratio: 0.0
+
+grad_clip: 1.0
+z_loss: 1e-4
+ce_impl: liger
+
+device: auto
+dtype: bfloat16
+compile: true
+tf32: true
+
+out_root: runs
+log_interval: 10
+slow_interval: 100
+permanent_ckpt_interval: 5000
+recent_ckpt_minutes: 30
+peak_tflops: 312           # A100 bf16 dense; only feeds the MFU metric

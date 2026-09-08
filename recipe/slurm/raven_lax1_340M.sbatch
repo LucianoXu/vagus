@@ -6,7 +6,11 @@
 #                recipe/slurm/raven_sax1_340M.sbatch \
 #                recipe/train/lax1_340M_pilot_lr17.yaml
 # Resubmitting the same script+config resumes from the latest recent
-# checkpoint.
+# checkpoint. Extra key=value arguments override top-level TrainConfig
+# fields; a resubmit from a newer checkout continues the original run
+# directory with run_dir=..., e.g. (the 15B run started at c9af2f44):
+#   sbatch recipe/slurm/raven_lax1_340M.sbatch recipe/train/lax1_340M_fwe15B.yaml \
+#     run_dir=runs/lax1-340M-fwe15B-c9af2f44
 #SBATCH --job-name=lax1-340M
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
@@ -26,6 +30,7 @@ set -uo pipefail
 cd "$HOME/work/vagus"
 
 CONFIG="${1:-recipe/train/lax1_340M_fwe15B.yaml}"
+shift $(( $# > 0 ? 1 : 0 ))
 
 module purge
 module load python-waterboa/2025.06
@@ -38,9 +43,12 @@ python -c "import fla" 2>/dev/null || echo "WARNING: fla not installed; torch re
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export OMP_NUM_THREADS=18
 
-echo "Job $SLURM_JOB_ID on $(hostname) | $(nvidia-smi -L | head -1) | config $CONFIG"
+echo "Job $SLURM_JOB_ID on $(hostname) | $(nvidia-smi -L | head -1) | config $CONFIG $*"
 
-setsid torchrun --nproc_per_node 4 -m infra.train.main "$CONFIG" &
+# --shutdown_timeout: torchrun also receives the group SIGTERM and would
+# SIGKILL the workers 30 s later by default, before rank 0 has finished
+# writing the recent checkpoint
+setsid torchrun --nproc_per_node 4 --shutdown_timeout 900 -m infra.train.main "$CONFIG" "$@" &
 PID=$!
 trap "echo 'walltime soon: forwarding SIGTERM to training'; kill -TERM -- -$PID" USR1
 wait $PID

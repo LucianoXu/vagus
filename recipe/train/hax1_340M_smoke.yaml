@@ -1,0 +1,64 @@
+# HAX1-340M smoke — the fwe15B recipe cut to 60 steps (31M tokens): the
+# multi-node path at real shapes. What it answers before the 15B run:
+# NCCL takes the IB path (NET/IB in the .err), no OOM at micro 8 under
+# FSDP2 (max_mem_gb), steady tokens_per_s / mfu on 2 nodes vs LAX1's
+# 0.20 Mtok/s on one, and the final checkpoint gather + slim export at
+# 340M size. Run it twice to pick the FSDP compute dtype:
+#   sbatch -J hax1smoke -t 00:30:00 recipe/slurm/raven_hax1_340M.sbatch \
+#     recipe/train/hax1_340M_smoke.yaml
+#   sbatch -J hax1smoke32 -t 00:30:00 recipe/slurm/raven_hax1_340M.sbatch \
+#     recipe/train/hax1_340M_smoke.yaml fsdp_param_dtype=float32 run_name=hax1-340M-smoke-p32
+# Same override mechanism gives the one-node variant on gpudev
+# (world_size=4 grad_accum_steps=8; see raven_smoke_hsdp.sbatch).
+# Not an experiment: no registry entry, delete the run dirs afterwards.
+
+run_name: hax1-340M-smoke
+model_recipe: ../model/hax1_340M.yaml
+
+data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+data_shards: null
+
+context_len: 2048
+world_size: 8
+shard_size: 4
+fsdp_param_dtype: bfloat16
+fsdp_reduce_dtype: float32
+batch_size: 8
+grad_accum_steps: 4
+global_batch_tokens: 524288
+train_tokens: 31_457_280       # 60 steps
+seed: 42
+
+optimizer_name: muon
+optimizer_args:
+  lr: 1.75e-3
+  momentum: 0.95
+  weight_decay: 0.1
+  lr_adjust: rms
+  ns_coeffs: polar_express
+  adamw:
+    lr: 1.75e-3
+    betas: [0.9, 0.95]
+    weight_decay: 0.1
+
+schedule_name: wsd
+schedule_args:
+  warmup: 0.5                  # 30 warmup steps; the loss curve is not the point
+  decay: 0.15
+  min_ratio: 0.0
+
+grad_clip: 1.0
+z_loss: 1e-4
+ce_impl: liger
+
+device: auto
+dtype: bfloat16
+compile: true
+tf32: true
+
+out_root: runs
+log_interval: 5
+slow_interval: 20
+permanent_ckpt_interval: null
+recent_ckpt_minutes: 1000
+peak_tflops: 312
