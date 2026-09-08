@@ -132,6 +132,11 @@ class TrainConfig:
     # DDP + autocast arithmetic exactly.
     fsdp_param_dtype: str = 'bfloat16'
     fsdp_reduce_dtype: str = 'float32'
+    # Free each block's gathered compute copy after its forward (True:
+    # re-gather in backward, FSDP2's default) or keep it until backward
+    # (False: one all-gather per block per micro-step instead of two, at
+    # the cost of holding every block's bf16 copy — 0.7 GB at 340M).
+    fsdp_reshard_after_forward: bool = True
 
     # loss shaping
     grad_clip: float | None = 1.0
@@ -273,7 +278,8 @@ def apply_fsdp(root: LMLoss, mesh: DeviceMesh, config: TrainConfig) -> None:
     root.replicated = [p for p in root.parameters() if p.dim() < 2]
     ignored = set(root.replicated)
     for blk in root.module.blocks:  # type: ignore[union-attr]
-        fully_shard(blk, mesh=mesh, mp_policy=blocks_mp, ignored_params=ignored)
+        fully_shard(blk, mesh=mesh, mp_policy=blocks_mp, ignored_params=ignored,
+                    reshard_after_forward=config.fsdp_reshard_after_forward)
     fully_shard(root, mesh=mesh, mp_policy=root_mp, ignored_params=ignored)
 
 
