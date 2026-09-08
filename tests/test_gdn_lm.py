@@ -95,7 +95,11 @@ def test_metric_hook_and_flops():
     assert set(out) == GATES | {'attn_logit_max'}
     assert 0 < out['gdn/alpha_mean'] < 1 and out['gdn/mem_len_max'] >= out['gdn/mem_len_median'] > 1
     assert m.metric_hooks()['slow'][0](MetricCtx(model=m)) == {}
-    assert m.attn_flops_per_token(2048) == 2 * 18 * 2 * 16 * 32 + 12 * 64 * 2048
+    # chunk 8, dk 16, dv 32, delta: 3 * (6*16*32 + 2*8*(3*16 + 2*32)) per head
+    per_head = 3 * (6 * 16 * 32 + 2 * 8 * (3 * 16 + 2 * 32))
+    assert m.attn_flops_per_token(2048) == 2 * 2 * per_head + 12 * 64 * 2048
+    m0 = build(gate='none', delta=False)          # no WY solve: 4 dk dv + 2C (dk + dv)
+    assert m0.attn_flops_per_token(2048) == 3 * 2 * 3 * (4 * 16 * 32 + 2 * 8 * (16 + 32))   # 3 layers x 2 heads
     assert set(build(gate='none', delta=False).metric_hooks()['slow'][0](ctx)) == {'gdn/state_rms_max'}
     assert set(build(gate='scalar').metric_hooks()['slow'][0](ctx)) == GATES
     assert set(build().metric_hooks()['slow'][0](ctx)) == GATES          # pure: no softmax probe
@@ -175,7 +179,8 @@ def test_parallel_metrics_flops_and_groups():
     out = m.metric_hooks()['slow'][0](ctx)
     assert 'attn_logit_max' in out and 'gdn/alpha_mean' in out
     # 2 pure layers (2 heads) + parallel: 1 linear head + softmax at width 32
-    assert m.attn_flops_per_token(2048) == 2 * 18 * 2 * 16 * 32 + 18 * 16 * 32 + 12 * 32 * 2048
+    per_head = 3 * (6 * 16 * 32 + 2 * 8 * (3 * 16 + 2 * 32))
+    assert m.attn_flops_per_token(2048) == 2 * 2 * per_head + per_head + 12 * 32 * 2048
     groups = m.param_groups()
     par = m.blocks[1].att
     muon_ids = {id(p) for p in groups['muon']}

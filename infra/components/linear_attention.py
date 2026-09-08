@@ -61,6 +61,24 @@ except ImportError:  # CUDA/Triton-only package; import-guarded like liger
 GATES = ('none', 'scalar', 'vector')
 
 
+def chunk_scan_flops(dk: int, dv: int, chunk: int, delta: bool) -> float:
+    '''Matmul FLOPs per token per head, forward + backward (x3), of the
+    chunkwise algorithm the kernels actually run — the honest MFU
+    numerator for a linear-attention layer. The recurrence alone (state
+    write, delta read-back, query read-out: 2 dk dv each) is what a
+    naive count credits; the chunked form adds, per token, the
+    intra-chunk products over a C-token chunk: Q K^T and the masked
+    attention-times-U read (2C dk + 2C dv), and with the delta rule the
+    K K^T gram and the WY solve of w = T (beta K), u = T (beta V)
+    (2C dk + 2C dk + 2C dv). At dk 128, dv 256, C 64 that is 1.58x the
+    naive count. Softmax layers keep the PaLM 12 d L convention (full
+    matrix, not the causal half) so MFU stays comparable with published
+    numbers and the SAX runs.'''
+    state = (6 if delta else 4) * dk * dv
+    intra = 2 * chunk * ((3 * dk + 2 * dv) if delta else (dk + dv))
+    return 3.0 * (state + intra)
+
+
 # ---------------------------------------------------------------------------
 # Scans: pure functions over (B, L, H, d) tensors, fp32 inside.
 #   q, k: (B, L, H, dk)   v: (B, L, H, dv)

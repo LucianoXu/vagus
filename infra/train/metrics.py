@@ -66,7 +66,7 @@ class MetricCtx:
     device_type: str = 'cpu'
     param_count: int = 0
     peak_tflops: float | None = None # per-device; enables mfu
-    attn_flops_per_tok: float = 0.0  # 12*L*d*ctx term; 0 = 6N only
+    attn_flops_per_tok: float = 0.0  # mixer matmul FLOPs/token (model.attn_flops_per_token); 0 = 6N only
     # per log window
     loss: float = 0.0
     loss_ema: float | None = None

@@ -23,7 +23,7 @@ from torch import nn
 
 from ..components.attention import SoftmaxAttention
 from ..components.block import Block
-from ..components.linear_attention import GatedDeltaNet
+from ..components.linear_attention import GatedDeltaNet, chunk_scan_flops
 from ..components.mixer import Mixer
 from ..components.norm_layer import RMSNorm
 from ..components.parallel_mixer import ParallelMixer
@@ -221,12 +221,14 @@ class GDNLM(nn.Module, Decodable):
 
     def attn_flops_per_token(self, context_len: int) -> float:
         '''Mixer matmul FLOPs per token (fwd + bwd), for the MFU estimate.
-        Linear: state write, delta read-back and query read-out are each
-        2 * H * dk * dv per token; softmax: the 12 * width * L term. A
-        parallel layer is the sum of its half-width branches.'''
+        Linear: the chunkwise algorithm's cost per head
+        (chunk_scan_flops: recurrence + intra-chunk products at the
+        configured chunk size, the kernels' 64); softmax: the PaLM
+        12 * width * L term. A parallel layer is the sum of its
+        half-width branches.'''
         c = self.config
         dk, dv, dim = (int(c[k]) for k in ('key_head_dim', 'value_head_dim', 'dim'))
-        per_head = (18 if c['delta'] else 12) * dk * dv
+        per_head = chunk_scan_flops(dk, dv, int(c['chunk_size']), bool(c['delta']))
 
         def flops(kind: str) -> float:
             if kind == 'gdn':
