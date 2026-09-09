@@ -58,6 +58,13 @@ except ImportError:  # CUDA/Triton-only package; import-guarded like liger
     chunk_gated_delta_rule = chunk_kda = chunk_simple_gla = None  # type: ignore[assignment]
     HAS_FLA = False
 
+try:
+    from fla.modules.fused_norm_gate import rms_norm_gated  # type: ignore
+    HAS_FLA_NORM_GATE = True
+except ImportError:
+    rms_norm_gated = None  # type: ignore[assignment]
+    HAS_FLA_NORM_GATE = False
+
 GATES = ('none', 'scalar', 'vector')
 
 
@@ -268,10 +275,30 @@ def chunk_scan_vec(q, k, v, g, beta, S0, *, scale: float, delta: bool, chunk_siz
     return o.to(out_dtype), S
 
 
-def fla_scan(q, k, v, g, beta, S0, *, scale: float, delta: bool):
+def fla_scan(q, k, v, g, beta, S0, *, scale: float, delta: bool, chunk_size: int = 64,
+             l2norm_in_kernel: bool = False, gate_in_kernel: bool = False,
+             beta_in_kernel: bool = False, A_log=None, dt_bias=None,
+             disable_recompute: bool = False, lower_bound: float | None = None):
     '''fla chunk kernels. q/k/v must be bf16/fp16 on CUDA; g/beta fp32.
     Semantics identical to recurrent_scan (fla's fused_recurrent
-    reference is the same recurrence: decay, then delta write).'''
+    reference is the same recurrence: decay, then delta write).
+
+    The *_in_kernel flags move work that this module would otherwise do
+    in PyTorch into the Triton kernels, which is where it belongs: each
+    one is an elementwise pass over a (B, L, H, d) tensor whose only
+    cost is memory traffic, and the kernel already has the operand in
+    registers.
+        l2norm_in_kernel  q, k arrive un-normalised; the kernel L2-norms
+                          them (and differentiates through it).
+        gate_in_kernel    g arrives as the raw pre-activation f; the
+                          kernel computes -exp(A_log) softplus(f +
+                          dt_bias) *and its chunk cumsum* in one pass
+                          (KDA only; A_log (H,), dt_bias (H*dk,)).
+        beta_in_kernel    beta arrives as logits; the kernel takes the
+                          sigmoid.
+    disable_recompute keeps the intra-chunk activations from the forward
+    instead of recomputing them in the backward: memory for time, worth
+    it at small model sizes.'''
     if not HAS_FLA:
         raise RuntimeError('fla is not installed (pip install fla-core)')
     S0 = None if S0 is None else S0.to(torch.float32).contiguous()
@@ -283,19 +310,41 @@ def fla_scan(q, k, v, g, beta, S0, *, scale: float, delta: bool):
         if not delta:
             raise NotImplementedError('vector gate without delta has no fla path here')
         assert beta is not None
-        o, S = chunk_kda(q, k, v, g.to(torch.float32), beta.to(q.dtype), scale=scale,
-                         initial_state=S0, output_final_state=True)
+        if gate_in_kernel:
+            assert A_log is not None and dt_bias is not None
+            kw: dict = dict(use_gate_in_kernel=True, A_log=A_log, dt_bias=dt_bias)
+            if lower_bound is not None:
+                # bounded decay: the kernel takes the tensor-core path for
+                # the intra-chunk diagonal blocks, which the unbounded
+                # exponents of the softplus gate cannot use safely
+                kw.update(safe_gate=True, lower_bound=lower_bound)
+        else:
+            g = g.to(torch.float32)
+            kw = {}
+        o, S = chunk_kda(q, k, v, g, beta if beta_in_kernel else beta.to(q.dtype),
+                         scale=scale, initial_state=S0, output_final_state=True,
+                         use_qk_l2norm_in_kernel=l2norm_in_kernel,
+                         use_beta_sigmoid_in_kernel=beta_in_kernel,
+                         disable_recompute=disable_recompute,
+                         chunk_size=chunk_size, **kw)
         return o, S
+    assert not gate_in_kernel, 'the fused gate activation is a KDA (vector-gate) kernel'
     if g is None:
         g = torch.zeros(q.shape[:3], device=q.device, dtype=torch.float32)
     g = g.to(torch.float32)
     if delta:
         assert beta is not None
-        o, S = chunk_gated_delta_rule(q, k, v, g, beta.to(q.dtype), scale=scale,
-                                      initial_state=S0, output_final_state=True)
+        o, S = chunk_gated_delta_rule(q, k, v, g, beta if beta_in_kernel else beta.to(q.dtype),
+                                      scale=scale, initial_state=S0, output_final_state=True,
+                                      use_qk_l2norm_in_kernel=l2norm_in_kernel,
+                                      use_beta_sigmoid_in_kernel=beta_in_kernel,
+                                      chunk_size=chunk_size)
     else:
+        assert not l2norm_in_kernel and not beta_in_kernel, \
+            'simple_gla takes no fused l2norm / beta'
         o, S = chunk_simple_gla(q, k, v, g, scale=scale,
-                                initial_state=S0, output_final_state=True)
+                                initial_state=S0, output_final_state=True,
+                                chunk_size=chunk_size)
     return o, S
 
 
@@ -326,6 +375,28 @@ class GatedDeltaNet(nn.Module, Mixer):
     impl: 'auto' picks fla when installed and the input is on CUDA in
     bf16/fp16, else the torch chunk reference. 'fla' / 'torch' force.
 
+    fused: on the fla path, hand the kernels their raw inputs instead of
+    doing the work in PyTorch first — the short conv (fla's Triton
+    causal_conv1d, activation folded in), the L2 norm on q/k, the gate
+    activation *and its chunk cumsum*, the beta sigmoid, and the output
+    RMSNorm x SiLU gate. It is the same computation, at the same
+    precision: under autocast the pre-activations were already bf16 and
+    every kernel does its arithmetic in fp32, so the only thing that
+    disappears is the round trip through memory. Off by default so a
+    run in flight keeps its exact numerics; the torch path ignores it.
+
+    disable_recompute: keep the intra-chunk activations from the forward
+    rather than recomputing them in the backward. Memory for time, and
+    at 340M there is memory to spend.
+
+    gate_lower_bound: switch the decay to Kimi's bounded form
+    lower_bound * sigmoid(exp(A_log) (f + dt_bias)) in [lower_bound, 0)
+    instead of -exp(A_log) softplus(...). A different gate family — not
+    a free speedup — but with fused=True it also puts the intra-chunk
+    diagonal blocks on the tensor cores (fla's safe_gate), which the
+    unbounded exponents of the softplus gate cannot use. -5 is Kimi's
+    recommended value.
+
     Parameter sizing at dim d: q, k are d x (H dk); v, gate, o are
     d x (H dv). With H dk = d/2 and H dv = d (the GLA layout) the mixer
     has 4 d^2 params, matching MHA at the same dim.
@@ -347,6 +418,9 @@ class GatedDeltaNet(nn.Module, Mixer):
             gate_rank: int = 64,
             chunk_size: int = 64,
             impl: str = 'auto',
+            fused: bool = False,
+            disable_recompute: bool = False,
+            gate_lower_bound: float | None = None,
             *,
             init_std: float = 0.02,
             layer_count: int | None = None,
@@ -373,6 +447,10 @@ class GatedDeltaNet(nn.Module, Mixer):
         self.gate_rank = gate_rank
         self.chunk_size = chunk_size
         self.impl = impl
+        self.fused = fused                     # fused scan inputs (l2norm/gate/beta)
+        self.fused_norm_gate = fused           # fused RMSNorm x SiLU gate on the output
+        self.disable_recompute = disable_recompute
+        self.gate_lower_bound = gate_lower_bound
         self.scale = key_head_dim ** -0.5
         self.out_proj = out_proj
         self.out_width = head_count * value_head_dim
@@ -387,9 +465,9 @@ class GatedDeltaNet(nn.Module, Mixer):
         self.o_norm = RMSNorm(dv)                         # per-head, gamma shared
 
         if short_conv_size is not None:
-            self.conv_q = ShortConv(H * dk, short_conv_size)
-            self.conv_k = ShortConv(H * dk, short_conv_size)
-            self.conv_v = ShortConv(H * dv, short_conv_size)
+            self.conv_q = ShortConv(H * dk, short_conv_size, fused=fused)
+            self.conv_k = ShortConv(H * dk, short_conv_size, fused=fused)
+            self.conv_v = ShortConv(H * dv, short_conv_size, fused=fused)
 
         if gate != 'none':
             n_dt = H * dk if gate == 'vector' else H        # one dt per channel / per head
@@ -442,26 +520,51 @@ class GatedDeltaNet(nn.Module, Mixer):
         h = cls._hi(x)
         return (h * torch.rsqrt(h.pow(2).sum(-1, keepdim=True) + eps)).to(x.dtype)
 
-    def _gates(self, x):
+    def _gates(self, x, *, raw_gate: bool = False, raw_beta: bool = False):
         '''(g, beta) in fp32 (fp64 for fp64 models): log a_t (or None)
-        and b_t (or None).'''
+        and b_t (or None).
+
+        raw_gate / raw_beta return the KDA kernel's inputs instead — the
+        gate pre-activation f, shaped (B, L, H, dk), and the beta
+        logits, both in x's dtype. The kernel then computes
+        -exp(A_log) softplus(f + dt_bias) (fusing the chunk cumsum that
+        follows it) and sigmoid(beta) itself, so neither the fp32
+        pre-activation nor the fp32 decay is ever written to memory.'''
         g = beta = None
         if self.gate == 'scalar':
+            assert not raw_gate, 'the fused gate activation is KDA-only (vector gate)'
             g = -self._hi(self.A_log).exp() * F.softplus(self._hi(self.wa(x)) + self._hi(self.dt_bias))
         elif self.gate == 'vector':
             B, L = x.shape[0], x.shape[1]
-            f = self._hi(self.wa2(self.wa1(x))) + self._hi(self.dt_bias)            # (B, L, H*dk)
-            g = -self._hi(self.A_log).exp()[:, None] * F.softplus(f).view(B, L, self.head_count, self.key_head_dim)
+            f = self.wa2(self.wa1(x))                                               # (B, L, H*dk)
+            if raw_gate:
+                g = f.view(B, L, self.head_count, self.key_head_dim)
+            elif self.gate_lower_bound is not None:
+                f = (self._hi(f) + self._hi(self.dt_bias)).view(
+                    B, L, self.head_count, self.key_head_dim)
+                g = self.gate_lower_bound * torch.sigmoid(self._hi(self.A_log).exp()[:, None] * f)
+            else:
+                f = self._hi(f) + self._hi(self.dt_bias)
+                g = -self._hi(self.A_log).exp()[:, None] * F.softplus(f).view(
+                    B, L, self.head_count, self.key_head_dim)
         if self.delta:
-            beta = torch.sigmoid(self._hi(self.wb(x)))
+            beta = self.wb(x) if raw_beta else torch.sigmoid(self._hi(self.wb(x)))
         return g, beta
 
-    def _heads(self, qp, kp, vp):
+    def _heads(self, qp, kp, vp, *, l2norm: bool = True, conv: bool = True):
+        '''conv -> SiLU -> per-head view, and (unless the kernel will do
+        it) the L2 norm on q and k. The activation is handed to the conv
+        rather than applied after it so a fused conv kernel can absorb
+        it.'''
         B, L = qp.shape[0], qp.shape[1]
         H, dk, dv = self.head_count, self.key_head_dim, self.value_head_dim
-        q = self._l2norm(F.silu(qp).view(B, L, H, dk))
-        k = self._l2norm(F.silu(kp).view(B, L, H, dk))
-        v = F.silu(vp).view(B, L, H, dv)
+        if conv and self.short_conv_size is not None:
+            qp, kp, vp = self.conv_q(qp, 'silu'), self.conv_k(kp, 'silu'), self.conv_v(vp, 'silu')
+        else:                              # already convolved (decode), or no conv
+            qp, kp, vp = F.silu(qp), F.silu(kp), F.silu(vp)
+        q, k, v = qp.view(B, L, H, dk), kp.view(B, L, H, dk), vp.view(B, L, H, dv)
+        if l2norm:
+            q, k = self._l2norm(q), self._l2norm(k)
         return q, k, v
 
     def _pick_impl(self, q) -> str:
@@ -470,16 +573,40 @@ class GatedDeltaNet(nn.Module, Mixer):
         ok = HAS_FLA and q.is_cuda and q.dtype in (torch.bfloat16, torch.float16)
         return 'fla' if ok else 'torch'
 
-    def _scan(self, q, k, v, g, beta, S0):
+    def _fused_kernel(self, qp) -> bool:
+        '''Whether this call runs the fused fla path (and so hands the
+        kernels their raw inputs). Decided on a projection output, the
+        tensor whose device and dtype the kernels will actually see —
+        under FSDP's mixed precision the residual stream reaching
+        forward() may still be fp32. Everything off the fla path — the
+        torch reference, cpu/fp32/fp64 — keeps the unfused semantics.'''
+        return self.fused and self._pick_impl(qp) == 'fla'
+
+    def _scan(self, q, k, v, g, beta, S0, *, fused: bool = False):
         if self._pick_impl(q) == 'fla':
-            return fla_scan(q, k, v, g, beta, S0, scale=self.scale, delta=self.delta)
+            return fla_scan(q, k, v, g, beta, S0, scale=self.scale, delta=self.delta,
+                            chunk_size=self.chunk_size,
+                            l2norm_in_kernel=fused,
+                            gate_in_kernel=fused and self.gate == 'vector',
+                            beta_in_kernel=fused and self.delta,
+                            A_log=self.A_log if self.gate != 'none' else None,
+                            dt_bias=self.dt_bias if self.gate != 'none' else None,
+                            disable_recompute=self.disable_recompute,
+                            lower_bound=self.gate_lower_bound)
         return chunk_scan(q, k, v, g, beta, S0, scale=self.scale, delta=self.delta,
                           chunk_size=self.chunk_size)
 
     def _output(self, o, x):
         B, L = x.shape[0], x.shape[1]
-        gate = F.silu(self.wg(x)).view(B, L, self.head_count, self.value_head_dim)
-        o = (self.o_norm(o.to(gate.dtype)) * gate).reshape(B, L, -1)
+        gate = self.wg(x).view(B, L, self.head_count, self.value_head_dim)
+        if self.fused_norm_gate and HAS_FLA_NORM_GATE and o.is_cuda and \
+                o.dtype in (torch.bfloat16, torch.float16):
+            # one kernel for RMSNorm(o) * SiLU(gate) over the head dim
+            assert rms_norm_gated is not None
+            o = rms_norm_gated(o.to(gate.dtype), gate, self.o_norm.gamma, None,
+                               activation='swish', eps=self.o_norm.eps).reshape(B, L, -1)
+        else:
+            o = (self.o_norm(o.to(gate.dtype)) * F.silu(gate)).reshape(B, L, -1)
         return self.wo(o) if self.out_proj else o
 
     # --- training / stateless -----------------------------------------
@@ -487,11 +614,11 @@ class GatedDeltaNet(nn.Module, Mixer):
     def forward(self, x, is_causal: bool = True):
         assert is_causal, 'linear attention is causal by construction'
         qp, kp, vp = self.wq(x), self.wk(x), self.wv(x)
-        if self.short_conv_size is not None:
-            qp, kp, vp = self.conv_q(qp), self.conv_k(kp), self.conv_v(vp)
-        q, k, v = self._heads(qp, kp, vp)
-        g, beta = self._gates(x)
-        o, _ = self._scan(q, k, v, g, beta, None)
+        fused = self._fused_kernel(qp)
+        q, k, v = self._heads(qp, kp, vp, l2norm=not fused)
+        g, beta = self._gates(x, raw_gate=fused and self.gate == 'vector',
+                              raw_beta=fused and self.delta)
+        o, _ = self._scan(q, k, v, g, beta, None, fused=fused)
         return self._output(o, x)
 
     @torch.no_grad()
@@ -499,10 +626,7 @@ class GatedDeltaNet(nn.Module, Mixer):
         '''Health probe on a small input (a sequence or two): per-head mean
         decay a, effective memory length 1/(1-a), mean write strength b,
         and the RMS of the state after the sequence. fp32 torch path.'''
-        qp, kp, vp = self.wq(x), self.wk(x), self.wv(x)
-        if self.short_conv_size is not None:
-            qp, kp, vp = self.conv_q(qp), self.conv_k(kp), self.conv_v(vp)
-        q, k, v = self._heads(qp, kp, vp)
+        q, k, v = self._heads(self.wq(x), self.wk(x), self.wv(x))
         g, beta = self._gates(x)
         _, S = chunk_scan(q, k, v, g, beta, None, scale=self.scale, delta=self.delta,
                           chunk_size=self.chunk_size)
@@ -570,7 +694,7 @@ class GatedDeltaNet(nn.Module, Mixer):
             qp = self.conv_q.direct_conv(qp)[:, -L:]
             kp = self.conv_k.direct_conv(kp)[:, -L:]
             vp = self.conv_v.direct_conv(vp)[:, -L:]
-        q, k, v = self._heads(qp, kp, vp)
+        q, k, v = self._heads(qp, kp, vp, conv=False)
         g, beta = self._gates(x)
 
         if L == 1:

@@ -177,7 +177,10 @@ class TrainConfig:
         `overrides` are `key=value` strings for top-level fields (the
         value parsed as yaml: `shard_size=4`, `fsdp_param_dtype=float32`,
         `run_dir=runs/x`), for launch-time variations of one recipe such
-        as smoke runs; an experiment's recipe file stays the record.'''
+        as smoke runs; an experiment's recipe file stays the record. A
+        dotted key reaches one level into a dict field
+        (`model_args.la_fused=true`), which is how a kernel-path A/B runs
+        off a single model recipe.'''
         path = Path(path)
         raw = yaml.load(open(path, encoding='utf-8'), _YamlLoader) or {}
         if 'model_recipe' in raw:
@@ -192,7 +195,13 @@ class TrainConfig:
             key, sep, value = item.partition('=')
             if not sep or not key:
                 raise ValueError(f'override {item!r} is not key=value')
-            raw[key] = yaml.load(value, _YamlLoader)
+            outer, dot, inner = key.partition('.')
+            if not dot:
+                raw[key] = yaml.load(value, _YamlLoader)
+                continue
+            if not isinstance(raw.get(outer), dict):
+                raise ValueError(f'override {item!r}: {outer} is not a dict field')
+            raw[outer] = dict(raw[outer]) | {inner: yaml.load(value, _YamlLoader)}
         return cls(**raw)   # unknown keys -> loud TypeError
 
 

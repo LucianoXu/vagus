@@ -180,3 +180,33 @@ def test_fla_matches_torch(gate, delta):
     o_f, S_f = fla_scan(q.bfloat16(), k.bfloat16(), v.bfloat16(), g, beta, S0, **kw)
     assert torch.allclose(o_f.float(), o_t, atol=3e-2, rtol=3e-2)
     assert torch.allclose(S_f.float(), S_t, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.skipif(not (HAS_FLA and torch.cuda.is_available()), reason='needs fla + CUDA')
+@pytest.mark.parametrize('gate,delta', [('vector', True), ('scalar', True), ('scalar', False)])
+def test_fused_matches_unfused(gate, delta):
+    '''fused=True moves the L2 norm, the gate activation, the beta
+    sigmoid, the short conv and the output norm-gate into fla's kernels.
+    Same computation, so the layer's output and gradients must agree
+    with the unfused path at bf16 rounding.'''
+    torch.manual_seed(0)
+    kw = dict(gate=gate, delta=delta, layer_count=4)
+    base = GatedDeltaNet(128, 4, 32, 32, 4, impl='fla', fused=False, **kw).cuda().bfloat16()
+    fused = GatedDeltaNet(128, 4, 32, 32, 4, impl='fla', fused=True, **kw).cuda().bfloat16()
+    fused.load_state_dict(base.state_dict())
+
+    x = torch.randn(2, 256, 128, device='cuda', dtype=torch.bfloat16)
+    outs, grads = [], []
+    for m in (base, fused):
+        t = x.detach().requires_grad_()
+        y = m(t)
+        y.float().pow(2).mean().backward()
+        outs.append(y.float())
+        grads.append((t.grad.float(), m.wq.weight.grad.float()))   # type: ignore[union-attr]
+
+    # bf16 carries ~0.4% per rounding, so compare against the largest
+    # element (a relative-to-rms bound would fail on the tail)
+    assert (outs[0] - outs[1]).abs().max() < 0.03 * outs[0].abs().max()
+    assert (outs[0] - outs[1]).norm() < 0.01 * outs[0].norm()
+    for a, b in zip(grads[0], grads[1]):
+        assert (a - b).abs().max() < 0.03 * a.abs().max().clamp(min=1e-6)
