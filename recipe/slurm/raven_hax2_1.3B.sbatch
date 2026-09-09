@@ -9,7 +9,14 @@
 #                recipe/train/hax2_1.3B_smoke.yaml
 # Resubmitting the same script+config resumes from the latest recent
 # checkpoint (the run dir is <run_name>-<commit8>; pass run_dir=... to
-# continue a run across code commits).
+# continue a run across code commits). Walltime chaining: queue the
+# continuations up front, each after the previous one, all with the
+# same run_dir=; a link whose run is already complete (model-final.pt
+# in the run dir) exits at once instead of holding the nodes:
+#   J1=$(sbatch --parsable recipe/slurm/raven_hax2_1.3B.sbatch)
+#   J2=$(sbatch --parsable --dependency=afterany:$J1 recipe/slurm/raven_hax2_1.3B.sbatch \
+#          recipe/train/hax2_1.3B_fwe60B.yaml run_dir=runs/hax2-1.3B-fwe60B-<commit8>)
+#   ... (one link per expected walltime, ~24 h each)
 #SBATCH --job-name=hax2-1.3B
 #SBATCH --partition=gpu
 #SBATCH --nodes=3
@@ -47,6 +54,17 @@ export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=INIT,NET
 
 echo "Job $SLURM_JOB_ID on $SLURM_JOB_NODELIST | master $MASTER_ADDR:$MASTER_PORT | config $CONFIG $*"
+
+# chain guard: a continuation link whose run already finished releases
+# the allocation immediately (run_dir=... is how links address the run)
+for arg in "$@"; do
+    case "$arg" in run_dir=*)
+        if [ -f "${arg#run_dir=}/model-final.pt" ]; then
+            echo "run ${arg#run_dir=} is complete (model-final.pt present); nothing to do"
+            exit 0
+        fi;;
+    esac
+done
 
 srun --kill-on-bad-exit=1 recipe/slurm/torchrun_node.sh "$CONFIG" "$@" &
 PID=$!

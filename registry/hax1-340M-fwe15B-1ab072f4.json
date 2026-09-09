@@ -37,7 +37,8 @@
     "contents": "ckpt-{05000,10000,15000,20000,25000,28610}.pt (full training state, DCP), model-final.pt (slim weights+args), tb/, config.yaml, meta.json, slurm logs (30084326)",
     "transient": [
       "raven:/u/yinxu/work/vagus/runs/hax1-340M-fwe15B-1ab072f4/ (home GPFS working copy, 48 GB incl. recent*.pt)",
-      "mbp:assets/2-areas/vagus/runs/cmp/hax1/ (tb + config/meta only)"
+      "mbp:assets/2-areas/vagus/runs/cmp/hax1/ (tb + config/meta only)",
+      "mbp:assets/2-areas/vagus/runs/gen-eval/hax1-model-final.pt (slim weights, pulled from selene 2026-09-09, sha256 matches the archive manifest)"
     ]
   }
 }
