@@ -1,0 +1,40 @@
+# gap 256 (256 tokens skipped between X and Y: the document-memory
+# reading, local continuation removed) of the budget ladder of consolidate_lax1_replay.yaml / _ntpx.yaml: 64 steps
+# at lr 5e-5, method ntp_x. The 16-step lr 1e-5 replay run kept 22% of
+# the context benefit with its distillation loss still falling at the
+# last step (registry/eval/consolidate-replay-340M-a2690564.json), so
+# the budget, not the objective, was the first limit to lift. Same
+# items (seed 0, 32 x L=2048), same LM mix.
+
+eval_name: consolidate-gap256-ntpx-s64-lr5e5-340M
+subjects:
+  - {ckpt: runs/gen-eval/lax1-model-final.pt, label: LAX1, run_meta: runs/cmp/lax1/meta.json}
+
+device: auto
+dtype: bfloat16
+seed: 0
+
+tasks:
+  - name: consolidation
+    args:
+      data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+      n_items: 32
+      x_len: [2048]
+      y_len: 512
+      gap: 256
+      batch_size: 2
+      buckets: [64, 256]
+      method: ntp_x
+      sleep_x_len: [2048]
+      sleep:
+        chunk_len: 512
+        steps: 64
+        lr: 5e-5
+        batch: 8
+        lm_mix: 0.5
+        lm_batch: 4
+        lm_len: 512
+        retain_windows: 8
+
+out_root: runs/eval
+registry_dir: registry/eval
