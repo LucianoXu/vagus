@@ -245,3 +245,33 @@ def test_short_conv_impls_agree():
     assert torch.allclose(outs[0], outs[1], atol=1e-12)
     for a, b in zip(grads[0], grads[1]):
         assert torch.allclose(a, b, atol=1e-12)
+
+
+def test_bounded_gate_starts_in_the_same_regime():
+    '''dt_bias is the inverse of whichever gate activation the layer
+    uses. Feeding the softplus inverse to the bounded (sigmoid) form
+    saturates it: every head starts at decay 1.0, i.e. no forgetting at
+    all, losing the Mamba2 spread the init exists for. Both forms must
+    start with forgetting rates in the same regime.'''
+    torch.manual_seed(0)
+    x = torch.randn(2, 128, 256)
+    stats = {}
+    for lb in (None, -5.0):
+        torch.manual_seed(0)                     # identical A_log / dt draw
+        m = GatedDeltaNet(256, 4, 32, 64, 4, gate='vector', delta=True,
+                          impl='torch', gate_lower_bound=lb, layer_count=8)
+        stats[lb] = m.gate_stats(x)
+
+    for lb, st in stats.items():
+        a = st['alpha']
+        assert a.max() < 0.999, f'{lb}: some channel never forgets ({a.max():.5f})'
+        assert a.quantile(0.99) / a.quantile(0.01) > 1.5, f'{lb}: no spread of decay rates'
+    ref, bounded = (stats[None]['mem_len'].median(), stats[-5.0]['mem_len'].median())
+    assert 0.25 < bounded / ref < 4, f'memory length regimes differ: {ref:.1f} vs {bounded:.1f}'
+
+
+def test_bounded_gate_is_vector_only():
+    with pytest.raises(AssertionError):
+        GatedDeltaNet(64, 2, 16, 32, gate='scalar', gate_lower_bound=-5.0)
+    with pytest.raises(AssertionError):
+        GatedDeltaNet(64, 2, 16, 32, gate='vector', gate_lower_bound=-9.0)

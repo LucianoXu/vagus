@@ -499,6 +499,10 @@ class GatedDeltaNet(nn.Module, Mixer):
         assert impl in ('auto', 'fla', 'torch')
         if impl == 'fla' and not HAS_FLA:
             raise RuntimeError("impl='fla' but fla is not installed")
+        assert gate_lower_bound is None or gate == 'vector', \
+            'the bounded decay is a KDA (vector-gate) parameterisation'
+        assert gate_lower_bound is None or -5 <= gate_lower_bound < 0, \
+            f'gate_lower_bound must be in [-5, 0), got {gate_lower_bound}'
 
         self.dim = dim
         self.head_count = head_count
@@ -545,7 +549,24 @@ class GatedDeltaNet(nn.Module, Mixer):
             self.A_log = nn.Parameter(A.log())
             lo, hi = math.log(dt_init_range[0]), math.log(dt_init_range[1])
             dt = torch.exp(torch.rand(n_dt) * (hi - lo) + lo).clamp(min=1e-4)
-            self.dt_bias = nn.Parameter(dt + torch.log(-torch.expm1(-dt)))   # softplus^-1
+            # dt_bias is whatever makes the gate's own activation return
+            # -dt at f = 0, so both parameterisations start from the same
+            # spread of forgetting rates. The inverse differs with the
+            # activation, and using the softplus one for the bounded gate
+            # is not a small error: logit's argument would be dt/|lb|
+            # ~ 1e-3, so sigmoid saturates at 0 and every head starts
+            # with no forgetting at all (measured: decay a = 1.0 across
+            # every quantile, against a median memory length of 9.7).
+            if gate_lower_bound is None:
+                bias = dt + torch.log(-torch.expm1(-dt))                  # softplus^-1
+            else:
+                # match the softplus form at f = 0, where it gives a decay
+                # of exp(A_log) * dt (A below is already exp(A_log)):
+                #   -lb * sigmoid(A b) = A dt  =>  b = logit(A dt / -lb) / A
+                a = A.repeat_interleave(dk)
+                p = (a * dt / -gate_lower_bound).clamp(1e-6, 1 - 1e-6)
+                bias = torch.logit(p) / a
+            self.dt_bias = nn.Parameter(bias)
         if delta:
             self.wb = nn.Linear(dim, H, bias=False)
 
