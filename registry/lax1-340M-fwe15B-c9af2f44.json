@@ -6,7 +6,10 @@
     "created": "2026-09-08T09:34:08+02:00",
     "finished": "2026-09-09T14:27:11+02:00",
     "elapsed": "23:44:44 + 05:09:42 (walltime hit at step 24,000; resumed from recent-prev.pt at step 23,520 — the walltime checkpoint was truncated by the sbatch wait bug fixed in 32b146a; ~30 min of compute redone)",
-    "slurm_jobs": { "walltime_hit": 30073697, "completed": 30083857 },
+    "slurm_jobs": {
+      "walltime_hit": 30073697,
+      "completed": 30083857
+    },
     "hardware": "1 node x 4x A100-SXM4-40GB (MPCDF Raven, partition gpu)",
     "torch": "2.13.0+cu130",
     "kernels": "fla-core 0.5.2 (chunk_kda), triton 3.7.1; regional torch.compile of the blocks"
@@ -17,7 +20,7 @@
     "steps": 28610,
     "tokens_seen": 14999879680,
     "final_loss": 2.4055,
-    "final_loss_ema": 2.4010,
+    "final_loss_ema": 2.401,
     "loss_tail5": 2.3963,
     "loss_ce_tail5": 2.3956,
     "loss_z_final": 0.0008,
@@ -31,10 +34,10 @@
   },
   "decision_note": "LAX1 is the linear-attention anchor of the 340M coordinate. Next in the series: a recall probe before any hybrid claim; LAX-H (softmax every 4th layer / HAX line) for the recall gap; gate: scalar (GDN) as the ablation from the same module. Throughput is the cost: 1.67x SAX2's step time at ctx 2048; the in-kernel fusions (gate / l2norm / beta) and micro 16 via activation checkpointing are the untested levers.",
   "archive": {
-    "primary": "PENDING — not yet pushed to selene (46 GB on raven incl. recent*.pt; the sax runs' archive set is ckpt-{05000,...,28610}.pt + model-final.pt + tb/ + config/meta + slurm logs, ~19 GB)",
+    "primary": "selene:/data/vagus/runs/lax1-340M-fwe15B-c9af2f44/  (SHA256SUMS inside; 18 GB, pushed from raven 2026-09-09 14:39-14:54, sha256sum -c verified 15/15)",
     "contents": "ckpt-{05000,10000,15000,20000,25000,28610}.pt (full training state), model-final.pt (slim weights+args), tb/, config.yaml, meta.json, slurm logs (30073697 + 30083857)",
     "transient": [
-      "raven:/u/yinxu/work/vagus/runs/lax1-340M-fwe15B-c9af2f44/ (home GPFS working copy, incl. recent*.pt and the truncated recent.pt.tmp)",
+      "raven:/u/yinxu/work/vagus/runs/lax1-340M-fwe15B-c9af2f44/ (home GPFS working copy, 46 GB incl. recent*.pt)",
       "mbp:assets/2-areas/vagus/runs/cmp/lax1/ (tb + config/meta only)"
     ]
   }

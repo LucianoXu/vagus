@@ -1,0 +1,43 @@
+{
+  "run": {
+    "name": "hax1-340M-fwe15B-1ab072f4",
+    "purpose": "HAX1 = the hybrid-attention series opener and the first multi-node run: intra-layer (parallel) softmax + KDA hybrid blocks at 8 of 24 layers (1:2), NoPE softmax branches, pure KDA (LAX1's mixer) elsewhere. Third member of the batch-paired 340M trio SAX2 (softmax) / LAX1 (linear) / HAX1 (hybrid): same data, token budget, global batch, seed, optimizer recipe and WSD schedule, so the delta is the mixing strategy alone.",
+    "code_commit": "1ab072f4",
+    "created": "2026-09-09T00:09:16+02:00",
+    "finished": "2026-09-09T13:53:54+02:00",
+    "elapsed": "13:46:08 (single job, no walltime event)",
+    "slurm_jobs": {
+      "completed": 30084326
+    },
+    "hardware": "2 nodes x 4x A100-SXM4-40GB (MPCDF Raven, partition gpu), HSDP: FSDP2 shard inside the node (shard_size 4), replicate across nodes; NCCL over IB with GPU Direct RDMA",
+    "torch": "2.13.0+cu130",
+    "kernels": "fla-core 0.5.2 (chunk_kda, chunk_size 64), SDPA for the softmax branches; regional torch.compile of the blocks; DCP checkpoints"
+  },
+  "recipe": "recipe/train/hax1_340M_fwe15B.yaml + recipe/model/hax1_340M.yaml at the commit (the model recipe later gained chunk_size 32 / la_fused gate / la_conv_impl shift — this run predates them; the args below are the run's meta.json). Model: 24 x 1024, tied embedding, FFN 2816; layer_kinds = parallel at 0-indexed layers 4, 6, 9, 11, 14, 16, 19, 21, gdn elsewhere. Parallel block: half-width (512) softmax branch (8 heads x 64, qk-norm, NoPE) beside a half-width KDA branch (2 heads x (128 x 256)), each RMSNormed, concatenated, one shared 1024 x 1024 output projection. Pure layers: LAX1's KDA (4 heads x (128 x 256), vector gate rank 64, delta rule, conv 4). 343.6M params (LAX1 343.8M, SAX1 341.1M). Training: world 8 = 2 x 4, micro 8 x accum 4 = 0.5M global batch (same global window set per step as the 4-GPU runs), fsdp_param_dtype bf16 / reduce fp32 / no reshard after forward; Muon polar-express + AdamW, shared lr 1.75e-3 (rms adjust), WSD warmup 0.01 / decay 0.15 / floor 0, z-loss 1e-4, wd 0.1, clip 1.0, liger CE. lr inherited from the SAX1 law and the LAX1 pilot ladder; no HAX1 pilot was run.",
+  "data": "same store as the sax/lax runs (fineweb-edu-100BT-mistral32k, 140 shards, 110.8B tokens, home-GPFS layout); identical batch sequence by construction",
+  "results": {
+    "steps": 28610,
+    "tokens_seen": 14999879680,
+    "final_loss": 2.3906,
+    "final_loss_ema": 2.3872,
+    "loss_tail5": 2.3827,
+    "loss_ce_tail5": 2.382,
+    "loss_z_final": 0.0008,
+    "median_tokens_per_s": 315532,
+    "mfu_median": 0.283,
+    "mfu_note": "MFU under the eb59813 accounting (chunkwise-algorithm FLOPs counted for the linear layers). Throughput 0.316 Mtok/s on 8 GPUs = 0.039 Mtok/s per GPU, the same per-GPU rate as LAX1's 0.038 on 4 — the cross-node reduce is fully hidden, and the hybrid's two half-width kernels per parallel block cost about what a full KDA layer does. 13.8 h wall for 15B vs LAX1's 28.9 h on one node.",
+    "max_mem_gb": 23.6,
+    "verdict": "loss_ce 2.3820: -0.0136 nat vs paired LAX1 (pure KDA, 2.3956) and -0.0333 vs paired SAX2 (softmax, 2.4153) — the trio orders hybrid < linear < softmax on LM loss at 340M/15B. The HAX1-LAX1 gap was largest early (-0.028 at step 1k) and settled to -0.014 to -0.017 over the stable phase (step 4k: 2.7168 vs 2.7334; 10k: 2.6028 vs 2.6200; 20k: 2.5494 vs 2.5640; decay start 24318: 2.5405 vs 2.5544); cooldown cliff 0.159, same as LAX1's 0.159 and SAX2's 0.164. As the recipe header anticipated, LM loss is not where hybrid vs linear is decided — the recall probe is; not measured here.",
+    "health": "zero instability events across 28,610 steps under HSDP: gnorm max 0.36 post-warmup (median 0.11, clip 1.0 never fired), z-term 0.0008 final. Softmax branches: attn_logit_max rose 7.6 -> ~26, capped by qk-norm (SAX runs: ~25-27). KDA gates: beta_mean 0.40 -> 0.79-0.83 by mid-run, alpha_mean 0.74-0.80, mem_len median (probe, 1/(1-mean alpha)) fell from 12 to 6.2-6.5 tokens over training — shorter than LAX1's 9-11, consistent with the softmax branches taking over the long-range share; state_rms_max peak 0.35, 0.17 after decay. pnorm/embedding equilibrated ~475-483 at constant lr (the wd-0.1 equilibrium shared by SAX2/LAX1) and fell to 435 in the decay.",
+    "trunk_asset": "stable-phase full-state ckpts 05000/10000/15000/20000 (decay began at step 24318; DCP layout, resumes only on 8 ranks — the loader fingerprint includes world_size) — cooldown-branch trunk, paired with SAX2/LAX1's at the same steps"
+  },
+  "decision_note": "HAX1 is the hybrid anchor of the 340M coordinate. The 0.014 nat over pure KDA buys 8 half-width softmax branches (the attention FLOPs and KV cache of 4 full layers). Next: the recall probe across the trio (MQAR-style / RULER-lite) before any claim about the hybrid's value; the model-recipe kernel path (chunk_size 32 / fused gate / shift conv, +11% throughput on the smoke) applies to the next HAX run, not this one.",
+  "archive": {
+    "primary": "selene:/data/vagus/runs/hax1-340M-fwe15B-1ab072f4/  (SHA256SUMS inside; 19 GB, pushed from raven 2026-09-09 14:54-15:08, sha256sum -c verified 12/12)",
+    "contents": "ckpt-{05000,10000,15000,20000,25000,28610}.pt (full training state, DCP), model-final.pt (slim weights+args), tb/, config.yaml, meta.json, slurm logs (30084326)",
+    "transient": [
+      "raven:/u/yinxu/work/vagus/runs/hax1-340M-fwe15B-1ab072f4/ (home GPFS working copy, 48 GB incl. recent*.pt)",
+      "mbp:assets/2-areas/vagus/runs/cmp/hax1/ (tb + config/meta only)"
+    ]
+  }
+}
