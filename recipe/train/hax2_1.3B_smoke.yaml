@@ -1,0 +1,64 @@
+# HAX2-1.3B smoke — the fwe60B recipe cut to 30 steps (65M tokens): the
+# launch gate for the 60B run, on the real 3-node layout. It answers:
+# 12-rank HSDP (replicate 3 x shard 4) comes up, NCCL on IB, memory at
+# micro 4 x ctx 4096 under FSDP2 (max_mem_gb; if it OOMs the second
+# submission below runs micro 2 x accum 22 at the same global batch),
+# steady tokens_per_s / mfu, and the final checkpoint gather + slim
+# export at 1.3B. Submit both at once (3-node queue waits are long):
+#   sbatch -J hax2smoke4 -t 00:40:00 recipe/slurm/raven_hax2_1.3B.sbatch \
+#     recipe/train/hax2_1.3B_smoke.yaml
+#   sbatch -J hax2smoke2 -t 00:40:00 recipe/slurm/raven_hax2_1.3B.sbatch \
+#     recipe/train/hax2_1.3B_smoke.yaml batch_size=2 grad_accum_steps=22 run_name=hax2-1.3B-smoke-m2
+# Not an experiment: no registry entry, delete the run dirs afterwards.
+
+run_name: hax2-1.3B-smoke
+model_recipe: ../model/hax2_1.3B.yaml
+
+data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+data_shards: null          # all 140 shards (110.8B tokens); 60B => 0.54 epoch
+
+context_len: 4096
+world_size: 12             # 3 nodes x 4 A100
+shard_size: 4              # HSDP: shard inside the node, replicate across
+fsdp_param_dtype: bfloat16
+fsdp_reduce_dtype: float32
+fsdp_reshard_after_forward: false
+batch_size: 4              # per-rank micro-batch (the smoke decides 4 vs 2; 2 x 22 keeps the global batch)
+grad_accum_steps: 11
+global_batch_tokens: 2162688
+train_tokens: 64_880_640        # 30 steps
+seed: 42
+
+optimizer_name: muon
+optimizer_args:
+  lr: 2.25e-3
+  momentum: 0.95
+  weight_decay: 0.1
+  lr_adjust: rms
+  ns_coeffs: polar_express
+  adamw:
+    lr: 2.25e-3
+    betas: [0.9, 0.95]
+    weight_decay: 0.1
+
+schedule_name: wsd
+schedule_args:
+  warmup: 0.5                  # 15 warmup steps; the loss curve is not the point
+  decay: 0.20              # linear cooldown over the last 12B tokens
+  min_ratio: 0.0
+
+grad_clip: 1.0
+z_loss: 1e-4
+ce_impl: liger
+
+device: auto
+dtype: bfloat16
+compile: true
+tf32: true
+
+out_root: runs
+log_interval: 5
+slow_interval: 10
+permanent_ckpt_interval: null
+recent_ckpt_minutes: 1000
+peak_tflops: 312           # A100 bf16 dense; only feeds the MFU metric

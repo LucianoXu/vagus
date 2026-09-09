@@ -1,0 +1,84 @@
+# HAX2-1.3B on FineWeb-Edu, 60B tokens (~46 tokens/param, 0.54 of the
+# 110.8B store) — the arsenal's first 1.3B run. 3 nodes x 4 A100 under
+# HSDP (shard 4 inside the node, replicate across the 3 nodes). No
+# pilots by decision (2026-09-09); the launch gate is the 30-step smoke
+# (hax2_1.3B_smoke.yaml): 12-rank HSDP, memory at micro 4 x ctx 4096,
+# throughput, the DCP checkpoint gather at 1.3B.
+#
+# Batch: 12 ranks x micro 4 x accum 11 x 4096 = 2,162,688 tokens/step
+# (~2.06M; 2M exactly does not divide over 12 GPUs), 27,743 steps.
+# DeepSeek's B_opt fit puts the optimal batch above 5M at this compute,
+# so 2.1M sits on the safe side; the step count stays near the 340M
+# runs' 28,610 so the checkpoint cadence carries over.
+#
+# lr: the SAX1 fitted law
+#     adam_lr = 0.087571 * tokens^-0.3461 * hidden^-0.3448 * sqrt(tpb)
+# at (60e9, 2048, 2,162,688) gives 1.73e-3 (check: 100B / 0.5M -> 7.1e-4
+# as recorded 2026-08-30). Raised x1.3 to 2.25e-3 by decision: every
+# 15B run at the law's value never fired the clip (gnorm median 0.10),
+# and the 1B ladders were stable to 3e-3 (consistent with the law's own
+# 1B prediction of 4.5e-3, so this is headroom, not evidence the law is
+# low — hence x1.3, not x2). Under Muon's rms adjust the AdamW group
+# shares the value. Warmup 2% (= 555 steps; 1% would be 277 steps at a
+# 2.25e-3 plateau start). WSD: flat, then a linear cooldown over the
+# last 20% (12B tokens) — up from the 340M runs' 15% (SAX2's note: a
+# longer decay likely recovers part of WSD's 0.015 nat vs linear).
+#
+# Everything else is HAX1's: z-loss 1e-4, wd 0.1, clip 1.0, liger CE,
+# bf16 FSDP compute / fp32 reduce, no reshard after forward.
+#
+# Expected: ~0.19 Mtok/s on 12 GPUs at MFU ~0.3 (1.3B is ~4x the 340M
+# FLOPs/token) -> ~3.7-4.8 days, 3-4 walltime resumes (sbatch wait bug
+# fixed in 32b146a). The recall probe on the 340M trio runs meanwhile.
+
+run_name: hax2-1.3B-fwe60B
+model_recipe: ../model/hax2_1.3B.yaml
+
+data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+data_shards: null          # all 140 shards (110.8B tokens); 60B => 0.54 epoch
+
+context_len: 4096
+world_size: 12             # 3 nodes x 4 A100
+shard_size: 4              # HSDP: shard inside the node, replicate across
+fsdp_param_dtype: bfloat16
+fsdp_reduce_dtype: float32
+fsdp_reshard_after_forward: false
+batch_size: 4              # per-rank micro-batch (the smoke decides 4 vs 2; 2 x 22 keeps the global batch)
+grad_accum_steps: 11
+global_batch_tokens: 2162688
+train_tokens: 60_000_000_000
+seed: 42
+
+optimizer_name: muon
+optimizer_args:
+  lr: 2.25e-3
+  momentum: 0.95
+  weight_decay: 0.1
+  lr_adjust: rms
+  ns_coeffs: polar_express
+  adamw:
+    lr: 2.25e-3
+    betas: [0.9, 0.95]
+    weight_decay: 0.1
+
+schedule_name: wsd
+schedule_args:
+  warmup: 0.02             # 1.2B tokens, 555 steps
+  decay: 0.20              # linear cooldown over the last 12B tokens
+  min_ratio: 0.0
+
+grad_clip: 1.0
+z_loss: 1e-4
+ce_impl: liger
+
+device: auto
+dtype: bfloat16
+compile: true
+tf32: true
+
+out_root: runs
+log_interval: 10
+slow_interval: 100
+permanent_ckpt_interval: 5000
+recent_ckpt_minutes: 30
+peak_tflops: 312           # A100 bf16 dense; only feeds the MFU metric

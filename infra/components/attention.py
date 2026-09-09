@@ -40,6 +40,15 @@ class SoftmaxAttention(nn.Module, Mixer):
     drops wo and returns the head concat of width out_width =
     dim * v_dim_mult, for a caller that owns the output projection.
 
+    out_gate: gated attention (arXiv:2505.06708, Qwen3-Next) — the SDPA
+    output is multiplied elementwise by sigmoid(W_g x) (W_g: in_dim x
+    out_width, N(0, init_std)) before wo / before being returned to the
+    caller. A query-dependent, per-channel gate on what the head concat
+    contributes to the residual; the paper's reading is that it removes
+    the attention-sink pathway and the massive activations that go with
+    it, for a small loss gain and higher lr tolerance. Costs in_dim x
+    out_width params.
+
     torch.compile: forward compiles as-is. For decode_step, cache_len is a
     python int attribute that changes every step, and dynamo specializes
     module ints — a plain torch.compile(attn.decode_step) recompiles per
@@ -71,6 +80,7 @@ class SoftmaxAttention(nn.Module, Mixer):
             layer_count: int | None = None,
             in_dim: int | None = None,
             out_proj: bool = True,
+            out_gate: bool = False,
         ):
         super().__init__()
 
@@ -85,6 +95,7 @@ class SoftmaxAttention(nn.Module, Mixer):
         self.dim = dim
         self.in_dim = in_dim or dim
         self.out_proj = out_proj
+        self.out_gate = out_gate
         self.out_width = dim * v_dim_mult
         self.v_dim_mult = v_dim_mult
         self.head_count = head_count
@@ -122,6 +133,9 @@ class SoftmaxAttention(nn.Module, Mixer):
                 bias = False
             )
 
+        if self.out_gate:
+            self.wg = nn.Linear(self.in_dim, self.out_width, bias=False)
+
         if self.short_conv_size is not None:
             self.conv_q = ShortConv(self.dim, self.short_conv_size)
             self.conv_k = ShortConv(Dh * self.kv_head_count, self.short_conv_size)
@@ -137,6 +151,8 @@ class SoftmaxAttention(nn.Module, Mixer):
         # stream keeps O(1) variance at init regardless of depth
         for lin in (self.wq, self.wk, self.wv):
             nn.init.normal_(lin.weight, std=init_std)
+        if self.out_gate:
+            nn.init.normal_(self.wg.weight, std=init_std)
         if self.out_proj:
             wo_std = init_std / math.sqrt(2 * layer_count) if layer_count else init_std
             nn.init.normal_(self.wo.weight, std=wo_std)
@@ -188,6 +204,8 @@ class SoftmaxAttention(nn.Module, Mixer):
 
         out = out.transpose(1, 2).reshape(B, L, -1)   # (B, H, L, Dvh) -> (B, L, dim*v_dim_mult)
 
+        if self.out_gate:
+            out = out * torch.sigmoid(self.wg(x))      # gated attention
         if not self.out_proj:
             return out
         x = self.wo(out)   # (B, L, dim*v_dim_mult) -> (B, L, dim)
@@ -354,6 +372,8 @@ class SoftmaxAttention(nn.Module, Mixer):
 
         out = out.transpose(1, 2).reshape(B, L, -1)   # (B, H, L, Dvh) -> (B, L, dim*v_dim_mult)
 
+        if self.out_gate:
+            out = out * torch.sigmoid(self.wg(x))      # gated attention
         if not self.out_proj:
             return out
         x = self.wo(out)   # (B, L, dim*v_dim_mult) -> (B, L, dim)

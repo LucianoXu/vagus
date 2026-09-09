@@ -56,6 +56,7 @@ class GDNLM(nn.Module, Decodable):
             layer_kinds: list[str] | None = None,
             softmax_head_dim: int = 64,
             softmax_rope: bool = True,
+            softmax_out_gate: bool = False,
             parallel_width: int | None = None,
             context_len: int = 2048,
             rope_base: float = 10000,
@@ -76,7 +77,7 @@ class GDNLM(nn.Module, Decodable):
             gate_lower_bound=gate_lower_bound,
             layer_pattern=layer_pattern, layer_kinds=layer_kinds,
             softmax_head_dim=softmax_head_dim, softmax_rope=softmax_rope,
-            parallel_width=parallel_width,
+            softmax_out_gate=softmax_out_gate, parallel_width=parallel_width,
             context_len=context_len, rope_base=rope_base, rmsnorm_eps=rmsnorm_eps,
             tie_embedding=tie_embedding, gate_proj_optimizer=gate_proj_optimizer,
         )
@@ -121,7 +122,8 @@ class GDNLM(nn.Module, Decodable):
             return SoftmaxAttention(
                 dim=width, head_count=width // softmax_head_dim, kv_head_count=None,
                 v_dim_mult=1, short_conv_size=None, qk_norm=True, rope=self.rope,
-                init_std=0.02, layer_count=layer_count, in_dim=dim, out_proj=out_proj)
+                init_std=0.02, layer_count=layer_count, in_dim=dim, out_proj=out_proj,
+                out_gate=softmax_out_gate)
 
         def mixer(kind: str) -> Mixer:
             if kind == 'gdn':

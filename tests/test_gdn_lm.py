@@ -191,3 +191,18 @@ def test_parallel_metrics_flops_and_groups():
     assert sum(len(g['params']) for g in opt.param_groups) == sum(1 for _ in m.parameters())
     m2 = type(m).from_config(m.config)
     assert m2.kinds == m.kinds and [p.shape for p in m2.parameters()] == [p.shape for p in m.parameters()]
+
+
+@pytest.mark.parametrize('pattern', ['gdn,softmax', 'gdn,parallel'])
+def test_softmax_out_gate(pattern):
+    m = build(layer_pattern=pattern, softmax_out_gate=True, softmax_head_dim=16)
+    att = m.blocks[1].att if pattern == 'gdn,softmax' else m.blocks[1].att.att
+    assert att.out_gate and att.wg.weight.shape == (att.out_width, att.in_dim)
+    assert any(p is att.wg.weight for p in m.param_groups()['muon'])
+    ids = torch.randint(2, 101, (2, 7))
+    ref = m(ids)
+    m.reset_cache(2, 64)
+    out = torch.cat([m.decode_step(ids[:, :4]), m.decode_step(ids[:, 4:])], dim=1)
+    assert torch.allclose(out, ref, atol=1e-5)
+    m0 = build(layer_pattern=pattern, softmax_head_dim=16)
+    assert sum(p.numel() for p in m.parameters()) > sum(p.numel() for p in m0.parameters())

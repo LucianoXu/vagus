@@ -1,0 +1,69 @@
+# HAX2-1.3B — second HAX generation and the first 1.3B model of the
+# arsenal. Designed 2026-09-09 from the 340M trio (SAX2 2.4153 / LAX1
+# 2.3956 / HAX1 2.3820 loss_ce at 15B): HAX1's architecture scaled to the
+# 1.3B coordinate (24 x 2048, FFN 5632, tied 32k embedding — the flame /
+# Mamba Table 12 "1.3B"), plus one architectural delta: a sigmoid output
+# gate on every softmax branch (gated attention, arXiv:2505.06708 /
+# Qwen3-Next). No 1.3B pilots by decision; the lr comes from the fitted
+# law (see the train recipe).
+#
+# Scaling rule: keep the head SHAPES the 340M runs and the fla kernels
+# were validated on, add heads.
+#   pure KDA layers   8 heads x (dk 128, dv 256): q/k 2048 -> 1024,
+#                     v/gate 2048 -> 2048 (LAX1 had 4 such heads)
+#   parallel layers   1:1 width split at 1024 per branch:
+#     softmax branch  8 heads x 128 (softmax_head_dim 128 — the 1.3B
+#                     standard; 340M used 64), NoPE, qk-norm, output
+#                     gate (new; 2048 x 1024 per parallel layer)
+#     KDA branch      4 heads x (128 x 256), q/k 2048 -> 512,
+#                     v/gate 2048 -> 1024
+#     shared wo       2048 x 2048
+#   placement         unchanged from HAX1 — depth is the same 24, so the
+#                     Meta / Jet-Nemotron placement evidence (middle 75%
+#                     of depth, none in the first four, none in the last
+#                     two) maps onto the same indices 4,6,9,11,14,16,19,21
+#   gate_rank         64, as at 340M (a d -> 64 -> H*dk bottleneck; the
+#                     relative capacity halves with d; untested lever)
+#
+# Considered and NOT taken (2026-09-09):
+#   residual-stream gate (x + g(x) * f(x)): both branches already carry
+#     an output gate (KDA's SiLU gate, the new softmax sigmoid gate) —
+#     that IS a gate on each branch's residual update — and the FFN is
+#     SwiGLU; a second gate is redundant.
+#   hyper-connections / mHC (arXiv:2409.19606, DeepSeek 2026-01): widens
+#     the residual stream with learned mixing; real reported gains at
+#     1.6B+, but untested in this stack (FSDP sharding, compile graphs,
+#     Muon grouping, n x residual activation memory). Not going into a
+#     60B-token run blind: HAX3's single variable, paired at 340M first.
+#   untied embedding / 8k context: leave the coordinate; 8k is HAX-L.
+
+model_name: GDNLM
+model_args:
+  vocab_size: 32000        # mistral32k tokenizer
+  dim: 2048
+  layer_count: 24
+  head_count: 8            # pure KDA layers: 8 heads x (128 x 256)
+  key_head_dim: 128
+  value_head_dim: 256
+  ffn_hidden_dim: 5632     # llama SwiGLU sizing: 8/3 * 2048 -> multiple of 256
+  short_conv_size: 4
+  gate: vector             # KDA: per-channel forget gate
+  gate_rank: 64
+  delta: true
+  chunk_size: 32           # kernel path as measured on the HAX1 model recipe (+12%)
+  la_impl: auto
+  la_fused: gate
+  la_conv_impl: shift
+  # 0-indexed parallel blocks at 4, 6, 9, 11, 14, 16, 19, 21 (1:2)
+  layer_kinds: [gdn, gdn, gdn, gdn, parallel, gdn, parallel, gdn,
+                gdn, parallel, gdn, parallel, gdn, gdn, parallel, gdn,
+                parallel, gdn, gdn, parallel, gdn, parallel, gdn, gdn]
+  parallel_width: 1024     # 1:1 split of dim between the two branches
+  softmax_head_dim: 128    # softmax branch: 8 heads x 128
+  softmax_rope: false      # NoPE global attention
+  softmax_out_gate: true   # gated attention on the softmax branches (the HAX2 delta)
+  context_len: 4096        # unused under NoPE (no positional limit)
+  rope_base: 10000         # unused under NoPE
+  rmsnorm_eps: 1.0e-6
+  tie_embedding: true
+  gate_proj_optimizer: adamw   # the low-rank gate / beta matrices train under AdamW
