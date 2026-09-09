@@ -86,14 +86,22 @@ GATES = ('none', 'scalar', 'vector')
 #                 happen in one pass. Removes an fp32 (B, L, H, dk)
 #                 tensor and the separate chunk_local_cumsum over it —
 #                 work inductor cannot remove, because the tensor exists
-#                 only to be handed to an opaque kernel.
-#     'beta'      the sigmoid moves into the same kernel. Small.
+#                 only to be handed to an opaque kernel. The one stage
+#                 that pays: -1.34 GB (5.7%) of peak at no cost in
+#                 speed, twice over.
+#     'beta'      the sigmoid moves into the same kernel. Small, and
+#                 measured neutral (160.0k tokens/s against 160-161k).
 #     'l2norm'    fla's use_qk_l2norm_in_kernel is a *separate*
 #                 l2norm_fwd launch, not a fusion into the chunk kernel.
 #                 Inductor fuses our l2norm into the SiLU that precedes
-#                 it, so this trades a fused kernel for a standalone one.
+#                 it, so this trades a fused kernel for a standalone one:
+#                 neutral (160.1k).
 #     'norm_gate' likewise: RMSNorm x SiLU is one inductor kernel
-#                 already.
+#                 already. Neutral (161.2k).
+# Combinations are worse than their parts — every spec containing 'conv'
+# lands at 142-152k against 160-161k without it, and the full set at
+# 135.8k — because each custom autograd Function is another break in a
+# graph inductor was fusing across.
 # 'scan' is the shorthand for the three the scan kernel accepts.
 FUSIONS = ('conv', 'l2norm', 'gate', 'beta', 'norm_gate')
 _ALIASES = {'scan': ('l2norm', 'gate', 'beta'), 'all': FUSIONS}

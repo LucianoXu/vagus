@@ -37,6 +37,12 @@
 # So FSDP costs nothing here; the ~0.28 MFU vs SAX2's 0.535 is the KDA
 # kernels' time per FLOP and the two half-width kernels of a parallel
 # block (see the session record). Expected: 15B in ~13.5 h.
+#
+# Kernel path (2026-09-09, after the model recipe's chunk_size 32 /
+# la_fused gate / la_conv_impl shift): 0.288 -> 0.321 MFU on the same
+# one-node smoke, 24.76 GB instead of 23.59, so ~11.9 h for the 15B run.
+# The first 15B run (job 30084326) predates it and keeps the old path;
+# the numbers above are that run's.
 
 run_name: hax1-340M-fwe15B
 model_recipe: ../model/hax1_340M.yaml

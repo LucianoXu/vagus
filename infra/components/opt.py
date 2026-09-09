@@ -34,6 +34,11 @@ class ShortConv(nn.Module):
                 once, but the shifted reads are adjacent and stay in
                 cache. Meant for the compiled path; in eager the K pads
                 are real copies.
+                Measured on HAX1-340M, 4 x A100, compiled, interleaved
+                with its control: 176.1k / 177.2k tokens/s against
+                160.9k / 160.1k, i.e. MFU 0.317 against 0.288 — and
+                +2.7 GB of peak memory, because the fused kernel keeps
+                x for the backward instead of the padded copy.
       'fla'     fla's causal_conv1d Triton kernel, which reads
                 (B, L, D) directly and folds the activation in. Needs
                 CUDA + half precision + an `activation`. Measured slower

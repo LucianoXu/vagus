@@ -69,8 +69,32 @@ model_args:
   gate: vector             # KDA: per-channel forget gate
   gate_rank: 64
   delta: true
-  chunk_size: 64
+  # Kernel path, measured on 4 x A100 against this recipe compiled and
+  # sharded, each value interleaved with its control (2026-09-09):
+  # 161.2k / 159.9k tokens/s at MFU 0.288 and 23.59 GB before,
+  # 180.3k / 180.2k at MFU 0.321 and 24.76 GB after — +12.3%, so ~11.9 h
+  # for the 15B run instead of ~13.4 h. The three are independent:
+  #   chunk_size 32   +1.9% and -0.17 GB (163.4/164.6/163.1k against
+  #                   161.1/160.0/161.0k). Note this knob did nothing at
+  #                   all before the fix in this branch: fla_scan never
+  #                   passed it to the kernels, which always ran fla's
+  #                   default 64.
+  #   la_fused gate   the KDA decay's activation and its chunk cumsum
+  #                   inside the kernel: -1.34 GB at no cost in speed.
+  #                   The other four fusion stages are neutral or worse
+  #                   under torch.compile — see the FUSIONS note in
+  #                   components/linear_attention.py.
+  #   la_conv_impl    the short conv as K shifted multiply-adds instead
+  #     shift         of a cuDNN depthwise call over a padded copy:
+  #                   +10.3% on its own (it was the largest non-GEMM
+  #                   item in the profile), +2.7 GB.
+  # A run started before this commit keeps the old path; resuming one
+  # across it needs run_dir= anyway, and the arithmetic changes (same
+  # function, different accumulation order).
+  chunk_size: 32
   la_impl: auto            # fla kernels on cuda/bf16, torch chunk reference elsewhere
+  la_fused: gate
+  la_conv_impl: shift
   # 0-indexed parallel blocks at 4, 6, 9, 11, 14, 16, 19, 21 (1:2)
   layer_kinds: [gdn, gdn, gdn, gdn, parallel, gdn, parallel, gdn,
                 gdn, parallel, gdn, parallel, gdn, gdn, parallel, gdn,
