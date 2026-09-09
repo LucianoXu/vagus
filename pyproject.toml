@@ -47,6 +47,7 @@ dev = [
 
 [project.scripts]
 vagus-train = "infra.train.main:main"
+vagus-eval = "infra.eval.main:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["infra"]

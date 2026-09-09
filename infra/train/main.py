@@ -28,7 +28,6 @@
 import argparse
 import json
 import os
-import re
 import signal
 import time
 from contextlib import contextmanager, nullcontext
@@ -51,6 +50,7 @@ from torch.distributed.tensor import DTensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from ..components.losses import make_ce
+from ..config import apply_overrides, load_yaml
 from ..dataset.loader import TokenStore, WindowLoader
 from ..models import build_model
 from ..models.io import export_slim
@@ -63,22 +63,6 @@ from .schedule import build_schedule
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-
-# YAML 1.1 parses `1e-4` (no dot) as a *string*; with args now passed
-# through as plain dicts there is no dataclass layer to coerce it back.
-# Register the full float form as an implicit resolver once, globally.
-_FLOAT_RE = re.compile(r'''^[-+]?(
-    (\d+(\.\d*)?|\.\d+)([eE][-+]?\d+)? | \d+[eE][-+]?\d+
-    )$''', re.X)
-
-
-class _YamlLoader(yaml.SafeLoader):
-    pass
-
-
-_YamlLoader.add_implicit_resolver(
-    'tag:yaml.org,2002:float', _FLOAT_RE, list('-+0123456789.'))
-
 
 _DTYPES = {'bfloat16': torch.bfloat16, 'float16': torch.float16,
            'float32': torch.float32}
@@ -182,27 +166,16 @@ class TrainConfig:
         (`model_args.la_fused=true`), which is how a kernel-path A/B runs
         off a single model recipe.'''
         path = Path(path)
-        raw = yaml.load(open(path, encoding='utf-8'), _YamlLoader) or {}
+        raw = load_yaml(path)
         if 'model_recipe' in raw:
             mpath = (path.parent / raw.pop('model_recipe')).resolve()
-            model = yaml.load(open(mpath, encoding='utf-8'), _YamlLoader) or {}
+            model = load_yaml(mpath)
             if not set(model) <= {'model_name', 'model_args'}:
                 raise ValueError(f'{mpath} is not a pure model recipe')
             if set(model) & set(raw):
                 raise ValueError('model defined in both train and model recipe')
             raw |= model
-        for item in overrides:
-            key, sep, value = item.partition('=')
-            if not sep or not key:
-                raise ValueError(f'override {item!r} is not key=value')
-            outer, dot, inner = key.partition('.')
-            if not dot:
-                raw[key] = yaml.load(value, _YamlLoader)
-                continue
-            if not isinstance(raw.get(outer), dict):
-                raise ValueError(f'override {item!r}: {outer} is not a dict field')
-            raw[outer] = dict(raw[outer]) | {inner: yaml.load(value, _YamlLoader)}
-        return cls(**raw)   # unknown keys -> loud TypeError
+        return cls(**apply_overrides(raw, overrides))   # unknown keys -> loud TypeError
 
 
 # ---------------------------------------------------------------------------

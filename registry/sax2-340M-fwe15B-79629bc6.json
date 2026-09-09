@@ -33,5 +33,8 @@
     "transient": [
       "raven:/u/yinxu/work/vagus/runs/sax2-340M-fwe15B-79629bc6/ (home GPFS working copy, incl. recent*.pt)"
     ]
-  }
+  },
+  "evals": [
+    "registry/eval/trio-340M-f97202d6.json (2026-09-09: holdout nll/entropy/rep@l at 2048/4096, degeneration rep-4, MQAR recall; SAX2 reference)"
+  ]
 }

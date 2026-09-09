@@ -72,11 +72,13 @@ class Generator:
     @classmethod
     def from_checkpoint(cls, path: 'str | Path', device: 'str | torch.device' = 'cpu',
                         dtype: 'str | torch.dtype | None' = None,
-                        tokenizer_id: str | None = None) -> 'Generator':
+                        tokenizer_id: str | None = None, with_meta: bool = False):
         '''Model, tokenizer and stream conventions from one checkpoint.
         The tokenizer id comes from the checkpoint (written by the training
         loop); tokenizer_id overrides it, and is required for checkpoints
-        that predate the field.'''
+        that predate the field. with_meta also returns load_model's meta
+        (model_name/args, tokenizer, step, tokens_seen, format) — what an
+        evaluation records about its subject.'''
         from ..models.io import load_model
         from .. import tokenizers
         model, meta = load_model(path, device=device, dtype=dtype)
@@ -85,7 +87,8 @@ class Generator:
                 raise ValueError(f'{path} records no tokenizer; pass tokenizer_id=')
             tokenizer_id = meta['tokenizer']['id']
         start_id, stop_ids = tokenizers.stream_conventions(tokenizer_id)
-        return cls(model, tokenizers.load(tokenizer_id), start_id=start_id, stop_ids=stop_ids)
+        gen = cls(model, tokenizers.load(tokenizer_id), start_id=start_id, stop_ids=stop_ids)
+        return (gen, meta) if with_meta else gen
 
     # --- state -------------------------------------------------------
 
@@ -160,6 +163,32 @@ class Generator:
         block = ids[:, :-1] if self.pending is None else torch.cat([self.pending[:, None], ids[:, :-1]], dim=1)
         self._feed(block, want_logits=False)
         self.pending = ids[:, -1].clone()
+
+    # --- scoring -----------------------------------------------------
+
+    @torch.no_grad()
+    def score_ids(self, ids: torch.Tensor) -> torch.Tensor:
+        '''Teacher-forced logits over fresh streams: ids (B, L) int64 ->
+        logits (B, T, vocab) where logits[:, t] is the model's prediction
+        of ids[:, -T + t] given the stream before it. T == L when the
+        stream has a start_id (every token is predicted), L - 1 without
+        one (the first token has no context). The streams are left in the
+        same state prefill_ids would have left them, so scoring can be
+        followed by generation.
+
+        This is the decode path (reset + one prefill block), not
+        model.forward(): evaluation then needs nothing of a model beyond
+        the Decodable protocol, and the two are bit-identical anyway.'''
+        assert ids.dim() == 2 and ids.shape[1] >= 1, 'ids must be (B, L) with L >= 1'
+        ids = ids.to(self.device, dtype=torch.int64)
+        B, L = ids.shape
+        self.reset(B, max_len=L)
+        block = ids[:, :-1] if self.pending is None else torch.cat([self.pending[:, None], ids[:, :-1]], dim=1)
+        out = self.model.decode_step(block, return_logits=True)
+        self.fed_len += block.shape[1]
+        self.pending = ids[:, -1].clone()
+        assert out is not None
+        return out
 
     # --- generation --------------------------------------------------
 

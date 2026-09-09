@@ -38,7 +38,11 @@
     "contents": "ckpt-{05000,10000,15000,20000,25000,28610}.pt (full training state), model-final.pt (slim weights+args), tb/, config.yaml, meta.json, slurm logs (30073697 + 30083857)",
     "transient": [
       "raven:/u/yinxu/work/vagus/runs/lax1-340M-fwe15B-c9af2f44/ (home GPFS working copy, 46 GB incl. recent*.pt)",
-      "mbp:assets/2-areas/vagus/runs/cmp/lax1/ (tb + config/meta only)"
+      "mbp:assets/2-areas/vagus/runs/cmp/lax1/ (tb + config/meta only)",
+      "mbp:assets/2-areas/vagus/runs/gen-eval/lax1-model-final.pt (slim weights, pulled from selene 2026-09-09, sha256 matches the archive manifest)"
     ]
-  }
+  },
+  "evals": [
+    "registry/eval/trio-340M-f97202d6.json (2026-09-09: holdout nll/entropy/rep@l at 2048/4096, degeneration rep-4, MQAR recall; SAX2 reference)"
+  ]
 }

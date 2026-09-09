@@ -1,0 +1,58 @@
+# The batch-paired 340M trio — SAX2 (softmax) / LAX1 (KDA) / HAX1
+# (hybrid), same data, tokens, batch sequence and recipe — on the three
+# v1 tasks. SAX2 is the reference of the paired statistics.
+#
+# Data: the local slice of the training store (20 shards, 16.7B tokens);
+# the 15B runs saw 0.135 expected views of any window of the 140-shard
+# store, so these samples are, for practical purposes, unseen text — the
+# exposure figure is written into every task's witness.
+#
+# Lengths: 2048 is the trained context; 4096 is extrapolation, which
+# SAX2 (RoPE, max_stream_len 2048) cannot stream and skips, while LAX1
+# and HAX1 (no positional limit) run — the holdout and recall cells at
+# 4096 are the NoPE / linear extrapolation reading.
+#
+# The subjects are local slim copies (runs/gen-eval/); the archived
+# originals and their sha256 are in registry/{sax2,lax1,hax1}-*.json.
+
+eval_name: trio-340M
+subjects:
+  - {ckpt: runs/gen-eval/sax2-model-final.pt, label: SAX2, tokenizer_id: mistral32k}
+  - {ckpt: runs/gen-eval/lax1-model-final.pt, label: LAX1, run_meta: runs/cmp/lax1/meta.json}
+  - {ckpt: runs/gen-eval/hax1-model-final.pt, label: HAX1, run_meta: runs/cmp/hax1/meta.json}
+
+device: auto
+dtype: bfloat16
+seed: 0
+
+tasks:
+  - name: holdout
+    args:
+      data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+      n_seq: 128
+      context_len: [2048, 4096]
+      batch_size: 2
+      metrics: [nll, entropy, top_p_support, rep_at_l]
+      top_p: 0.9
+      rep_l: [32, 128]
+  - name: degeneration
+    args:
+      data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+      n_prompts: 32
+      prompt_tokens: 32
+      new_tokens: 96
+      seeds: 5
+      sampling: {temperature: 0.8, top_p: 0.9}
+      greedy: true
+      batch_size: 32
+  - name: recall_probe
+    args:
+      data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+      lengths: [256, 1024, 4096]
+      kv_pairs: [8, 32]
+      n: 64
+      noise: text
+      batch_size: 2
+
+out_root: runs/eval
+registry_dir: registry/eval
