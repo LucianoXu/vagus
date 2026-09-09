@@ -2,20 +2,23 @@
 Where the KDA layer's A100 time goes, and what the fused kernel path
 buys back.
 
-HAX1 trains at ~0.28 MFU on A100 against SAX2's 0.535 at the same
-coordinate, and fla's chunk kernels are tuned on H100. Two questions
-this script answers, in order:
+HAX1 trains at ~0.29 MFU on A100 against SAX2's 0.535 at the same
+coordinate, and fla's chunk kernels are tuned on H100. Four modes,
+increasing in how much they can be trusted and decreasing in how much
+they explain:
 
   parts   attribution: the pieces of one GatedDeltaNet layer timed
           separately (projections, short conv, SiLU + L2 norm, gate
-          activation, the fla scan itself, the output norm-gate). The
-          scan is the only part that is supposed to be there; everything
-          else is elementwise traffic around it, and its share is the
-          size of the prize.
+          activation, the fla scan itself, the output norm-gate). Eager,
+          so it says what the work *is*, not what it costs after
+          inductor has had it.
   layer   the race: the layer fwd+bwd with the fusions switched on one
-          at a time (conv / norm_gate / scan / combinations, plus
-          disable_recompute, chunk 32 and the bounded gate), at both
-          HAX1 shapes.
+          at a time (conv / l2norm / gate / beta / norm_gate and
+          combinations, plus disable_recompute, chunk 32 and the bounded
+          gate), at both HAX1 shapes.
+  profile the compiled model step's GPU time, split into
+          linear-attention kernels / GEMMs / the rest — the number that
+          says whether more kernel work on this path is worth doing.
   model   the whole HAX1-340M step over the same specs, in tokens/s,
           MFU and peak memory. Single GPU, no sharding — good for the
           memory column and for catching an OOM, unreliable as a compile
@@ -252,7 +255,7 @@ def check_layer(mods, x):
 # model: the whole HAX1 step
 # ---------------------------------------------------------------------------
 
-def build_hax(args, fused=False, disable_recompute: bool = False):
+def build_hax(args, fused=False, disable_recompute=False):
     import yaml
 
     from infra.models import build_model
@@ -314,26 +317,44 @@ def bench_model(args):
 
 
 def profile_model(args):
+    '''Where a HAX1 step's GPU time actually goes, compiled (--compile)
+    or not. The one number that says whether more kernel work on the
+    linear-attention path is worth doing: what share of the step the
+    chunk kernels hold.'''
     from torch.profiler import ProfilerActivity, profile
     model, vocab = build_hax(args, fused=args.fused)
     model.train()
     torch.manual_seed(2)
     tok = torch.randint(0, vocab, (args.batch, args.seq), device='cuda')
 
-    def step():
-        model(tok).float().pow(2).mean().backward()
+    def step(t):
+        model(t).float().pow(2).mean().backward()
         for p in model.parameters():
             p.grad = None
 
-    for _ in range(3):
-        step()
+    fn = torch.compile(step) if args.compile else step
+    for _ in range(5):                      # includes the compile
+        fn(tok)
     torch.cuda.synchronize()
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
         for _ in range(3):
-            step()
+            fn(tok)
         torch.cuda.synchronize()
-    print(f'\n== profile (fused={args.fused}) top CUDA kernels ==')
-    print(prof.key_averages().table(sort_by='self_cuda_time_total', row_limit=25))
+    print(f'\n== profile (fused={args.fused!r}, compile={args.compile}, '
+          f'batch {args.batch}) top CUDA kernels ==')
+    ev = prof.key_averages()
+    print(ev.table(sort_by='self_cuda_time_total', row_limit=30))
+    total = sum(e.self_device_time_total for e in ev)
+    def share(pred):
+        return sum(e.self_device_time_total for e in ev if pred(e.key)) / max(total, 1)
+    kda = share(lambda n: any(t in n.lower() for t in (
+        'chunk_kda', 'chunk_gated_delta', 'chunk_gla', 'wy_fast', 'solve_tril',
+        'cumsum', 'l2norm', 'recompute_w_u', 'delta_rule')))
+    gemm = share(lambda n: any(t in n.lower() for t in (
+        'gemm', 'cutlass', 'sm80_', 'ampere_', 'nn_align', 'nt_align', 'tn_align')))
+    print(f'  linear-attention kernels: {kda:6.1%} of GPU time')
+    print(f'  GEMM kernels:             {gemm:6.1%}')
+    print(f'  everything else:          {1 - kda - gemm:6.1%}')
 
 
 # ---------------------------------------------------------------------------
@@ -387,7 +408,8 @@ def main():
     p.add_argument('--gate', choices=['vector', 'scalar', 'none'], default='vector')
     p.add_argument('--no-delta', action='store_true')
     p.add_argument('--compile', action='store_true')
-    p.add_argument('--fused', action='store_true', help='profile: which path')
+    p.add_argument('--fused', default=False,
+                   help="profile / single-run modes: the FUSIONS spec ('gate', 'conv,gate', ...)")
     p.add_argument('--model-recipe', default='recipe/model/hax1_340M.yaml')
     p.add_argument('--warmup', type=int, default=5)
     p.add_argument('--iters', type=int, default=20)
