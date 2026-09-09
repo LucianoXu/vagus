@@ -238,10 +238,12 @@ class Sleeper:
                 distill = self._kl(self._forward(self._student_input(s[idx])), teacher[idx], valid[idx])
             else:
                 # chunks of start+X; a chunk's first token is its context, as _lm_loss
-                L = xin.shape[1]
-                starts = self.rng.choice(max(L - cfg.chunk_len, 0) + 1, size=cfg.batch)
-                chunks = torch.stack([xin[0, st:st + cfg.chunk_len + 1] if L > cfg.chunk_len else xin[0]
-                                      for st in starts])
+                L, C = xin.shape[1], cfg.chunk_len + 1
+                if L <= C:
+                    chunks = xin.expand(cfg.batch, L)
+                else:
+                    starts = self.rng.integers(0, L - C + 1, size=cfg.batch)
+                    chunks = torch.stack([xin[0, st:st + C] for st in starts])
                 distill = self._lm_loss(chunks)
             loss = distill
             if cfg.lm_mix > 0:

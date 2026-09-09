@@ -77,6 +77,11 @@ def test_items_length_and_pairing(store):
         assert d[0] == 1 and torch.equal(torch.cat([x48, y]), d[1:1 + 48 + 24])   # BOS dropped
     again = sample_items(store, np.random.default_rng(3), 5, x_max=48, y_len=24)
     assert again == items                                                # pure function of the rng
+    gapped = sample_items(store, np.random.default_rng(3), 3, x_max=48, y_len=24, gap=10)
+    for it in gapped:
+        x, y = item_ids(store, it)
+        d = torch.from_numpy(np.asarray(store.doc(it.shard, it.doc)).astype(np.int64))
+        assert torch.equal(x, d[1:49]) and torch.equal(y, d[59:83]) and len(d) >= 83
     with pytest.raises(RuntimeError):
         sample_items(store, rng, 1, x_max=5000, y_len=24, max_tries=50)
 
@@ -107,6 +112,10 @@ def test_sleep_trains_in_place_and_keeps_dtype(store, method):
     x = torch.randint(2, VOCAB, (40,))
     w = sl.consolidate(x)
     assert next(g.model.parameters()).dtype == torch.float32 and len(w['distill_loss']) == 6
+    if method == 'ntp_x':
+        sl.consolidate(torch.randint(2, VOCAB, (16,)))     # start+X of 17 tokens is one chunk exactly
+        sl.consolidate(torch.randint(2, VOCAB, (17,)))     # ... and one longer: the last start is legal
+        sl.consolidate(torch.randint(2, VOCAB, (5,)))      # shorter than a chunk
     assert w['retain_before'] > 0 and w['retain_after'] > 0
     changed = any(not torch.equal(before[k], v) for k, v in g.model.state_dict().items())
     assert changed

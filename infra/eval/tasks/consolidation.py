@@ -4,7 +4,8 @@
 # the weights and clearing the memory (nll2).
 #
 # Cells are context lengths x_len (Y is the same text for all of them,
-# a shorter X the suffix of a longer one; items.py). Per item and
+# a shorter X the suffix of a longer one; items.py — and `gap` tokens
+# may separate X from Y, see there). Per item and
 # length: nll1@L, benefit@L = nll3 - nll1@L, the position buckets of
 # both, and with a method nll2@L, lost@L = nll2 - nll1 and the loss
 # ratio lost / benefit. The ratio's scalar is the ratio of means (a
@@ -32,20 +33,20 @@ from ..core import EvalCtx, TaskResult, exposure
 
 
 def run(ctx: EvalCtx, data_dir: str, shards: list[str] | None = None, n_items: int = 32,
-        x_len: int | Sequence[int] = (512, 1024, 2048, 4096), y_len: int = 512,
+        x_len: int | Sequence[int] = (512, 1024, 2048, 4096), y_len: int = 512, gap: int = 0,
         batch_size: int = 2, buckets: Sequence[int] = (64, 256),
         method: str | None = None, sleep: dict | None = None,
         sleep_x_len: Sequence[int] | None = None, n_text_samples: int = 2) -> TaskResult:
     store = ctx.store(data_dir, shards)
     lengths = sorted({int(L) for L in ([x_len] if isinstance(x_len, int) else x_len)})
     x_max = lengths[-1]
-    items = sample_items(store, ctx.rng('items'), n_items, x_max, y_len)
+    items = sample_items(store, ctx.rng('items'), n_items, x_max, y_len, gap)
     gen = ctx.subject.generator
     limit = gen.model.max_stream_len
     edges = tuple(int(e) for e in buckets)
 
     def can(L: int) -> bool:
-        return limit is None or 1 + L + y_len <= limit
+        return limit is None or 1 + L + gap + y_len <= limit
 
     ran = [L for L in lengths if can(L)]
     skipped = [L for L in lengths if not can(L)]
@@ -123,7 +124,7 @@ def run(ctx: EvalCtx, data_dir: str, shards: list[str] | None = None, n_items: i
         ctx.log('  ' + ' '.join(f'ratio@{L}={result.scalars[f"ratio@{L}"]:.3f}' for L in ran if f'ratio@{L}' in result.scalars))
 
     result.witness.update({
-        'n_items': n_items, 'x_len': ran, 'x_len_skipped': skipped, 'y_len': y_len, 'buckets': list(edges),
+        'n_items': n_items, 'x_len': ran, 'x_len_skipped': skipped, 'y_len': y_len, 'gap': gap, 'buckets': list(edges),
         'method': method,
         'items': [[store.entries[it.shard]['file'], it.doc] for it in items],
         'store': {'dir': str(store.dir.resolve()), 'source': store.manifest.get('source'),
