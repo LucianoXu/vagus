@@ -6,10 +6,11 @@
 # and must draw its items from ctx.rng() / ctx.torch_seed() only, so the
 # item order is the same for every subject (the runner pairs on it).
 
-from . import degeneration, holdout, recall_probe
+from . import consolidation, degeneration, holdout, recall_probe
 
 TASKS = {
     'holdout': holdout.run,
     'degeneration': degeneration.run,
     'recall_probe': recall_probe.run,
+    'consolidation': consolidation.run,
 }

@@ -1,0 +1,38 @@
+# The baseline of consolidate_lax1_replay.yaml: the same items, the
+# same optimiser budget (16 AdamW steps, lr 1e-5, all weights, lm_mix
+# 0.5), spent on next-token loss over X itself instead of the replay
+# distillation — no memory involved. If replay_kl does not beat this
+# on ratio@2048, distilling the state added nothing over reading the
+# text again.
+
+eval_name: consolidate-ntpx-340M
+subjects:
+  - {ckpt: runs/gen-eval/lax1-model-final.pt, label: LAX1, run_meta: runs/cmp/lax1/meta.json}
+
+device: auto
+dtype: bfloat16
+seed: 0
+
+tasks:
+  - name: consolidation
+    args:
+      data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+      n_items: 32
+      x_len: [2048]
+      y_len: 512
+      batch_size: 2
+      buckets: [64, 256]
+      method: ntp_x
+      sleep_x_len: [2048]
+      sleep:
+        steps: 16
+        lr: 1e-5
+        batch: 8
+        chunk_len: 512
+        lm_mix: 0.5
+        lm_batch: 4
+        lm_len: 512
+        retain_windows: 8
+
+out_root: runs/eval
+registry_dir: registry/eval

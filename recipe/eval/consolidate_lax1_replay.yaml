@@ -1,0 +1,50 @@
+# Stage 1: replay_kl consolidation on LAX1, one context length (2048),
+# 32 items. The baseline that must be beaten is the same recipe with
+# method ntp_x (consolidate_lax1_ntpx.yaml — same items, same optimiser
+# budget, same LM mix; the item arrays pair across the two records).
+#
+# Budget per item: K=32 replays of 256 tokens sampled from the
+# 2048-token memory, teacher logits of every replay token, then 16
+# AdamW steps at lr 1e-5 over all weights on batches of 8 replay rows
+# plus 4 store windows of 512 tokens (lm_mix 0.5). The witness carries
+# the replay KL before/after and the LM loss on 8 fixed windows
+# before/after (retain_delta: the forgetting side).
+#
+# Reading: ratio@2048 = (nll2 - nll1) / (nll3 - nll1), the fraction of
+# the context benefit the consolidation lost; 0 = perfect, 1 = nothing
+# kept, > 1 = worse than no memory. Compare with the ntp_x record.
+
+eval_name: consolidate-replay-340M
+subjects:
+  - {ckpt: runs/gen-eval/lax1-model-final.pt, label: LAX1, run_meta: runs/cmp/lax1/meta.json}
+
+device: auto
+dtype: bfloat16
+seed: 0
+
+tasks:
+  - name: consolidation
+    args:
+      data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+      n_items: 32
+      x_len: [2048]
+      y_len: 512
+      batch_size: 2
+      buckets: [64, 256]
+      method: replay_kl
+      sleep_x_len: [2048]
+      sleep:
+        n_samples: 32
+        sample_len: 256
+        temperature: 1.0
+        sample_batch: 32
+        steps: 16
+        lr: 1e-5
+        batch: 8
+        lm_mix: 0.5
+        lm_batch: 4
+        lm_len: 512
+        retain_windows: 8
+
+out_root: runs/eval
+registry_dir: registry/eval

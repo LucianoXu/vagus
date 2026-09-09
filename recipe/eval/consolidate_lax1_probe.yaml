@@ -1,0 +1,33 @@
+# Stage 0 of the consolidation thread: the dynamic range of the unit
+# test on LAX1 — how much a same-document context of L tokens buys on
+# the next 512 (benefit@L = nll3 - nll1@L), and how the benefit fades
+# along Y (position buckets). No consolidation yet: the numbers say
+# whether same-document FineWeb-Edu text gives enough room to measure a
+# consolidation loss, or whether the probe needs data where Y depends
+# harder on X.
+#
+# Subjects: LAX1 (pure KDA — the blank state m0 is exactly the zero
+# state; the thread's main subject); HAX1 for reference (its memory is
+# KDA state + NoPE KV cache). Same items for both (seeded).
+
+eval_name: consolidate-probe-340M
+subjects:
+  - {ckpt: runs/gen-eval/lax1-model-final.pt, label: LAX1, run_meta: runs/cmp/lax1/meta.json}
+  - {ckpt: runs/gen-eval/hax1-model-final.pt, label: HAX1, run_meta: runs/cmp/hax1/meta.json}
+
+device: auto
+dtype: bfloat16
+seed: 0
+
+tasks:
+  - name: consolidation
+    args:
+      data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+      n_items: 64
+      x_len: [256, 1024, 2048, 4096]
+      y_len: 512
+      batch_size: 2
+      buckets: [64, 256]
+
+out_root: runs/eval
+registry_dir: registry/eval
