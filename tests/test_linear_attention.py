@@ -182,22 +182,33 @@ def test_fla_matches_torch(gate, delta):
     assert torch.allclose(S_f.float(), S_t, atol=3e-2, rtol=3e-2)
 
 
+def test_parse_fusions():
+    from infra.components.linear_attention import FUSIONS, parse_fusions
+    assert parse_fusions(True) == frozenset(FUSIONS)
+    assert parse_fusions(False) == parse_fusions(None) == parse_fusions('') == frozenset()
+    assert parse_fusions('scan') == frozenset({'l2norm', 'gate', 'beta'})
+    assert parse_fusions('conv,gate') == parse_fusions(['conv', 'gate'])
+    with pytest.raises(AssertionError):
+        parse_fusions('nope')
+
+
 @pytest.mark.skipif(not (HAS_FLA and torch.cuda.is_available()), reason='needs fla + CUDA')
 @pytest.mark.parametrize('gate,delta', [('vector', True), ('scalar', True), ('scalar', False)])
-def test_fused_matches_unfused(gate, delta):
-    '''fused=True moves the L2 norm, the gate activation, the beta
-    sigmoid, the short conv and the output norm-gate into fla's kernels.
-    Same computation, so the layer's output and gradients must agree
-    with the unfused path at bf16 rounding.'''
+@pytest.mark.parametrize('fused', [True, 'conv', 'gate', 'l2norm,norm_gate'])
+def test_fused_matches_unfused(gate, delta, fused):
+    '''Each fusion moves a piece of the layer into an fla kernel — the
+    short conv, the L2 norm, the gate activation, the beta sigmoid, the
+    output norm-gate. Same computation, so the layer's output and
+    gradients must agree with the unfused path at bf16 rounding.'''
     torch.manual_seed(0)
     kw = dict(gate=gate, delta=delta, layer_count=4)
     base = GatedDeltaNet(128, 4, 32, 32, 4, impl='fla', fused=False, **kw).cuda().bfloat16()
-    fused = GatedDeltaNet(128, 4, 32, 32, 4, impl='fla', fused=True, **kw).cuda().bfloat16()
-    fused.load_state_dict(base.state_dict())
+    alt = GatedDeltaNet(128, 4, 32, 32, 4, impl='fla', fused=fused, **kw).cuda().bfloat16()
+    alt.load_state_dict(base.state_dict())
 
     x = torch.randn(2, 256, 128, device='cuda', dtype=torch.bfloat16)
     outs, grads = [], []
-    for m in (base, fused):
+    for m in (base, alt):
         t = x.detach().requires_grad_()
         y = m(t)
         y.float().pow(2).mean().backward()

@@ -48,7 +48,7 @@ class GDNLM(nn.Module, Decodable):
             gate_rank: int = 64,
             chunk_size: int = 64,
             la_impl: str = 'auto',
-            la_fused: bool = False,
+            la_fused: bool | str | list = False,
             la_disable_recompute: bool = False,
             gate_lower_bound: float | None = None,
             layer_pattern: str = 'gdn',

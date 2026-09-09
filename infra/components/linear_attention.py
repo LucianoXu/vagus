@@ -67,6 +67,49 @@ except ImportError:
 
 GATES = ('none', 'scalar', 'vector')
 
+# The places a GatedDeltaNet layer can hand work to an fla kernel
+# instead of doing it in PyTorch. They are separate flags because under
+# torch.compile they do not have the same sign, and the difference is
+# not which is 'more fused' — it is what inductor would otherwise have
+# done with that work:
+#     'conv'      replaces a cuDNN depthwise conv over a left-padded
+#                 copy. An extern call inductor cannot fuse into
+#                 anything, so this is free ground.
+#     'gate'      the gate activation reaches chunk_kda as the raw
+#                 pre-activation, so the activation and its chunk cumsum
+#                 happen in one pass. Removes an fp32 (B, L, H, dk)
+#                 tensor and the separate chunk_local_cumsum over it —
+#                 work inductor cannot remove, because the tensor exists
+#                 only to be handed to an opaque kernel.
+#     'beta'      the sigmoid moves into the same kernel. Small.
+#     'l2norm'    fla's use_qk_l2norm_in_kernel is a *separate*
+#                 l2norm_fwd launch, not a fusion into the chunk kernel.
+#                 Inductor fuses our l2norm into the SiLU that precedes
+#                 it, so this trades a fused kernel for a standalone one.
+#     'norm_gate' likewise: RMSNorm x SiLU is one inductor kernel
+#                 already.
+# 'scan' is the shorthand for the three the scan kernel accepts.
+FUSIONS = ('conv', 'l2norm', 'gate', 'beta', 'norm_gate')
+_ALIASES = {'scan': ('l2norm', 'gate', 'beta'), 'all': FUSIONS}
+
+
+def parse_fusions(spec) -> frozenset:
+    '''`fused=` accepts True (all), False/None (none), or a subset —
+    'gate', 'conv,gate', 'scan' (= l2norm,gate,beta), ['conv', 'gate'].'''
+    if spec is True:
+        return frozenset(FUSIONS)
+    if not spec:
+        return frozenset()
+    names = [s.strip() for s in spec.split(',')] if isinstance(spec, str) else list(spec)
+    out: set[str] = set()
+    for n in names:
+        if not n:
+            continue
+        out.update(_ALIASES.get(n, (n,)))
+    bad = out - set(FUSIONS)
+    assert not bad, f'unknown fusion {sorted(bad)}; pick from {FUSIONS} or {sorted(_ALIASES)}'
+    return frozenset(out)
+
 
 def chunk_scan_flops(dk: int, dv: int, chunk: int, delta: bool) -> float:
     '''Matmul FLOPs per token per head, forward + backward (x3), of the
@@ -375,15 +418,15 @@ class GatedDeltaNet(nn.Module, Mixer):
     impl: 'auto' picks fla when installed and the input is on CUDA in
     bf16/fp16, else the torch chunk reference. 'fla' / 'torch' force.
 
-    fused: on the fla path, hand the kernels their raw inputs instead of
-    doing the work in PyTorch first — the short conv (fla's Triton
-    causal_conv1d, activation folded in), the L2 norm on q/k, the gate
-    activation *and its chunk cumsum*, the beta sigmoid, and the output
-    RMSNorm x SiLU gate. It is the same computation, at the same
-    precision: under autocast the pre-activations were already bf16 and
-    every kernel does its arithmetic in fp32, so the only thing that
-    disappears is the round trip through memory. Off by default so a
-    run in flight keeps its exact numerics; the torch path ignores it.
+    fused: which of FUSIONS (see the note above them) to hand to an fla
+    kernel instead of doing it in PyTorch — True for all, False for
+    none, or a subset: 'gate', 'conv,gate', 'scan'. Every one of them is
+    the same computation at the same precision (under autocast the
+    pre-activations were already bf16 and each kernel does its
+    arithmetic in fp32; only the round trip through memory changes), so
+    the choice is purely about speed, and it has to be measured against
+    torch.compile rather than assumed. Off by default; the torch path
+    ignores it.
 
     disable_recompute: keep the intra-chunk activations from the forward
     rather than recomputing them in the backward. Memory for time, and
@@ -418,7 +461,7 @@ class GatedDeltaNet(nn.Module, Mixer):
             gate_rank: int = 64,
             chunk_size: int = 64,
             impl: str = 'auto',
-            fused: bool = False,
+            fused: bool | str | list = False,
             disable_recompute: bool = False,
             gate_lower_bound: float | None = None,
             *,
@@ -447,8 +490,7 @@ class GatedDeltaNet(nn.Module, Mixer):
         self.gate_rank = gate_rank
         self.chunk_size = chunk_size
         self.impl = impl
-        self.fused = fused                     # fused scan inputs (l2norm/gate/beta)
-        self.fused_norm_gate = fused           # fused RMSNorm x SiLU gate on the output
+        self.fusions = parse_fusions(fused)
         self.disable_recompute = disable_recompute
         self.gate_lower_bound = gate_lower_bound
         self.scale = key_head_dim ** -0.5
@@ -465,9 +507,10 @@ class GatedDeltaNet(nn.Module, Mixer):
         self.o_norm = RMSNorm(dv)                         # per-head, gamma shared
 
         if short_conv_size is not None:
-            self.conv_q = ShortConv(H * dk, short_conv_size, fused=fused)
-            self.conv_k = ShortConv(H * dk, short_conv_size, fused=fused)
-            self.conv_v = ShortConv(H * dv, short_conv_size, fused=fused)
+            conv_fused = 'conv' in self.fusions
+            self.conv_q = ShortConv(H * dk, short_conv_size, fused=conv_fused)
+            self.conv_k = ShortConv(H * dk, short_conv_size, fused=conv_fused)
+            self.conv_v = ShortConv(H * dv, short_conv_size, fused=conv_fused)
 
         if gate != 'none':
             n_dt = H * dk if gate == 'vector' else H        # one dt per channel / per head
@@ -573,22 +616,21 @@ class GatedDeltaNet(nn.Module, Mixer):
         ok = HAS_FLA and q.is_cuda and q.dtype in (torch.bfloat16, torch.float16)
         return 'fla' if ok else 'torch'
 
-    def _fused_kernel(self, qp) -> bool:
-        '''Whether this call runs the fused fla path (and so hands the
-        kernels their raw inputs). Decided on a projection output, the
-        tensor whose device and dtype the kernels will actually see —
-        under FSDP's mixed precision the residual stream reaching
-        forward() may still be fp32. Everything off the fla path — the
-        torch reference, cpu/fp32/fp64 — keeps the unfused semantics.'''
-        return self.fused and self._pick_impl(qp) == 'fla'
+    def _active_fusions(self, qp) -> frozenset:
+        '''The fusions this call actually runs. Decided on a projection
+        output, the tensor whose device and dtype the kernels will
+        actually see — under FSDP's mixed precision the residual stream
+        reaching forward() may still be fp32. Off the fla path (the
+        torch reference, cpu/fp32/fp64) nothing is fused.'''
+        return self.fusions if self._pick_impl(qp) == 'fla' else frozenset()
 
-    def _scan(self, q, k, v, g, beta, S0, *, fused: bool = False):
+    def _scan(self, q, k, v, g, beta, S0, *, fusions=frozenset()):
         if self._pick_impl(q) == 'fla':
             return fla_scan(q, k, v, g, beta, S0, scale=self.scale, delta=self.delta,
                             chunk_size=self.chunk_size,
-                            l2norm_in_kernel=fused,
-                            gate_in_kernel=fused and self.gate == 'vector',
-                            beta_in_kernel=fused and self.delta,
+                            l2norm_in_kernel='l2norm' in fusions,
+                            gate_in_kernel='gate' in fusions and self.gate == 'vector',
+                            beta_in_kernel='beta' in fusions and self.delta,
                             A_log=self.A_log if self.gate != 'none' else None,
                             dt_bias=self.dt_bias if self.gate != 'none' else None,
                             disable_recompute=self.disable_recompute,
@@ -599,7 +641,7 @@ class GatedDeltaNet(nn.Module, Mixer):
     def _output(self, o, x):
         B, L = x.shape[0], x.shape[1]
         gate = self.wg(x).view(B, L, self.head_count, self.value_head_dim)
-        if self.fused_norm_gate and HAS_FLA_NORM_GATE and o.is_cuda and \
+        if 'norm_gate' in self.fusions and HAS_FLA_NORM_GATE and o.is_cuda and \
                 o.dtype in (torch.bfloat16, torch.float16):
             # one kernel for RMSNorm(o) * SiLU(gate) over the head dim
             assert rms_norm_gated is not None
@@ -614,11 +656,11 @@ class GatedDeltaNet(nn.Module, Mixer):
     def forward(self, x, is_causal: bool = True):
         assert is_causal, 'linear attention is causal by construction'
         qp, kp, vp = self.wq(x), self.wk(x), self.wv(x)
-        fused = self._fused_kernel(qp)
-        q, k, v = self._heads(qp, kp, vp, l2norm=not fused)
-        g, beta = self._gates(x, raw_gate=fused and self.gate == 'vector',
-                              raw_beta=fused and self.delta)
-        o, _ = self._scan(q, k, v, g, beta, None, fused=fused)
+        on = self._active_fusions(qp)
+        q, k, v = self._heads(qp, kp, vp, l2norm='l2norm' not in on)
+        g, beta = self._gates(x, raw_gate='gate' in on and self.gate == 'vector',
+                              raw_beta='beta' in on and self.delta)
+        o, _ = self._scan(q, k, v, g, beta, None, fusions=on)
         return self._output(o, x)
 
     @torch.no_grad()

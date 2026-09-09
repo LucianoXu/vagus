@@ -13,11 +13,21 @@ this script answers, in order:
           else is elementwise traffic around it, and its share is the
           size of the prize.
   layer   the race: the layer fwd+bwd with the fusions switched on one
-          at a time (fused conv / fused norm-gate / in-kernel l2norm +
-          gate + beta / all / all + disable_recompute / chunk 32), at
-          both HAX1 shapes.
-  model   the whole HAX1-340M step, unfused vs fused, in tokens/s and
-          MFU — the number that decides whether any of this matters.
+          at a time (conv / norm_gate / scan / combinations, plus
+          disable_recompute, chunk 32 and the bounded gate), at both
+          HAX1 shapes.
+  model   the whole HAX1-340M step over the same specs, in tokens/s,
+          MFU and peak memory. Single GPU, no sharding — good for the
+          memory column and for catching an OOM, unreliable as a compile
+          verdict (five timed iterations of a freshly compiled model
+          measure dynamo as much as the kernels).
+  sweep   read back what recipe/slurm/raven_gpudev_sweep.sbatch
+          measured. THIS is the verdict: a real recipe, compiled,
+          sharded, twenty steps. The eager `layer` race and the compiled
+          training step disagree, and they disagree for a reason —
+          inductor already fuses the elementwise chain it can see, so a
+          fusion only pays if it removes work inductor could not have
+          removed. Measure here before believing a microbenchmark.
 
 Shapes (--shape):
   pure      the pure KDA layers, 16 of 24: dim 1024, 4 heads x (128, 256)
@@ -28,6 +38,8 @@ Run (cluster, one A100 via SLURM; needs fla + bf16 + CUDA):
     python -m infra.meter.examples.bench_kda_kernel --which parts
     python -m infra.meter.examples.bench_kda_kernel --which layer --shape both
     python -m infra.meter.examples.bench_kda_kernel --which model
+and, after a sweep job, anywhere (no GPU):
+    python -m infra.meter.examples.bench_kda_kernel --which sweep --runs runs
 '''
 
 import argparse
@@ -54,25 +66,19 @@ SHAPES = {
 }
 
 
-def make(shape, args, *, fused: bool, conv_fused: bool | None = None,
-         norm_gate: bool | None = None, disable_recompute: bool = False,
+def make(shape, args, *, fused=False, disable_recompute: bool = False,
          chunk: int | None = None, lower_bound: float | None = None) -> GatedDeltaNet:
-    '''One layer at `shape`, with the fusions selected individually.
-    `fused` drives the in-kernel l2norm / gate / beta; the two Nones
-    follow it.'''
+    '''One layer at `shape`. `fused` is a FUSIONS spec: False, True, or
+    a subset ('scan', 'conv,scan', ...).'''
     dim, H, dk, dv = SHAPES[shape]
     torch.manual_seed(0)
     # a pure layer owns its output projection; a parallel branch does not
-    m = GatedDeltaNet(dim, H, dk, dv, args.conv or None, gate=args.gate,
-                      delta=not args.no_delta, chunk_size=chunk or args.chunk,
-                      impl='fla', fused=fused, disable_recompute=disable_recompute,
-                      gate_lower_bound=lower_bound,
-                      layer_count=24, out_proj=(shape == 'pure'))
-    m.fused_norm_gate = fused if norm_gate is None else norm_gate
-    for name in ('conv_q', 'conv_k', 'conv_v'):
-        if hasattr(m, name):
-            getattr(m, name).fused = fused if conv_fused is None else conv_fused
-    return m.to(device='cuda', dtype=torch.bfloat16)
+    return GatedDeltaNet(dim, H, dk, dv, args.conv or None, gate=args.gate,
+                         delta=not args.no_delta, chunk_size=chunk or args.chunk,
+                         impl='fla', fused=fused, disable_recompute=disable_recompute,
+                         gate_lower_bound=lower_bound,
+                         layer_count=24, out_proj=(shape == 'pure')
+                         ).to(device='cuda', dtype=torch.bfloat16)
 
 
 def train_step(m):
@@ -167,25 +173,27 @@ def layer_variants(args, shape) -> dict:
         m.load_state_dict(state)
         return m
 
-    if args.compile:
-        # compiling every ablation does not fit a gpudev slot; under
-        # compile only the endpoints are interesting anyway, and this is
-        # the comparison training actually runs (compile: true)
-        return {'base': base, 'all': like(fused=True),
-                'all+no_recompute': like(fused=True, disable_recompute=True)}
-    return {
+    out = {
         'base': base,
-        '+conv': like(fused=False, conv_fused=True),
-        '+norm_gate': like(fused=False, norm_gate=True),
-        '+scan': like(fused=True, conv_fused=False, norm_gate=False),
+        'conv': like(fused='conv'),
+        'l2norm': like(fused='l2norm'),
+        'gate': like(fused='gate'),
+        'beta': like(fused='beta'),
+        'norm_gate': like(fused='norm_gate'),
+        'conv,gate,beta': like(fused='conv,gate,beta'),
         'all': like(fused=True),
+    }
+    if args.compile:
+        return out          # the compiled race is about the three stages
+    out.update({
         'all+no_recompute': like(fused=True, disable_recompute=True),
         'all+chunk32': like(fused=True, chunk=32),
         # bounded decay: a different gate family, not the same model.
         # Here for the size of the prize — it puts the intra-chunk
         # diagonal blocks on the tensor cores.
         'all+bounded(-5)*': like(fused=True, lower_bound=-5.0),
-    }
+    })
+    return out
 
 
 def bench_layer(args, shape):
@@ -244,14 +252,14 @@ def check_layer(mods, x):
 # model: the whole HAX1 step
 # ---------------------------------------------------------------------------
 
-def build_hax(args, fused: bool, disable_recompute: bool = False):
+def build_hax(args, fused=False, disable_recompute: bool = False):
     import yaml
 
     from infra.models import build_model
     recipe = yaml.safe_load(pathlib.Path(args.model_recipe).read_text())
     margs = dict(recipe['model_args'])
     margs.update(la_fused=fused, la_disable_recompute=disable_recompute,
-                 chunk_size=args.chunk)
+                 chunk_size=args.chunk)   # fused: a FUSIONS spec
     torch.manual_seed(0)
     model = build_model(recipe['model_name'], margs)
     return model.to(device='cuda', dtype=torch.bfloat16), margs['vocab_size']
@@ -270,8 +278,12 @@ def bench_model(args):
 
     ref_ms = None
     for name, kw in (('base', dict(fused=False)),
-                     ('fused', dict(fused=True)),
-                     ('fused+no_recompute', dict(fused=True, disable_recompute=True))):
+                     ('conv', dict(fused='conv')),
+                     ('l2norm', dict(fused='l2norm')),
+                     ('gate', dict(fused='gate')),
+                     ('norm_gate', dict(fused='norm_gate')),
+                     ('conv,gate,beta', dict(fused='conv,gate,beta')),
+                     ('all', dict(fused=True))):
         model, vocab = build_hax(args, **kw)
         model.train()
         torch.manual_seed(2)
@@ -324,11 +336,49 @@ def profile_model(args):
     print(prof.key_averages().table(sort_by='self_cuda_time_total', row_limit=25))
 
 
+# ---------------------------------------------------------------------------
+# sweep: read back what raven_gpudev_sweep.sbatch measured
+# ---------------------------------------------------------------------------
+
+def read_sweep(args):
+    '''Tabulate the last tokens_per_s / mfu / max_mem_gb / loss_ce of
+    every run under --runs. The compiled, sharded training step is the
+    measurement that settles a kernel-path question; this is how to read
+    it back.'''
+    import glob
+
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+    dirs = sorted(glob.glob(f'{args.runs}/*/tb'))
+    if not dirs:
+        print(f'[sweep] no runs under {args.runs}')
+        return
+    print(f'\n== sweep ({args.runs}) ==')
+    print(f'  {"run":<28}{"tok/s":>10}{"MFU":>8}{"peak GB":>9}{"loss_ce":>10}')
+    for d in dirs:
+        events = sorted(glob.glob(d + '/events*'))
+        if not events:
+            continue
+        ea = EventAccumulator(events[0])
+        ea.Reload()
+
+        def last(tag):
+            try:
+                return ea.Scalars(tag)[-1].value
+            except Exception:  # noqa: BLE001 - a run may have died early
+                return float('nan')
+
+        run = pathlib.Path(d).parent.name
+        print(f'  {run:<28}{last("tokens_per_s"):>10,.0f}{last("mfu"):>8.3f}'
+              f'{last("max_mem_gb"):>9.2f}{last("loss_ce"):>10.4f}')
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--which', choices=['parts', 'layer', 'model', 'profile', 'all'],
+    p.add_argument('--which', choices=['parts', 'layer', 'model', 'profile', 'sweep', 'all'],
                    default='all')
+    p.add_argument('--runs', default='runs', help='sweep: the directory of run dirs to read')
     p.add_argument('--shape', choices=['pure', 'parallel', 'both'], default='both')
     p.add_argument('--batch', type=int, default=8)
     p.add_argument('--seq', type=int, default=2048)
@@ -342,6 +392,10 @@ def main():
     p.add_argument('--warmup', type=int, default=5)
     p.add_argument('--iters', type=int, default=20)
     args = p.parse_args()
+
+    if args.which == 'sweep':          # reads run dirs, needs no GPU
+        read_sweep(args)
+        return
 
     assert torch.cuda.is_available(), 'this bench is about A100 kernels'
     torch.backends.cuda.matmul.allow_tf32 = True
