@@ -1,0 +1,41 @@
+{
+  "run": {
+    "name": "lax1-340M-fwe15B-c9af2f44",
+    "purpose": "LAX1 = the linear-attention series opener: Kimi Delta Attention (per-channel forget gate + delta rule, fla chunk_kda) on the Transformer++ skeleton, pure (no softmax layers, no positional encoding), at the 340M coordinate. Batch-paired vs sax2-340M-fwe15B-79629bc6 (same seed/data order/global batch/optimizer recipe/WSD schedule; the mixer is the only variable) with sax1-340M-fwe15B-74b227a9 as the linear-schedule reference.",
+    "code_commit": "c9af2f44",
+    "created": "2026-09-08T09:34:08+02:00",
+    "finished": "2026-09-09T14:27:11+02:00",
+    "elapsed": "23:44:44 + 05:09:42 (walltime hit at step 24,000; resumed from recent-prev.pt at step 23,520 — the walltime checkpoint was truncated by the sbatch wait bug fixed in 32b146a; ~30 min of compute redone)",
+    "slurm_jobs": { "walltime_hit": 30073697, "completed": 30083857 },
+    "hardware": "1 node x 4x A100-SXM4-40GB (MPCDF Raven, partition gpu)",
+    "torch": "2.13.0+cu130",
+    "kernels": "fla-core 0.5.2 (chunk_kda), triton 3.7.1; regional torch.compile of the blocks"
+  },
+  "recipe": "recipe/train/lax1_340M_fwe15B.yaml + recipe/model/lax1_340M.yaml at the commit — SAX2's training recipe verbatim (Muon polar-express + AdamW, shared lr 1.75e-3 via rms adjust, WSD warmup 0.01 / decay 0.15 / floor 0, z-loss 1e-4, wd 0.1, grad clip 1.0) with micro 8 x accum 8 instead of 16 x 4 (KDA OOMs at micro 16 on 40 GB; the loader gives each optimizer step the same global window set either way, so the pairing holds). Model: 24 x 1024, 4 heads, key head 128 / value head 256, conv 4, gate_rank 64, tied embedding, FFN 2816 — 343.8M params (+0.8% vs SAX1's 341.1M, the low-rank gate). Gate projections under AdamW; A_log / dt_bias / norm gammas undecayed. lr cleared by the lax1_340M_pilot_lr{10,17,30} ladder (1B tokens, zero spikes on all arms; pilot loss_ce tail5 2.8395 / 2.7938 / 2.7696 vs SAX1 pilots 2.8378 / 2.8037 / 2.7909).",
+  "data": "same store as the sax runs (fineweb-edu-100BT-mistral32k, 140 shards, 110.8B tokens, home-GPFS layout); identical batch sequence by construction",
+  "results": {
+    "steps": 28610,
+    "tokens_seen": 14999879680,
+    "final_loss": 2.4055,
+    "final_loss_ema": 2.4010,
+    "loss_tail5": 2.3963,
+    "loss_ce_tail5": 2.3956,
+    "loss_z_final": 0.0008,
+    "median_tokens_per_s": 150832,
+    "mfu_median": 0.256,
+    "mfu_note": "MFU under the c9af2f44 accounting (6N + 18*H*dk*dv per gdn layer, i.e. the state read/write only; the chunk kernel's intra-chunk and WY work is uncounted — commit eb59813 on hax1 changes the accounting). The comparable number is throughput: 0.151 Mtok/s vs SAX2's 0.252, i.e. 1.67x slower per token at ctx 2048 (KDA layer 20.2 ms vs SDPA 10.0 ms fwd+bwd at 16x2048 in the meter bench, plus micro 8).",
+    "max_mem_gb": 29.8,
+    "verdict": "loss_ce 2.3956 vs paired SAX2 (WSD) 2.4153: -0.0197 nat at matched data/order/budget/schedule — pure KDA beats the frontier softmax recipe on LM loss at 340M/15B. Also -0.0052 vs SAX1's linear-decay 2.4007 despite carrying WSD's ~0.015 nat schedule cost. The gap was a constant -0.025 nat over the whole stable phase (step 4k: 2.7334 vs 2.7593; 10k: 2.6200 vs 2.6451; decay start 24318: 2.5544 vs 2.5791) and narrowed slightly in the cooldown: cliff 0.159 vs SAX2's 0.164. Softmax led only for the first ~500 steps. Loss parity says nothing about exact recall — the known linear-attention deficit — which needs a separate probe (MQAR-style / RULER-lite); not measured here.",
+    "health": "zero instability events across 28,610 steps: gnorm max 0.29 post-warmup (median 0.10, clip 1.0 never fired), z-term 0.0008 final. Gates: beta_mean rose 0.35 -> 0.82 by step ~5k and held (strong delta writes), alpha_mean settled 0.76-0.77 (mean per-channel decay), mem_len median (1/(1-mean alpha), probe on one sequence) 9-11 tokens with a mid-run excursion to 16.7, some channels saturating at alpha -> 1 (persistent memory, expected); state_rms_max bounded, peak 0.36 mid-plateau, 0.15 after decay. pnorm/embedding equilibrated ~474-481 at constant lr (SAX2: 478-481, same wd-0.1 equilibrium) and fell to 431 in the decay (SAX2 423).",
+    "trunk_asset": "stable-phase full-state ckpts 05000/10000/15000/20000 (decay began at step 24318) — cooldown-branch trunk, paired with SAX2's at the same steps"
+  },
+  "decision_note": "LAX1 is the linear-attention anchor of the 340M coordinate. Next in the series: a recall probe before any hybrid claim; LAX-H (softmax every 4th layer / HAX line) for the recall gap; gate: scalar (GDN) as the ablation from the same module. Throughput is the cost: 1.67x SAX2's step time at ctx 2048; the in-kernel fusions (gate / l2norm / beta) and micro 16 via activation checkpointing are the untested levers.",
+  "archive": {
+    "primary": "PENDING — not yet pushed to selene (46 GB on raven incl. recent*.pt; the sax runs' archive set is ckpt-{05000,...,28610}.pt + model-final.pt + tb/ + config/meta + slurm logs, ~19 GB)",
+    "contents": "ckpt-{05000,10000,15000,20000,25000,28610}.pt (full training state), model-final.pt (slim weights+args), tb/, config.yaml, meta.json, slurm logs (30073697 + 30083857)",
+    "transient": [
+      "raven:/u/yinxu/work/vagus/runs/lax1-340M-fwe15B-c9af2f44/ (home GPFS working copy, incl. recent*.pt and the truncated recent.pt.tmp)",
+      "mbp:assets/2-areas/vagus/runs/cmp/lax1/ (tb + config/meta only)"
+    ]
+  }
+}
