@@ -453,11 +453,17 @@ class GatedDeltaNet(nn.Module, Mixer):
 
     gate_lower_bound: switch the decay to Kimi's bounded form
     lower_bound * sigmoid(exp(A_log) (f + dt_bias)) in [lower_bound, 0)
-    instead of -exp(A_log) softplus(...). A different gate family — not
-    a free speedup — but with fused=True it also puts the intra-chunk
-    diagonal blocks on the tensor cores (fla's safe_gate), which the
-    unbounded exponents of the softplus gate cannot use. -5 is Kimi's
-    recommended value.
+    instead of -exp(A_log) softplus(...). Vector gate only. With the
+    'gate' fusion it also puts the intra-chunk diagonal blocks on the
+    tensor cores (fla's safe_gate), which the unbounded exponents of the
+    softplus gate cannot use — but that is worth +1.9% end to end
+    (184.5k / 185.1k tokens/s against 180.4k / 182.1k, interleaved), not
+    the ~5% the eager layer bench suggests: the KDA kernels are only
+    ~20% of a compiled step and safe_gate touches part of that. It is a
+    different gate family, so it costs a pilot and it breaks the HAX/LAX/
+    SAX batch pairing. At 1.9% that trade does not look worth making.
+    -5 is Kimi's recommended value. See the dt_bias init: each form
+    needs its own inverse.
 
     Parameter sizing at dim d: q, k are d x (H dk); v, gate, o are
     d x (H dv). With H dk = d/2 and H dv = d (the GLA layout) the mixer
