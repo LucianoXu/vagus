@@ -639,20 +639,33 @@ class GatedDeltaNet(nn.Module, Mixer):
         return 'fla' if ok else 'torch'
 
     def _active_fusions(self, qp) -> frozenset:
-        '''The fusions this call actually runs. Decided on a projection
-        output, the tensor whose device and dtype the kernels will
-        actually see — under FSDP's mixed precision the residual stream
-        reaching forward() may still be fp32. Off the fla path (the
-        torch reference, cpu/fp32/fp64) nothing is fused.'''
-        return self.fusions if self._pick_impl(qp) == 'fla' else frozenset()
+        '''The fusions this call actually runs: the configured set minus
+        the ones this layer's kernel cannot take. Decided on a
+        projection output, the tensor whose device and dtype the kernels
+        will actually see — under FSDP's mixed precision the residual
+        stream reaching forward() may still be fp32. Off the fla path
+        (the torch reference, cpu/fp32/fp64) nothing is fused.
+
+        The one filter that is not about the device: without the delta
+        rule the scan is chunk_simple_gla, which has no beta and takes
+        no fused L2 norm, and only the vector-gate kernel (chunk_kda)
+        computes the gate activation itself.'''
+        if self._pick_impl(qp) != 'fla':
+            return frozenset()
+        on = self.fusions
+        if not self.delta:
+            on = on - {'l2norm', 'beta'}
+        if self.gate != 'vector':
+            on = on - {'gate'}
+        return on
 
     def _scan(self, q, k, v, g, beta, S0, *, fusions=frozenset()):
         if self._pick_impl(q) == 'fla':
             return fla_scan(q, k, v, g, beta, S0, scale=self.scale, delta=self.delta,
                             chunk_size=self.chunk_size,
                             l2norm_in_kernel='l2norm' in fusions,
-                            gate_in_kernel='gate' in fusions and self.gate == 'vector',
-                            beta_in_kernel='beta' in fusions and self.delta,
+                            gate_in_kernel='gate' in fusions,
+                            beta_in_kernel='beta' in fusions,
                             A_log=self.A_log if self.gate != 'none' else None,
                             dt_bias=self.dt_bias if self.gate != 'none' else None,
                             disable_recompute=self.disable_recompute,
@@ -680,8 +693,7 @@ class GatedDeltaNet(nn.Module, Mixer):
         qp, kp, vp = self.wq(x), self.wk(x), self.wv(x)
         on = self._active_fusions(qp)
         q, k, v = self._heads(qp, kp, vp, l2norm='l2norm' not in on)
-        g, beta = self._gates(x, raw_gate='gate' in on and self.gate == 'vector',
-                              raw_beta='beta' in on and self.delta)
+        g, beta = self._gates(x, raw_gate='gate' in on, raw_beta='beta' in on)
         o, _ = self._scan(q, k, v, g, beta, None, fusions=on)
         return self._output(o, x)
 
