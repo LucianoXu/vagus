@@ -72,9 +72,15 @@ GATES = ('none', 'scalar', 'vector')
 # torch.compile they do not have the same sign, and the difference is
 # not which is 'more fused' — it is what inductor would otherwise have
 # done with that work:
-#     'conv'      replaces a cuDNN depthwise conv over a left-padded
-#                 copy. An extern call inductor cannot fuse into
-#                 anything, so this is free ground.
+#     'conv'      fla's Triton causal_conv1d in place of the cuDNN
+#                 depthwise call. Worth 1.29x on the layer in eager and
+#                 a reproducible 6% LOSS end to end (150.6k tok/s
+#                 against 160.1k, five interleaved runs): the custom
+#                 autograd Function breaks the graph where the cuDNN
+#                 call did not, and the regions either side stop fusing.
+#                 Do not turn it on. The conv is worth attacking — it is
+#                 the largest non-GEMM item in a compiled step — but
+#                 from the other end: see ShortConv's 'shift'.
 #     'gate'      the gate activation reaches chunk_kda as the raw
 #                 pre-activation, so the activation and its chunk cumsum
 #                 happen in one pass. Removes an fp32 (B, L, H, dk)
@@ -428,6 +434,11 @@ class GatedDeltaNet(nn.Module, Mixer):
     torch.compile rather than assumed. Off by default; the torch path
     ignores it.
 
+    conv_impl: how the short conv is written — see ShortConv. 'conv1d'
+    is the cuDNN depthwise call, 'shift' the same convolution as K
+    shifted multiply-adds, which inductor fuses with the SiLU and L2
+    norm around it. Ignored when the 'conv' fusion selects fla's kernel.
+
     disable_recompute: keep the intra-chunk activations from the forward
     rather than recomputing them in the backward. Memory for time, and
     at 340M there is memory to spend.
@@ -462,6 +473,7 @@ class GatedDeltaNet(nn.Module, Mixer):
             chunk_size: int = 64,
             impl: str = 'auto',
             fused: bool | str | list = False,
+            conv_impl: str = 'conv1d',
             disable_recompute: bool = False,
             gate_lower_bound: float | None = None,
             *,
@@ -507,10 +519,12 @@ class GatedDeltaNet(nn.Module, Mixer):
         self.o_norm = RMSNorm(dv)                         # per-head, gamma shared
 
         if short_conv_size is not None:
-            conv_fused = 'conv' in self.fusions
-            self.conv_q = ShortConv(H * dk, short_conv_size, fused=conv_fused)
-            self.conv_k = ShortConv(H * dk, short_conv_size, fused=conv_fused)
-            self.conv_v = ShortConv(H * dv, short_conv_size, fused=conv_fused)
+            # the 'conv' fusion is the fla kernel; conv_impl chooses among
+            # the rest ('conv1d' as written, 'shift' as elementwise work)
+            ci = 'fla' if 'conv' in self.fusions else conv_impl
+            self.conv_q = ShortConv(H * dk, short_conv_size, impl=ci)
+            self.conv_k = ShortConv(H * dk, short_conv_size, impl=ci)
+            self.conv_v = ShortConv(H * dv, short_conv_size, impl=ci)
 
         if gate != 'none':
             n_dt = H * dk if gate == 'vector' else H        # one dt per channel / per head

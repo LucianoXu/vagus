@@ -49,6 +49,7 @@ class GDNLM(nn.Module, Decodable):
             chunk_size: int = 64,
             la_impl: str = 'auto',
             la_fused: bool | str | list = False,
+            la_conv_impl: str = 'conv1d',
             la_disable_recompute: bool = False,
             gate_lower_bound: float | None = None,
             layer_pattern: str = 'gdn',
@@ -70,7 +71,8 @@ class GDNLM(nn.Module, Decodable):
             head_count=head_count, key_head_dim=key_head_dim, value_head_dim=value_head_dim,
             ffn_hidden_dim=ffn_hidden_dim, short_conv_size=short_conv_size,
             gate=gate, delta=delta, gate_rank=gate_rank, chunk_size=chunk_size, la_impl=la_impl,
-            la_fused=la_fused, la_disable_recompute=la_disable_recompute,
+            la_fused=la_fused, la_conv_impl=la_conv_impl,
+            la_disable_recompute=la_disable_recompute,
             gate_lower_bound=gate_lower_bound,
             layer_pattern=layer_pattern, layer_kinds=layer_kinds,
             softmax_head_dim=softmax_head_dim, softmax_rope=softmax_rope,
@@ -109,7 +111,8 @@ class GDNLM(nn.Module, Decodable):
                 dim=dim, head_count=width // value_head_dim, key_head_dim=key_head_dim,
                 value_head_dim=value_head_dim, short_conv_size=short_conv_size,
                 gate=gate, delta=delta, gate_rank=gate_rank, chunk_size=chunk_size, impl=la_impl,
-                fused=la_fused, disable_recompute=la_disable_recompute,
+                fused=la_fused, conv_impl=la_conv_impl,
+                disable_recompute=la_disable_recompute,
                 gate_lower_bound=gate_lower_bound,
                 init_std=0.02, layer_count=layer_count, out_proj=out_proj)
 

@@ -221,3 +221,27 @@ def test_fused_matches_unfused(gate, delta, fused):
     assert (outs[0] - outs[1]).norm() < 0.01 * outs[0].norm()
     for a, b in zip(grads[0], grads[1]):
         assert (a - b).abs().max() < 0.03 * a.abs().max().clamp(min=1e-6)
+
+
+def test_short_conv_impls_agree():
+    '''ShortConv's 'shift' path is the same convolution as the cuDNN
+    one, written as K shifted multiply-adds; in fp64 the two must agree
+    to round-off, gradients included.'''
+    from infra.components.opt import ShortConv
+    torch.manual_seed(0)
+    ref = ShortConv(16, 4, impl='conv1d').double()
+    shift = ShortConv(16, 4, impl='shift').double()
+    shift.load_state_dict(ref.state_dict())
+
+    outs, grads = [], []
+    for m in (ref, shift):
+        torch.manual_seed(1)                       # same x for both
+        x = torch.randn(2, 9, 16, dtype=torch.float64).requires_grad_()
+        y = m(x, 'silu')
+        y.pow(2).sum().backward()
+        outs.append(y)
+        grads.append((x.grad, m.conv.weight.grad))
+
+    assert torch.allclose(outs[0], outs[1], atol=1e-12)
+    for a, b in zip(grads[0], grads[1]):
+        assert torch.allclose(a, b, atol=1e-12)
