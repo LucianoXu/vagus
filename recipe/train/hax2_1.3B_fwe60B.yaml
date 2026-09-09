@@ -5,8 +5,15 @@
 # (hax2_1.3B_smoke.yaml): 12-rank HSDP, memory at micro 4 x ctx 4096,
 # throughput, the DCP checkpoint gather at 1.3B.
 #
-# Batch: 12 ranks x micro 4 x accum 11 x 4096 = 2,162,688 tokens/step
+# Batch: 12 ranks x micro 2 x accum 22 x 4096 = 2,162,688 tokens/step
 # (~2.06M; 2M exactly does not divide over 12 GPUs), 27,743 steps.
+# micro 2 by the smokes (2026-09-09, jobs 30098901/30099020/30098902):
+# micro 4 and micro 3 OOM on A100-40GB at ctx 4096 (the FFN's 16k x
+# 11264 SwiGLU buffer was the last straw at 4; ~10 GB of activations
+# per micro on top of ~10 GB static), micro 2 peaks at 30.4 GB and runs
+# 11.4 s/step = 0.185 Mtok/s on the 12 GPUs, MFU 0.40-0.43 — so ~3.75
+# days for 60B, 3 walltime resumes. The final DCP checkpoint gather and
+# slim export worked at 1.3B (11.1 GB full state, 5.5 GB slim).
 # DeepSeek's B_opt fit puts the optimal batch above 5M at this compute,
 # so 2.1M sits on the safe side; the step count stays near the 340M
 # runs' 28,610 so the checkpoint cadence carries over.
@@ -27,9 +34,10 @@
 # Everything else is HAX1's: z-loss 1e-4, wd 0.1, clip 1.0, liger CE,
 # bf16 FSDP compute / fp32 reduce, no reshard after forward.
 #
-# Expected: ~0.19 Mtok/s on 12 GPUs at MFU ~0.3 (1.3B is ~4x the 340M
-# FLOPs/token) -> ~3.7-4.8 days, 3-4 walltime resumes (sbatch wait bug
-# fixed in 32b146a). The recall probe on the 340M trio runs meanwhile.
+# Measured (smoke): 0.185 Mtok/s on 12 GPUs -> ~3.75 days, 3 walltime
+# resumes (sbatch wait bug fixed in 32b146a; chain resumes by hand with
+# --dependency=afterany, never two at once on one run dir). The recall
+# probe on the 340M trio runs meanwhile.
 
 run_name: hax2-1.3B-fwe60B
 model_recipe: ../model/hax2_1.3B.yaml
@@ -43,8 +51,8 @@ shard_size: 4              # HSDP: shard inside the node, replicate across
 fsdp_param_dtype: bfloat16
 fsdp_reduce_dtype: float32
 fsdp_reshard_after_forward: false
-batch_size: 4              # per-rank micro-batch (the smoke decides 4 vs 2; 2 x 22 keeps the global batch)
-grad_accum_steps: 11
+batch_size: 2              # per-rank micro-batch (4 and 3 OOM, see above)
+grad_accum_steps: 22
 global_batch_tokens: 2162688
 train_tokens: 60_000_000_000
 seed: 42

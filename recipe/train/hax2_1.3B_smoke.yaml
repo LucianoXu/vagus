@@ -1,14 +1,11 @@
 # HAX2-1.3B smoke — the fwe60B recipe cut to 30 steps (65M tokens): the
 # launch gate for the 60B run, on the real 3-node layout. It answers:
-# 12-rank HSDP (replicate 3 x shard 4) comes up, NCCL on IB, memory at
-# micro 4 x ctx 4096 under FSDP2 (max_mem_gb; if it OOMs the second
-# submission below runs micro 2 x accum 22 at the same global batch),
-# steady tokens_per_s / mfu, and the final checkpoint gather + slim
-# export at 1.3B. Submit both at once (3-node queue waits are long):
-#   sbatch -J hax2smoke4 -t 00:40:00 recipe/slurm/raven_hax2_1.3B.sbatch \
+# 12-rank HSDP (replicate 3 x shard 4) comes up, NCCL on IB, memory
+# under FSDP2 (max_mem_gb), steady tokens_per_s / mfu, and the final
+# checkpoint gather + slim export at 1.3B. Verdict 2026-09-09: micro 4
+# and 3 OOM at ctx 4096, micro 2 peaks at 30.4 GB at 0.185 Mtok/s.
+#   sbatch -J hax2smoke -t 00:40:00 recipe/slurm/raven_hax2_1.3B.sbatch \
 #     recipe/train/hax2_1.3B_smoke.yaml
-#   sbatch -J hax2smoke2 -t 00:40:00 recipe/slurm/raven_hax2_1.3B.sbatch \
-#     recipe/train/hax2_1.3B_smoke.yaml batch_size=2 grad_accum_steps=22 run_name=hax2-1.3B-smoke-m2
 # Not an experiment: no registry entry, delete the run dirs afterwards.
 
 run_name: hax2-1.3B-smoke
@@ -23,8 +20,8 @@ shard_size: 4              # HSDP: shard inside the node, replicate across
 fsdp_param_dtype: bfloat16
 fsdp_reduce_dtype: float32
 fsdp_reshard_after_forward: false
-batch_size: 4              # per-rank micro-batch (the smoke decides 4 vs 2; 2 x 22 keeps the global batch)
-grad_accum_steps: 11
+batch_size: 2              # per-rank micro-batch (4 and 3 OOM at ctx 4096; see the fwe60B recipe)
+grad_accum_steps: 22
 global_batch_tokens: 2162688
 train_tokens: 64_880_640        # 30 steps
 seed: 42
