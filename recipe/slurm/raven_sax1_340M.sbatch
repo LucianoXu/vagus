@@ -41,5 +41,14 @@ PID=$!
 trap "echo 'walltime soon: forwarding SIGTERM to training'; kill -TERM -- -$PID" USR1
 wait $PID
 status=$?
+# A trapped signal interrupts `wait` with 128+sig while training is still
+# running. Without waiting again the batch script exits here and SLURM
+# tears the step down before rank 0 has written the recent checkpoint
+# (job 30073697: ended at 23:44:44 with exit 138, recent.pt.tmp truncated,
+# resume fell back to recent-prev.pt). Keep waiting for the real exit.
+while [ "$status" -gt 128 ] && kill -0 "$PID" 2>/dev/null; do
+    wait $PID
+    status=$?
+done
 echo "training exited with status $status"
 exit $status
