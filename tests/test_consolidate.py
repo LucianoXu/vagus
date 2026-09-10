@@ -114,6 +114,8 @@ def test_sleep_trains_in_place_and_keeps_dtype(store, method):
     x = torch.randint(2, VOCAB, (40,))
     w = sl.consolidate(x)
     assert next(g.model.parameters()).dtype == torch.float32 and len(w['distill_loss']) == 6
+    w2 = sl.consolidate([torch.randint(2, VOCAB, (40,)), torch.randint(2, VOCAB, (12,))])   # two memories, one sleep
+    assert len(w2['distill_loss']) == 12 and w2['n_contexts'] == 2
     if method == 'ntp_x':
         sl.consolidate(torch.randint(2, VOCAB, (16,)))     # start+X of 17 tokens is one chunk exactly
         sl.consolidate(torch.randint(2, VOCAB, (17,)))     # ... and one longer: the last start is legal
@@ -320,7 +322,20 @@ def test_sequential_task(store_dir, tmp_path):
     sc, it, w = res['scalars'], res['items'], res['witness']
     assert [sc[f'n_pairs@{a}'] for a in range(4)] == [4, 3, 2, 1]
     assert len(it['kept_final']) == 4 and len(w['nll2']) == 4 and w['nll2'][0][1] is None and w['nll2'][3][0] is not None
-    assert 'retain_delta_final' in sc and len(w['consolidations']) == 4
+    assert 'retain_delta_final' in sc and len(w['consolidations']) == 4 and len(it['retain_lm']) == 5
+    # grouped sleeps: 2 docs per sleep -> rows 1 and 3 scored, pairs by age accordingly
+    grp = evaluate(EvalConfig(
+        eval_name='seq2', subjects=[{'ckpt': str(ckpt), 'label': 'G'}],
+        tasks=[{'name': 'consolidation_seq', 'args': {
+            'data_dir': str(store_dir), 'n_docs': 4, 'x_len': 32, 'y_len': 16, 'gap': 8, 'batch_size': 3,
+            'method': 'replay_kl', 'sleep': sleep, 'docs_per_sleep': 2}}],
+        device='cpu', dtype='float32', seed=1, n_boot=20, out_root=str(tmp_path / 'eval'), registry_dir=None))
+    r2 = json.loads((grp / 'results.json').read_text())['consolidation_seq']['subjects']['G']
+    assert r2['witness']['nll2'][0][0] is None and r2['witness']['nll2'][1][0] is not None
+    assert [r2['scalars'][f'n_pairs@{a}'] for a in range(4)] == [2, 2, 1, 1]
+    assert len(r2['witness']['consolidations']) == 2 and r2['witness']['consolidations'][0]['n_contexts'] == 2
+    assert len(r2['witness']['consolidations'][0]['distill_loss']) == 2 * sleep['steps']
+    assert r2['items']['nll3'] == pytest.approx(it['nll3'])                # same items
     assert sc['ratio_final'] == pytest.approx(1 - sc['kept_final'])
     # the subject was restored at the end: a fresh score equals the recorded nll3
     g = Generator.from_checkpoint(ckpt, device='cpu', dtype='float32')

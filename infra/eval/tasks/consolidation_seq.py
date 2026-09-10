@@ -7,12 +7,19 @@
 # the fraction of document j's context benefit still in the weights
 # after k - j further consolidations — the forgetting curve by age.
 #
-# Scalars: kept_age@a = ratio of means over all (j, k) with k - j = a
-# of (nll3_j - nll2_j^(k)) / (nll3_j - nll1_j); kept_final@j per
-# document after all n; retain_delta_final: the method's own LM loss
-# on fixed store windows, last minus first. Items: kept_final per
-# document (paired across subjects / methods on the same seed).
-# Witness: the full nll2 matrix, the per-step witnesses.
+# docs_per_sleep groups the documents: one sleep consolidates a group
+# jointly (their replays pooled, the per-document step budget kept),
+# the scores are taken after each group. 1 is strictly sequential; n
+# is one sleep over everything.
+#
+# Scalars: kept_age@a = ratio of means over all scored (j, k) with
+# k - j = a of (nll3_j - nll2_j^(k)) / (nll3_j - nll1_j); kept_final
+# over all documents after the last sleep; retain_delta_final: LM loss
+# on one fixed set of store windows, after the last sleep minus before
+# the first (the per-sleep witnesses draw their own windows and are
+# not comparable across sleeps). Items: kept_final per document
+# (paired across subjects / methods on the same seed), retain_lm after
+# each sleep. Witness: the full nll2 matrix, the per-sleep witnesses.
 
 from collections import defaultdict
 from typing import Sequence
@@ -27,7 +34,7 @@ from ..core import EvalCtx, TaskResult, exposure
 
 def run(ctx: EvalCtx, data_dir: str, shards: list[str] | None = None, n_docs: int = 16,
         x_len: int = 2048, y_len: int = 512, gap: int = 256, batch_size: int = 2,
-        method: str = 'replay_kl', sleep: dict | None = None,
+        method: str = 'replay_kl', sleep: dict | None = None, docs_per_sleep: int = 1,
         ages: Sequence[int] = (0, 1, 2, 4, 8, 16, 32)) -> TaskResult:
     store = ctx.store(data_dir, shards)
     items = sample_items(store, ctx.rng('items'), n_docs, x_len, y_len, gap)
@@ -50,21 +57,26 @@ def run(ctx: EvalCtx, data_dir: str, shards: list[str] | None = None, n_docs: in
     sleeper = Sleeper(gen, store, cfg, log=ctx.log)
     model = gen.model
     snapshot = {k: v.detach().clone() for k, v in model.state_dict().items()}   # type: ignore[attr-defined]
+    retain = sleeper._windows(max(cfg.retain_windows, 1), cfg.lm_len)
+    with torch.no_grad():
+        retain_lm = [float(sleeper._lm_loss(retain))]
     nll2 = np.full((n_docs, n_docs), np.nan)                                     # [k][j], j <= k
     witnesses = []
-    for k, it in enumerate(items):
-        x, _ = item_ids(store, it)
-        w = sleeper.consolidate(x)
-        witnesses.append({kk: v for kk, v in w.items() if kk != 'config'})
+    for g0 in range(0, n_docs, docs_per_sleep):
+        ks = list(range(g0, min(g0 + docs_per_sleep, n_docs)))
+        k = ks[-1]
+        w = sleeper.consolidate([item_ids(store, items[i])[0] for i in ks])
+        witnesses.append({kk: v for kk, v in w.items() if kk != 'config'} | {'docs': ks})
+        with torch.no_grad():
+            retain_lm.append(float(sleeper._lm_loss(retain)))
         for b0 in range(0, k + 1, batch_size):
             js = list(range(b0, min(b0 + batch_size, k + 1)))
             y = torch.stack([item_ids(store, items[j])[1] for j in js])
             nll2[k, js] = nll_positions(score_continuation(gen, y), y).mean(1).cpu().numpy()
-        kept_now = (nll3[k] - nll2[k, k]) / benefit[k] if abs(benefit[k]) > 1e-9 else float('nan')
+        kept_now = sum(nll3[i] - nll2[k, i] for i in ks) / max(sum(benefit[i] for i in ks), 1e-9)
         kept_first = (nll3[0] - nll2[k, 0]) / benefit[0] if abs(benefit[0]) > 1e-9 else float('nan')
-        ctx.log(f'  doc {k}: nll1={nll1[k]:.4f} nll2={nll2[k, k]:.4f} nll3={nll3[k]:.4f} kept_now={kept_now:.3f} '
-                f'kept_doc0={kept_first:.3f}' + (f' retain {w["retain_before"]:.3f}->{w["retain_after"]:.3f}'
-                                                 if 'retain_before' in w else ''))
+        ctx.log(f'  docs {ks[0]}-{k}: kept_now={kept_now:.3f} kept_doc0={kept_first:.3f} '
+                f'retain_lm {retain_lm[0]:.4f}->{retain_lm[-1]:.4f}')
     model.load_state_dict(snapshot)                                              # type: ignore[attr-defined]
     del snapshot
 
@@ -72,7 +84,8 @@ def run(ctx: EvalCtx, data_dir: str, shards: list[str] | None = None, n_docs: in
     by_age: dict[int, list[tuple[float, float]]] = defaultdict(list)           # age -> [(nll3 - nll2, benefit)]
     for k in range(n_docs):
         for j in range(k + 1):
-            by_age[k - j].append((nll3[j] - nll2[k, j], benefit[j]))
+            if not np.isnan(nll2[k, j]):
+                by_age[k - j].append((nll3[j] - nll2[k, j], benefit[j]))
     for a in sorted(by_age):
         num = sum(v for v, _ in by_age[a])
         den = sum(b for _, b in by_age[a])
@@ -87,15 +100,15 @@ def run(ctx: EvalCtx, data_dir: str, shards: list[str] | None = None, n_docs: in
     result.scalars['kept_final'] = float((np.array(nll3) - final).sum() / benefit.sum())
     result.scalars['ratio_final'] = 1.0 - result.scalars['kept_final']
     result.scalars['benefit'] = float(benefit.mean())
-    if witnesses and 'retain_before' in witnesses[0]:
-        result.scalars['retain_delta_final'] = witnesses[-1]['retain_after'] - witnesses[0]['retain_before']
-        result.items['retain_after'] = [w['retain_after'] for w in witnesses]
+    result.scalars['retain_delta_final'] = retain_lm[-1] - retain_lm[0]
+    result.items['retain_lm'] = retain_lm
     ctx.log('  ' + ' '.join(f'kept_age@{a}={result.scalars[f"kept_age@{a}"]:.3f}' for a in sorted(by_age)
                             if a in set(int(v) for v in ages) or a == n_docs - 1)
             + f' kept_final={result.scalars["kept_final"]:.3f}'
             + (f' retainΔ={result.scalars["retain_delta_final"]:+.4f}' if 'retain_delta_final' in result.scalars else ''))
     result.witness = {
         'n_docs': n_docs, 'x_len': x_len, 'y_len': y_len, 'gap': gap, 'method': method, 'sleep': cfg.asdict(),
+        'docs_per_sleep': docs_per_sleep,
         'items': [[store.entries[it.shard]['file'], it.doc] for it in items],
         'nll2': [[None if np.isnan(v) else round(float(v), 6) for v in row] for row in nll2],
         'consolidations': witnesses,
