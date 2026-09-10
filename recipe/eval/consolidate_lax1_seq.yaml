@@ -1,0 +1,46 @@
+# Sequential consolidation on LAX1: 32 same-document X|Y items (gap 256,
+# X 2048, Y 512) consolidated one after another into the same weights
+# at the phase-A operating point (replay_kl, 64 steps, lr 5e-5 const,
+# no LM mix, retain_kl 0.5), every earlier Y re-scored after each
+# consolidation. kept_age@a is the fraction of a document's context
+# benefit still in the weights a consolidations later; kept_final the
+# same after all 32. Variants by override, e.g. the ntp_x baseline at
+# its own best rung:
+#   tasks.0.args.method=ntp_x tasks.0.args.sleep.steps=16 tasks.0.args.sleep.lr=1e-5
+#   tasks.0.args.sleep.lm_mix=0.5 tasks.0.args.sleep.retain_kl=0
+
+eval_name: consolidate-seq32-replay-340M
+subjects:
+  - {ckpt: runs/gen-eval/lax1-model-final.pt, label: LAX1, run_meta: runs/cmp/lax1/meta.json}
+
+device: auto
+dtype: bfloat16
+seed: 0
+
+tasks:
+  - name: consolidation_seq
+    args:
+      data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+      n_docs: 32
+      x_len: 2048
+      y_len: 512
+      gap: 256
+      batch_size: 2
+      method: replay_kl
+      ages: [0, 1, 2, 4, 8, 16, 31]
+      sleep:
+        n_samples: 32
+        sample_len: 256
+        temperature: 1.0
+        sample_batch: 32
+        steps: 64
+        lr: 5e-5
+        batch: 8
+        lm_mix: 0.0
+        retain_kl: 0.5
+        lm_batch: 4
+        lm_len: 512
+        retain_windows: 8
+
+out_root: runs/eval
+registry_dir: registry/eval

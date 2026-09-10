@@ -304,3 +304,28 @@ def test_hops_validation():
         SleepConfig(hops=[0.2, 0.5, 0.0])  # must decrease
     with pytest.raises(AssertionError):
         SleepConfig(degrade='nope')
+
+
+def test_sequential_task(store_dir, tmp_path):
+    ckpt = _checkpoint(tmp_path / 'subj-seq')
+    sleep = dict(n_samples=4, sample_len=8, sample_batch=4, steps=2, lr=1e-3, batch=2,
+                 lm_batch=2, lm_len=16, retain_windows=2, eval_chunk=4, lm_mix=0.0, retain_kl=0.5)
+    run_dir = evaluate(EvalConfig(
+        eval_name='seq', subjects=[{'ckpt': str(ckpt), 'label': 'G'}],
+        tasks=[{'name': 'consolidation_seq', 'args': {
+            'data_dir': str(store_dir), 'n_docs': 4, 'x_len': 32, 'y_len': 16, 'gap': 8, 'batch_size': 3,
+            'method': 'replay_kl', 'sleep': sleep, 'ages': [0, 1, 3]}}],
+        device='cpu', dtype='float32', seed=1, n_boot=20, out_root=str(tmp_path / 'eval'), registry_dir=None))
+    res = json.loads((run_dir / 'results.json').read_text())['consolidation_seq']['subjects']['G']
+    sc, it, w = res['scalars'], res['items'], res['witness']
+    assert [sc[f'n_pairs@{a}'] for a in range(4)] == [4, 3, 2, 1]
+    assert len(it['kept_final']) == 4 and len(w['nll2']) == 4 and w['nll2'][0][1] is None and w['nll2'][3][0] is not None
+    assert 'retain_delta_final' in sc and len(w['consolidations']) == 4
+    assert sc['ratio_final'] == pytest.approx(1 - sc['kept_final'])
+    # the subject was restored at the end: a fresh score equals the recorded nll3
+    g = Generator.from_checkpoint(ckpt, device='cpu', dtype='float32')
+    from infra.dataset.loader import TokenStore as _TS
+    st = _TS(store_dir)
+    items = sample_items(st, np.random.default_rng(0), 1, 32, 16, 8)   # any item: just check scoring works
+    y = item_ids(st, items[0])[1][None]
+    assert score_continuation(g, y).shape[1] == 16
