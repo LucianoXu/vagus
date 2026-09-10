@@ -47,7 +47,10 @@ run_name: lax3-340M-fwe15B
 model_recipe: ../model/lax3_340M.yaml
 
 data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
-data_shards: null          # all 20 shards (16.7B tokens); 15B => 0.9 epoch
+data_shards: null          # all 140 shards (110.8B tokens); 15B => 0.14 epoch.
+                           # The same store the SAX / LAX1 runs used (LAX1's
+                           # registry entry records 140 shards / 110.8B), so the
+                           # batch sequence is identical to LAX1's by construction.
 
 context_len: 2048
 # 4 GPUs, single node; global batch = 4 * 8 * 8 * 2048 = 0.5M tokens.

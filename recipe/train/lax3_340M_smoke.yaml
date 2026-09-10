@@ -9,7 +9,8 @@
 #   OOMs at micro 16 (38 GB). Anything near the 40 GB ceiling means
 #   batch_size=4 grad_accum_steps=16 (same global batch, so the pairing
 #   with LAX1 survives), or chunk_size 128 in the model recipe.
-#   tokens_per_s / mfu against LAX1's ~0.20 Mtok/s on the same 4 GPUs.
+#   tokens_per_s / mfu against LAX1's median 150.8k tok/s on the same 4
+#   GPUs (registry lax1-340M-fwe15B-c9af2f44).
 #   Total FLOPs/token is only +2.7%, so a throughput drop much past that
 #   is the kernel at d_k 256, not the arithmetic.
 #   The gate probe in the slow metrics: mem_len median/max should start
@@ -26,7 +27,10 @@ run_name: lax3-340M-smoke
 model_recipe: ../model/lax3_340M.yaml
 
 data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
-data_shards: null          # all 20 shards (16.7B tokens); 15B => 0.9 epoch
+data_shards: null          # all 140 shards (110.8B tokens); 15B => 0.14 epoch.
+                           # The same store the SAX / LAX1 runs used (LAX1's
+                           # registry entry records 140 shards / 110.8B), so the
+                           # batch sequence is identical to LAX1's by construction.
 
 context_len: 2048
 # 4 GPUs, single node; global batch = 4 * 8 * 8 * 2048 = 0.5M tokens.

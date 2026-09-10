@@ -20,6 +20,16 @@
 #     so -t 00:30:00 leaves only ~10 min of training and cuts a
 #     60-step smoke short (job 30133340 stopped at step 38). Give a
 #     smoke 1200 s more than it needs, or pass deadline_margin_s=null.
+# 15B does NOT fit one walltime: at the measured 142.5k tok/s it needs
+# ~29.2 h against a 24 h allocation (LAX1 was the same, 150.8k -> 27.6 h).
+# Queue the continuation up front, after the first link, with the same
+# run_dir=; a link whose run is already complete exits at once instead of
+# holding the node:
+#   J1=$(sbatch --parsable recipe/slurm/raven_lax3_340M.sbatch)
+#   J2=$(sbatch --parsable --dependency=afterany:$J1 \
+#          recipe/slurm/raven_lax3_340M.sbatch \
+#          recipe/train/lax3_340M_fwe15B.yaml \
+#          run_dir=runs/lax3-340M-fwe15B-<commit8>)
 # Resubmitting the same script+config resumes from the latest recent
 # checkpoint (the run dir is <run_name>-<commit8>); a resubmit from a
 # newer checkout continues the original directory with run_dir=...
@@ -56,6 +66,17 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export OMP_NUM_THREADS=18
 
 echo "Job $SLURM_JOB_ID on $(hostname) | $(nvidia-smi -L | head -1) | config $CONFIG $*"
+
+# chain guard: a continuation link whose run already finished releases
+# the allocation immediately (run_dir=... is how links address the run)
+for arg in "$@"; do
+    case "$arg" in run_dir=*)
+        if [ -f "${arg#run_dir=}/model-final.pt" ]; then
+            echo "run ${arg#run_dir=} is complete (model-final.pt present); nothing to do"
+            exit 0
+        fi;;
+    esac
+done
 
 # --shutdown_timeout: torchrun also receives the group SIGTERM and would
 # SIGKILL the workers 30 s later by default, before rank 0 has finished
