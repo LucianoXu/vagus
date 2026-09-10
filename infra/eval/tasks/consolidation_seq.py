@@ -59,7 +59,7 @@ def run(ctx: EvalCtx, data_dir: str, shards: list[str] | None = None, n_docs: in
         for b0 in range(0, k + 1, batch_size):
             js = list(range(b0, min(b0 + batch_size, k + 1)))
             y = torch.stack([item_ids(store, items[j])[1] for j in js])
-            nll2[k, js] = nll_positions(score_continuation(gen, y), y).mean(1).numpy()
+            nll2[k, js] = nll_positions(score_continuation(gen, y), y).mean(1).cpu().numpy()
         kept_now = (nll3[k] - nll2[k, k]) / benefit[k] if abs(benefit[k]) > 1e-9 else float('nan')
         kept_first = (nll3[0] - nll2[k, 0]) / benefit[0] if abs(benefit[0]) > 1e-9 else float('nan')
         ctx.log(f'  doc {k}: nll1={nll1[k]:.4f} nll2={nll2[k, k]:.4f} nll3={nll3[k]:.4f} kept_now={kept_now:.3f} '
