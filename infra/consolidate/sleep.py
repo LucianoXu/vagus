@@ -120,7 +120,7 @@ class SleepConfig:
         assert self.teacher in ('fixed', 'chain'), self.teacher
         assert self.replay_from in ('end', 'uniform', 'surprise'), self.replay_from
         assert self.replay_from == 'end' or self.hops == (0.0,), 'positional replay is one-hop only'
-        assert self.replay_bin >= 1 and self.surprise_power >= 0
+        assert self.replay_bin >= 1                    # surprise_power < 0 favours the least surprising bins
         self.betas = tuple(self.betas)   # type: ignore[assignment]  # yaml gives a list
 
     def asdict(self) -> dict:
