@@ -382,7 +382,7 @@ def test_surprise_profile_and_positional_replay(store):
         s, t, info = sl.replay_from_x(x[0])
         assert s.shape == (6, 5) and t.shape == (6, 5, VOCAB)
         assert info['bins'] == 3 and sum(info['draws']) == 6 and (how == 'uniform') == ('surprise' not in info)
-        assert len(info['weights']) == 3 and abs(sum(info['weights']) - 1) < 1e-6
+        assert len(info['weights']) == 3 and abs(sum(info['weights']) - 1) < 1e-3   # recorded to 4 decimals
         if how == 'surprise':
             assert len(info['surprise']) == 3 and info['weights'][0] == 0 and info['draws'][0] == 0
     # a continuation drawn from the last bin is the same as replay() from the end memory
