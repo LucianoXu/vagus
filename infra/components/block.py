@@ -51,9 +51,12 @@ class Block(nn.Module, WithCache):
             layer_count=layer_count
         )
 
-    def forward(self, x, is_causal: bool = True):
+    def forward(self, x, is_causal: bool = True, cache: dict | None = None):
+        '''cache: the mixer's exported state as a constant entry point,
+        for a mixer whose forward takes one (GatedDeltaNet); None is the
+        ordinary stateless path.'''
         dx = self.rmsnorm1(x)
-        dx = self.att(dx, is_causal)
+        dx = self.att(dx, is_causal) if cache is None else self.att(dx, is_causal, cache=cache)  # type: ignore[call-arg]
         x = x + dx
 
         dx = self.rmsnorm2(x)

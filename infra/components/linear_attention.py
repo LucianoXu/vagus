@@ -715,13 +715,32 @@ class GatedDeltaNet(nn.Module, Mixer):
 
     # --- training / stateless -----------------------------------------
 
-    def forward(self, x, is_causal: bool = True):
+    def forward(self, x, is_causal: bool = True, cache: dict | None = None):
+        '''cache: an exported state of this layer (export_cache's dict:
+        `state` (B, H, dk, dv) and, with a short conv, the K pre-
+        activation caches) taken as a constant entry point — the
+        differentiable forward of a stream whose prefix is already in
+        the memory (consolidation's student at an intermediate memory).
+        With the conv caches the result equals decode_step from the
+        same loaded cache; without them the conv sees no history for
+        the first K-1 positions.'''
         assert is_causal, 'linear attention is causal by construction'
+        B, L = x.shape[0], x.shape[1]
         qp, kp, vp = self.wq(x), self.wk(x), self.wv(x)
         on = self._active_fusions(qp)
+        S0 = None
+        if cache is not None:
+            S0 = cache['state'].detach()
+            assert S0.shape == (B, self.head_count, self.key_head_dim, self.value_head_dim), S0.shape
+            if self.short_conv_size is not None and 'qp_cache' in cache:
+                qp = torch.cat([cache['qp_cache'].detach().to(qp.dtype), qp], dim=1)
+                kp = torch.cat([cache['kp_cache'].detach().to(kp.dtype), kp], dim=1)
+                vp = torch.cat([cache['vp_cache'].detach().to(vp.dtype), vp], dim=1)
         q, k, v = self._heads(qp, kp, vp, l2norm='l2norm' not in on)
+        if q.shape[1] != L:                # the conv history is consumed, not scored
+            q, k, v = q[:, -L:], k[:, -L:], v[:, -L:]
         g, beta = self._gates(x, raw_gate='gate' in on, raw_beta='beta' in on)
-        o, _ = self._scan(q, k, v, g, beta, None, fusions=on)
+        o, _ = self._scan(q, k, v, g, beta, S0, fusions=on)
         return self._output(o, x)
 
     @torch.no_grad()

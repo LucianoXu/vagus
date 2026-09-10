@@ -223,3 +223,84 @@ def test_retain_kl_and_schedule(store):
     before = {k: v.clone() for k, v in sl.original.state_dict().items()}
     sl.consolidate(torch.randint(2, VOCAB, (30,)))
     assert all(torch.equal(before[k], v) for k, v in sl.original.state_dict().items())
+
+
+# --- phase B: memory as an object, multi-hop curricula ------------------
+
+from infra.consolidate.memory import block_states, degrade, svd_truncate   # noqa: E402
+
+
+def test_forward_from_state_matches_decode():
+    '''The differentiable forward from a loaded memory equals the decode
+    path from the same memory (conv history included); without the conv
+    caches the first K-1 positions, and through the state everything
+    after, differ.'''
+    g = _gen()
+    x = torch.randint(2, VOCAB, (2, 25))
+    y = torch.randint(2, VOCAB, (2, 11))
+    g.reset(2, max_len=64)
+    g.prefill_ids(x)
+    m = g.export_state()
+    block = torch.cat([g.pending[:, None], y[:, :-1]], 1)
+    ref = g.model.decode_step(block, return_logits=True)
+    with torch.no_grad():
+        out = g.model(block, caches=m['cache']['blocks'])
+        noconv = g.model(block, caches=[{'att': {'state': c['att']['state']}} for c in m['cache']['blocks']])
+    assert out.shape == ref.shape
+    assert torch.allclose(out, ref, atol=1e-4)
+    assert not torch.allclose(noconv, ref, atol=1e-4)
+    # the memory-conditioned student differs from a fresh stream, and a blank memory equals one
+    g.reset(2, max_len=64)
+    blank = g.export_state()
+    with torch.no_grad():
+        fresh = g.model(block, caches=blank['cache']['blocks'])
+        plain = g.model(block)
+    assert torch.allclose(fresh, plain, atol=1e-5) and not torch.allclose(out, plain, atol=1e-2)
+    # gradients flow to the weights through the memory-conditioned forward
+    g.model.requires_grad_(True)
+    g.model(block, caches=m['cache']['blocks']).float().logsumexp(-1).mean().backward()
+    assert g.model.embedding.weight.grad is not None and g.model.embedding.weight.grad.abs().sum() > 0
+
+
+def test_degrade():
+    g = _gen()
+    g.reset(1, max_len=32)
+    g.prefill_ids(torch.randint(2, VOCAB, (1, 20)))
+    m = g.export_state()
+    Ss = block_states(m)
+    assert len(Ss) == 2 and all(S.shape == (1, 2, 16, 32) for S in Ss)
+    assert all(torch.equal(a, b) for a, b in zip(block_states(degrade(m, 1.0, 'scale')), Ss))
+    assert all(torch.equal(a, b) for a, b in zip(block_states(degrade(m, 1.0, 'svd')), Ss))
+    for how in ('scale', 'layers_topdown', 'layers_bottomup', 'svd'):
+        assert all((S == 0).all() for S in block_states(degrade(m, 0.0, how)))
+    half = block_states(degrade(m, 0.5, 'scale'))
+    assert torch.allclose(half[0], 0.5 * Ss[0])
+    td = block_states(degrade(m, 0.5, 'layers_topdown'))
+    assert torch.equal(td[0], Ss[0]) and (td[1] == 0).all()
+    bu = block_states(degrade(m, 0.5, 'layers_bottomup'))
+    assert (bu[0] == 0).all() and torch.equal(bu[1], Ss[1])
+    t = svd_truncate(Ss[0], 0.25)                                   # rank <= ceil(0.25 * 16) = 4
+    assert t.shape == Ss[0].shape and torch.linalg.matrix_rank(t[0, 0]) <= 4 and t.dtype == Ss[0].dtype
+    assert torch.equal(block_states(m)[0], Ss[0])                     # the input is untouched
+
+
+@pytest.mark.parametrize('teacher', ['fixed', 'chain'])
+@pytest.mark.parametrize('how', ['scale', 'layers_topdown', 'svd'])
+def test_multihop(store, teacher, how):
+    g = _gen()
+    cfg = SleepConfig(n_samples=4, sample_len=10, sample_batch=4, steps=5, lr=1e-3, batch=4, lm_batch=2,
+                      lm_len=16, retain_windows=2, eval_chunk=4, hops=[0.5, 0.0], degrade=how, teacher=teacher)
+    w = Sleeper(g, store, cfg).consolidate(torch.randint(2, VOCAB, (30,)))
+    assert [h['level'] for h in w['hops']] == [0.5, 0.0] and [h['steps'] for h in w['hops']] == [2, 3]
+    assert len(w['distill_loss']) == 5 and all('kl_before' in h and 'kl_after' in h for h in w['hops'])
+    assert w['kl_after'] < w['kl_before']
+    assert next(g.model.parameters()).dtype == torch.float32
+
+
+def test_hops_validation():
+    with pytest.raises(AssertionError):
+        SleepConfig(hops=[0.5])            # must end at 0
+    with pytest.raises(AssertionError):
+        SleepConfig(hops=[0.2, 0.5, 0.0])  # must decrease
+    with pytest.raises(AssertionError):
+        SleepConfig(degrade='nope')

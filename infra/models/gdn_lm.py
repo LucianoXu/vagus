@@ -155,10 +155,20 @@ class GDNLM(nn.Module, Decodable):
         for blk in self.blocks:
             blk.compile()
 
-    def forward(self, tokens, is_causal: bool = True, return_hidden: bool = False):
+    def forward(self, tokens, is_causal: bool = True, return_hidden: bool = False,
+                caches: list | None = None):
+        '''caches: export_cache()['blocks'] (or a list with None for
+        blocks started blank) taken as constant entry points — the
+        differentiable forward of a stream whose prefix is already in
+        the memory. See GatedDeltaNet.forward.'''
         x = self.embedding(tokens)
-        for blk in self.blocks:
-            x = blk(x, is_causal)
+        if caches is None:
+            for blk in self.blocks:
+                x = blk(x, is_causal)
+        else:
+            assert len(caches) == len(self.blocks), (len(caches), len(self.blocks))
+            for blk, c in zip(self.blocks, caches):
+                x = blk(x, is_causal, cache=None if c is None else c['att'])
         x = self.rms_head(x)
         if return_hidden:
             return x

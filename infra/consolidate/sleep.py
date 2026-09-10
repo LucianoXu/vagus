@@ -15,6 +15,17 @@
 #   Replay tokens after a BOS the model emitted are masked: the document
 #   the memory conditions ended there.
 #
+#   Multi-hop (hops = levels of the student's memory, ending at 0): the
+#   memory is removed in steps m -> m' -> ... -> m0 (memory.py chooses
+#   how — uniform scaling, layer by layer, by singular value), the
+#   student at each hop reads the replay from the degraded memory
+#   through the differentiable forward (GDNLM.forward(states=...)) and
+#   is trained to match the teacher; the last hop is the blank-memory
+#   student above. teacher='fixed' keeps (w, m) as the teacher
+#   throughout; 'chain' re-samples the replay at each hop from the
+#   current weights at the previous hop's memory, the literal reading
+#   of "compare (w, m) with (w', m')" hop by hop.
+#
 # ntp_x — the baseline consolidation must beat: the same optimiser
 #   budget spent on next-token loss over X itself (the context read
 #   with no memory involved), same LM mix. If replay_kl cannot beat
@@ -47,6 +58,7 @@ import torch.nn.functional as F
 from ..dataset.loader import TokenStore
 from ..inference import Generator, SamplingConfig
 from ..optimizer import build_adamw
+from .memory import DEGRADATIONS, degrade
 
 METHODS = ('replay_kl', 'ntp_x')
 
@@ -76,6 +88,10 @@ class SleepConfig:
     lm_batch: int = 4
     lm_len: int = 512
     retain_windows: int = 8        # fixed windows scored before / after (forgetting witness)
+    # multi-hop curriculum (replay_kl): student memory level per hop, last must be 0
+    hops: tuple[float, ...] = (0.0,)
+    degrade: str = 'scale'         # memory.DEGRADATIONS
+    teacher: str = 'fixed'         # fixed | chain
     seed: int = 0
     eval_chunk: int = 8            # rows per no-grad pass when scoring the replay set
 
@@ -83,6 +99,11 @@ class SleepConfig:
         assert self.method in METHODS, f'method {self.method!r} not in {METHODS}'
         assert self.lr_schedule in ('const', 'cosine', 'linear'), self.lr_schedule
         assert 0 <= self.warmup <= self.steps
+        self.hops = tuple(float(h) for h in self.hops)   # type: ignore[assignment]
+        assert self.hops and self.hops[-1] == 0.0 and all(0.0 <= h <= 1.0 for h in self.hops), self.hops
+        assert all(a > b for a, b in zip(self.hops, self.hops[1:])), f'hops must decrease: {self.hops}'
+        assert self.degrade in DEGRADATIONS, self.degrade
+        assert self.teacher in ('fixed', 'chain'), self.teacher
         self.betas = tuple(self.betas)   # type: ignore[assignment]  # yaml gives a list
 
     def asdict(self) -> dict:
@@ -96,7 +117,7 @@ def _expand(obj, K: int):
         if obj.dim() == 0:
             return obj
         assert obj.shape[0] == 1, f'expected a batch-1 state, got {tuple(obj.shape)}'
-        return obj.expand(K, *obj.shape[1:]).clone()
+        return obj.expand(K, *obj.shape[1:])
     if isinstance(obj, dict):
         return {k: _expand(v, K) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
@@ -226,6 +247,22 @@ class Sleeper:
         bos = torch.full((s.shape[0], 1), self.start_id, dtype=torch.int64, device=self.device)
         return torch.cat([bos, s[:, :-1]], dim=1)
 
+    def _student_logits(self, s: torch.Tensor, mem: dict | None) -> torch.Tensor:
+        '''Logits predicting s (b, N) from the student: a fresh stream
+        (start_id + s) when mem is None, else the stream continuing
+        from mem's pending token with mem's matrix states as entry
+        states (the differentiable forward).'''
+        if mem is None:
+            return self._forward(self._student_input(s))
+        b = s.shape[0]
+        pending = mem['pending'].expand(b)
+        block = torch.cat([pending[:, None], s[:, :-1]], dim=1)
+        caches = _expand(mem['cache'], b)['blocks']
+        if self.autocast:
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                return self.model(block, caches=caches)
+        return self.model(block, caches=caches)
+
     def _kl(self, student_logits: torch.Tensor, teacher_logits: torch.Tensor,
             valid: torch.Tensor) -> torch.Tensor:
         '''Mean over valid positions of KL(teacher || student), fp32.'''
@@ -235,14 +272,15 @@ class Sleeper:
         return (kl * valid).sum() / valid.sum().clamp(min=1)
 
     @torch.no_grad()
-    def _replay_kl(self, s: torch.Tensor, teacher: torch.Tensor, valid: torch.Tensor) -> float:
+    def _replay_kl(self, s: torch.Tensor, teacher: torch.Tensor, valid: torch.Tensor,
+                   mem: dict | None = None) -> float:
         tot, cnt = 0.0, 0
         for b0 in range(0, s.shape[0], self.cfg.eval_chunk):
             sl = slice(b0, b0 + self.cfg.eval_chunk)
             n = int(valid[sl].sum())
             if n == 0:
                 continue
-            tot += float(self._kl(self._forward(self._student_input(s[sl])), teacher[sl], valid[sl])) * n
+            tot += float(self._kl(self._student_logits(s[sl], mem), teacher[sl], valid[sl])) * n
             cnt += n
         return tot / max(cnt, 1)
 
@@ -255,12 +293,11 @@ class Sleeper:
         orig_dtype = _param_dtype(self.model)
         retain = self._windows(cfg.retain_windows, cfg.lm_len) if cfg.retain_windows else None
 
-        s = teacher = valid = None
+        m = s = teacher = valid = None
         if cfg.method == 'replay_kl':
             m = self.read(x)
             s, teacher = self.replay(m)
             valid = self._valid(s)
-            del m
 
         self.model.float()
         for p in self.model.parameters():
@@ -280,41 +317,71 @@ class Sleeper:
                 witness['kl_before'] = self._replay_kl(s, teacher, valid)
                 witness['replay_valid_frac'] = float(valid.float().mean())
 
+        # the hop plan: (student memory level, steps); ntp_x is one hop at level 0
+        levels = list(cfg.hops) if cfg.method == 'replay_kl' else [0.0]
+        per_hop = [cfg.steps // len(levels)] * len(levels)
+        per_hop[-1] += cfg.steps - sum(per_hop)
         bos = torch.full((1, 1), self.start_id, dtype=torch.int64, device=self.device)
         xin = torch.cat([bos, x[None]], dim=1)          # start + X: X's tokens are the targets
-        losses = []
-        for step in range(cfg.steps):
-            f = lr_factor(step, cfg.steps, cfg.lr_schedule, cfg.warmup)
-            for g in opt.param_groups:
-                g['lr'] = cfg.lr * f
-            opt.zero_grad(set_to_none=True)
+        losses: list[float] = []
+        hops: list[dict] = []
+        step = 0
+        for h, (level, n_steps) in enumerate(zip(levels, per_hop)):
+            mem = None
+            if cfg.method == 'replay_kl':
+                assert m is not None
+                mem = degrade(m, level, cfg.degrade) if level > 0 else None
+                if cfg.teacher == 'chain' and h > 0:
+                    # the previous hop's student, (w_h, m_{h-1}), becomes the teacher
+                    prev = degrade(m, levels[h - 1], cfg.degrade)
+                    with torch.no_grad():
+                        s, teacher = self.replay(prev)
+                    valid = self._valid(s)
+                assert s is not None and teacher is not None and valid is not None
+                hop = {'level': level, 'steps': n_steps}
+                with torch.no_grad():
+                    hop['kl_before'] = self._replay_kl(s, teacher, valid, mem)
+            else:
+                hop = {'level': 0.0, 'steps': n_steps}
+            for _ in range(n_steps):
+                f = lr_factor(step, cfg.steps, cfg.lr_schedule, cfg.warmup)
+                for g in opt.param_groups:
+                    g['lr'] = cfg.lr * f
+                opt.zero_grad(set_to_none=True)
+                if cfg.method == 'replay_kl':
+                    assert s is not None and teacher is not None and valid is not None
+                    idx = torch.from_numpy(self.rng.choice(s.shape[0], size=min(cfg.batch, s.shape[0]),
+                                                           replace=False)).to(self.device)
+                    distill = self._kl(self._student_logits(s[idx], mem), teacher[idx], valid[idx])
+                else:
+                    # chunks of start+X; a chunk's first token is its context, as _lm_loss
+                    L, C = xin.shape[1], cfg.chunk_len + 1
+                    if L <= C:
+                        chunks = xin.expand(cfg.batch, L)
+                    else:
+                        starts = self.rng.integers(0, L - C + 1, size=cfg.batch)
+                        chunks = torch.stack([xin[0, st:st + C] for st in starts])
+                    distill = self._lm_loss(chunks)
+                loss = distill
+                if cfg.lm_mix > 0 or cfg.retain_kl > 0:
+                    win = self._windows(cfg.lm_batch, cfg.lm_len)
+                    if cfg.lm_mix > 0:
+                        loss = loss + cfg.lm_mix * self._lm_loss(win)
+                    if cfg.retain_kl > 0:
+                        loss = loss + cfg.retain_kl * self._retain_kl(win)
+                loss.backward()
+                if cfg.grad_clip:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), cfg.grad_clip)
+                opt.step()
+                losses.append(float(distill.detach()))
+                step += 1
             if cfg.method == 'replay_kl':
                 assert s is not None and teacher is not None and valid is not None
-                idx = torch.from_numpy(self.rng.choice(s.shape[0], size=min(cfg.batch, s.shape[0]),
-                                                       replace=False)).to(self.device)
-                distill = self._kl(self._forward(self._student_input(s[idx])), teacher[idx], valid[idx])
-            else:
-                # chunks of start+X; a chunk's first token is its context, as _lm_loss
-                L, C = xin.shape[1], cfg.chunk_len + 1
-                if L <= C:
-                    chunks = xin.expand(cfg.batch, L)
-                else:
-                    starts = self.rng.integers(0, L - C + 1, size=cfg.batch)
-                    chunks = torch.stack([xin[0, st:st + C] for st in starts])
-                distill = self._lm_loss(chunks)
-            loss = distill
-            if cfg.lm_mix > 0 or cfg.retain_kl > 0:
-                win = self._windows(cfg.lm_batch, cfg.lm_len)
-                if cfg.lm_mix > 0:
-                    loss = loss + cfg.lm_mix * self._lm_loss(win)
-                if cfg.retain_kl > 0:
-                    loss = loss + cfg.retain_kl * self._retain_kl(win)
-            loss.backward()
-            if cfg.grad_clip:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), cfg.grad_clip)
-            opt.step()
-            losses.append(float(distill.detach()))
+                with torch.no_grad():
+                    hop['kl_after'] = self._replay_kl(s, teacher, valid, mem)
+            hops.append(hop)
         witness['distill_loss'] = losses
+        witness['hops'] = hops
 
         with torch.no_grad():
             if retain is not None:
