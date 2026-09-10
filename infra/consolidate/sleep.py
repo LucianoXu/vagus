@@ -26,6 +26,17 @@
 #   current weights at the previous hop's memory, the literal reading
 #   of "compare (w, m) with (w', m')" hop by hop.
 #
+#   Prioritised replay (replay_from): 'end' starts every continuation
+#   from the memory after all of X; 'uniform' / 'surprise' start them
+#   from the memory at positions inside X — X cut into replay_bin-token
+#   bins, a bin drawn uniformly or with probability proportional to its
+#   summed delta-rule residual (GDNLM.surprise: what the memory failed
+#   to predict about what it stored, the CA1 comparator's signal),
+#   standardised across the document's bins and exponentiated with
+#   surprise_power. The biological replay's bias towards novel and
+#   surprising episodes, made a sampling weight. On LAX1 the high
+#   residuals sit at section breaks, topic changes and rare names.
+#
 # ntp_x — the baseline consolidation must beat: the same optimiser
 #   budget spent on next-token loss over X itself (the context read
 #   with no memory involved), same LM mix. If replay_kl cannot beat
@@ -72,6 +83,9 @@ class SleepConfig:
     temperature: float = 1.0
     top_p: float | None = None
     sample_batch: int = 32         # continuations sampled in parallel
+    replay_from: str = 'end'       # end | uniform | surprise: where in X the replays start
+    replay_bin: int = 64           # tokens per bin for uniform / surprise starts
+    surprise_power: float = 1.0    # bin weight = exp(power * z), z the standardised bin residual sum
     # optimisation
     steps: int = 16
     lr: float = 1e-5
@@ -104,6 +118,9 @@ class SleepConfig:
         assert all(a > b for a, b in zip(self.hops, self.hops[1:])), f'hops must decrease: {self.hops}'
         assert self.degrade in DEGRADATIONS, self.degrade
         assert self.teacher in ('fixed', 'chain'), self.teacher
+        assert self.replay_from in ('end', 'uniform', 'surprise'), self.replay_from
+        assert self.replay_from == 'end' or self.hops == (0.0,), 'positional replay is one-hop only'
+        assert self.replay_bin >= 1 and self.surprise_power >= 0
         self.betas = tuple(self.betas)   # type: ignore[assignment]  # yaml gives a list
 
     def asdict(self) -> dict:
@@ -237,6 +254,77 @@ class Sleeper:
             teacher.append(t)
         return torch.cat(samples), torch.cat(teacher)
 
+    @torch.no_grad()
+    def replay_from_x(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, dict]:
+        '''K continuations started from the memory at positions inside
+        x (Lx,), the start bin of each drawn by cfg.replay_from, plus
+        the teacher logits under the memory at that position and a
+        record: the per-bin surprise profile and the bins drawn.'''
+        cfg = self.cfg
+        L = int(x.shape[0])
+        nb = max(L // cfg.replay_bin, 1)
+        edges = [min((b + 1) * cfg.replay_bin, L) for b in range(nb)]
+        edges[-1] = L                                              # the remainder joins the last bin
+        info: dict = {'bins': nb, 'bin_len': cfg.replay_bin}
+        if cfg.replay_from == 'surprise':
+            prof = self.model.surprise(x[None].to(self.device)).mean(dim=(2, 3))[0]   # (L,)  # type: ignore[operator]
+            lo = 0
+            weights = []
+            for hi in edges:
+                weights.append(float(prof[lo:hi].sum()))
+                lo = hi
+            # bin sums vary by a few percent around a large floor (most layers
+            # never predict most of a value), so the weight is exp(power * z)
+            # with z the bin's standardised sum; the first bin is excluded —
+            # its residuals are high only because the memory is still empty
+            a = np.asarray(weights, dtype=np.float64)
+            info['surprise'] = [round(v, 4) for v in weights]
+            if nb > 1:
+                z = (a[1:] - a[1:].mean()) / (a[1:].std() + 1e-9)
+                w = np.concatenate([[0.0], np.exp(cfg.surprise_power * z)])
+            else:
+                w = np.ones(1)
+        else:
+            w = np.ones(nb)
+        w = w / w.sum()
+        info['weights'] = [round(float(v), 4) for v in w]
+        draws = self.rng.choice(nb, size=cfg.n_samples, p=w)
+        counts = np.bincount(draws, minlength=nb)
+        info['draws'] = counts.tolist()
+        # walk x once, exporting the memory at the end of every drawn bin
+        N = cfg.sample_len
+        self.gen.reset(1, max_len=1 + L + N)
+        pos = 0
+        seed0 = int(self.rng.integers(0, 2 ** 31))
+        samples, teacher = [], []
+        for b in range(nb):
+            hi = edges[b]
+            if hi > pos:
+                self.gen.prefill_ids(x[None, pos:hi].to(self.device))
+                pos = hi
+            n = int(counts[b])
+            if n == 0:
+                continue
+            m = self.gen.export_state()
+            for b0 in range(0, n, cfg.sample_batch):
+                bb = min(cfg.sample_batch, n - b0)
+                state = {**m, 'cache': _expand(m['cache'], bb), 'pending': _expand(m['pending'], bb),
+                         'batch_size': bb}
+                self.gen.load_state(state, max_len=hi + 1 + N)
+                s_ = self.gen.gen_ids(SamplingConfig(max_new_tokens=N, temperature=cfg.temperature,
+                                                     top_p=cfg.top_p, stop_ids=(), seed=seed0 + b * 1000 + b0))
+                assert s_.shape == (bb, N), s_.shape
+                self.gen.load_state(state, max_len=hi + 1 + N)
+                assert self.gen.pending is not None
+                block = torch.cat([self.gen.pending[:, None], s_[:, :-1]], dim=1)
+                t = self.model.decode_step(block, return_logits=True)
+                assert t is not None
+                samples.append(s_)
+                teacher.append(t)
+            # resume the walk from the full memory at hi
+            self.gen.load_state(m, max_len=1 + L + N)
+        return torch.cat(samples), torch.cat(teacher), info
+
     def _valid(self, s: torch.Tensor) -> torch.Tensor:
         '''(K, N) bool: positions up to and including the first
         start_id the model emitted (the document ends there).'''
@@ -302,17 +390,22 @@ class Sleeper:
         retain = self._windows(cfg.retain_windows, cfg.lm_len) if cfg.retain_windows else None
 
         m = s = teacher = valid = None
+        replay_info = []
         if cfg.method == 'replay_kl':
             ss, ts = [], []
             for t in xs:
-                m = self.read(t)
-                a, b = self.replay(m)
+                if cfg.replay_from == 'end':
+                    m = self.read(t)
+                    a, b = self.replay(m)
+                else:
+                    a, b, info = self.replay_from_x(t)
+                    replay_info.append(info)
                 ss.append(a)
                 ts.append(b)
             s, teacher = torch.cat(ss), torch.cat(ts)
             valid = self._valid(s)
-            if len(xs) > 1:
-                m = None                        # no single memory for intermediate hops
+            if len(xs) > 1 or cfg.replay_from != 'end':
+                m = None                        # no single end memory for intermediate hops
         x = xs[0]
 
         self.model.float()
@@ -322,6 +415,8 @@ class Sleeper:
                                        'weight_decay': cfg.weight_decay})
         witness: dict = {'method': cfg.method, 'x_len': int(x.shape[0]), 'n_contexts': len(xs),
                          'config': cfg.asdict()}
+        if replay_info:
+            witness['replay'] = replay_info
         if cfg.retain_kl > 0:
             self._original()
         with torch.no_grad():

@@ -344,3 +344,60 @@ def test_sequential_task(store_dir, tmp_path):
     items = sample_items(st, np.random.default_rng(0), 1, 32, 16, 8)   # any item: just check scoring works
     y = item_ids(st, items[0])[1][None]
     assert score_continuation(g, y).shape[1] == 16
+
+
+# --- prioritised replay -------------------------------------------------
+
+from infra.components.linear_attention import recurrent_scan, residual_scan   # noqa: E402
+
+
+def test_residual_scan_matches_recurrence():
+    torch.manual_seed(0)
+    B, L, H, dk, dv = 2, 9, 2, 4, 6
+    k = torch.nn.functional.normalize(torch.randn(B, L, H, dk), dim=-1)
+    v = torch.randn(B, L, H, dv)
+    g = -torch.rand(B, L, H, dk) * 0.5
+    beta = torch.rand(B, L, H)
+    r = residual_scan(k, v, g, beta, None, delta=True)
+    assert r.shape == (B, L, H) and (r >= 0).all()
+    # position t's residual is |v_t - k_t^T S_{t-1}| / |v_t| with S_{t-1} from the recurrence, decayed
+    for t in (0, 4, 8):
+        _, S = recurrent_scan(k[:, :t], k[:, :t], v[:, :t], g[:, :t], beta[:, :t], None, scale=1.0, delta=True)
+        S = S * g[:, t].exp()[..., None]
+        kS = torch.einsum('bhk,bhkv->bhv', k[:, t], S)
+        ref = (v[:, t] - kS).norm(dim=-1) / v[:, t].norm(dim=-1)
+        assert torch.allclose(r[:, t], ref, atol=1e-5), t
+    assert torch.allclose(r[:, 0], torch.ones(B, H))                 # nothing stored yet: residual = v
+    assert (residual_scan(k, v, g, beta, None, delta=False) == 1).all()
+
+
+def test_surprise_profile_and_positional_replay(store):
+    g = _gen()
+    x = torch.randint(2, VOCAB, (1, 30))
+    prof = g.model.surprise(x)
+    assert prof.shape == (1, 30, 2, 2) and (prof >= 0).all() and torch.allclose(prof[:, 0], torch.ones(1, 2, 2))
+    for how in ('uniform', 'surprise'):
+        cfg = SleepConfig(n_samples=6, sample_len=5, sample_batch=4, replay_from=how, replay_bin=8, surprise_power=2.0)
+        sl = Sleeper(g, store, cfg)
+        s, t, info = sl.replay_from_x(x[0])
+        assert s.shape == (6, 5) and t.shape == (6, 5, VOCAB)
+        assert info['bins'] == 3 and sum(info['draws']) == 6 and (how == 'uniform') == ('surprise' not in info)
+        assert len(info['weights']) == 3 and abs(sum(info['weights']) - 1) < 1e-6
+        if how == 'surprise':
+            assert len(info['surprise']) == 3 and info['weights'][0] == 0 and info['draws'][0] == 0
+    # a continuation drawn from the last bin is the same as replay() from the end memory
+    torch.manual_seed(1)
+    cfg = SleepConfig(n_samples=1, sample_len=5, sample_batch=1, replay_from='uniform', replay_bin=30)
+    sl = Sleeper(g, store, cfg)
+    s1, t1, info = sl.replay_from_x(x[0])
+    assert info['bins'] == 1
+    sl2 = Sleeper(g, store, SleepConfig(n_samples=1, sample_len=5, sample_batch=1))
+    m = sl2.read(x[0])
+    assert torch.allclose(m['cache']['blocks'][0]['att']['state'], sl.gen.export_state()['cache']['blocks'][0]['att']['state'])
+    # the whole sleep runs with positional replay
+    w = Sleeper(g, store, SleepConfig(n_samples=4, sample_len=6, sample_batch=4, steps=2, lr=1e-3, batch=4,
+                                      lm_batch=2, lm_len=16, retain_windows=2, replay_from='surprise',
+                                      replay_bin=8)).consolidate(x[0])
+    assert w['replay'][0]['draws'] and len(w['distill_loss']) == 2
+    with pytest.raises(AssertionError):
+        SleepConfig(replay_from='surprise', hops=[0.5, 0.0])
