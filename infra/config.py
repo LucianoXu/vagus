@@ -37,20 +37,40 @@ def parse_value(text: str):
 
 def apply_overrides(raw: dict, overrides: list[str] | tuple[str, ...]) -> dict:
     '''`key=value` strings applied to a loaded recipe dict, for launch-time
-    variations of one recipe (smoke runs, a kernel A/B): the recipe file
-    stays the record, the resolved config written to the run dir carries
-    the result. A dotted key reaches one level into a dict field
-    (`model_args.la_fused=true`). Returns a new dict.'''
+    variations of one recipe (smoke runs, a kernel A/B, a sweep cell):
+    the recipe file stays the record, the resolved config written to the
+    run dir carries the result. A dotted key walks into the recipe —
+    dict fields by name, list entries by index — creating dict levels
+    that do not exist yet (`model_args.la_fused=true`,
+    `tasks.0.args.sleep.lr=1e-4`). Containers on the path are copied,
+    never mutated. Returns a new dict.'''
     raw = dict(raw)
     for item in overrides:
         key, sep, value = item.partition('=')
         if not sep or not key:
             raise ValueError(f'override {item!r} is not key=value')
-        outer, dot, inner = key.partition('.')
-        if not dot:
-            raw[key] = parse_value(value)
-            continue
-        if not isinstance(raw.get(outer), dict):
-            raise ValueError(f'override {item!r}: {outer} is not a dict field')
-        raw[outer] = dict(raw[outer]) | {inner: parse_value(value)}
+        raw = _set_path(raw, key.split('.'), parse_value(value), item)
     return raw
+
+
+def _set_path(node, path: list[str], value, item: str):
+    head, rest = path[0], path[1:]
+    if isinstance(node, list):
+        try:
+            i = int(head)
+        except ValueError:
+            raise ValueError(f'override {item!r}: {head!r} is not a list index') from None
+        if not 0 <= i < len(node):
+            raise ValueError(f'override {item!r}: index {i} out of range ({len(node)} entries)')
+        node = list(node)
+        node[i] = value if not rest else _set_path(node[i], rest, value, item)
+        return node
+    if not isinstance(node, dict):
+        raise ValueError(f'override {item!r}: {head!r} is not inside a dict or list')
+    node = dict(node)
+    if not rest:
+        node[head] = value
+    else:
+        child = node.get(head)
+        node[head] = _set_path({} if child is None else child, rest, value, item)
+    return node

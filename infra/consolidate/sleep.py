@@ -20,10 +20,23 @@
 #   with no memory involved), same LM mix. If replay_kl cannot beat
 #   this, the memory contributed nothing beyond the text it saw.
 #
+# Two regularisers keep the model from collapsing onto one document:
+#   lm_mix     plain LM loss on random windows of the training store
+#   retain_kl  KL(original model || student) on random windows of the
+#              store, the original weights kept as a frozen teacher —
+#              "change nothing the context did not ask for", a tighter
+#              anchor than the LM loss, which only says "stay good".
+#
+# lr_schedule: const, or cosine / linear decay to zero after `warmup`
+# steps (a per-item fine-tune is a small training run; a decay lets a
+# larger peak lr end at a settled point).
+#
 # Weights train in fp32 (an AdamW step at lr 1e-5 vanishes in bf16),
 # under bf16 autocast on CUDA; the model returns to its original dtype
 # before the caller scores it.
 
+import copy
+import math
 from dataclasses import asdict, dataclass
 from typing import Callable
 
@@ -55,8 +68,11 @@ class SleepConfig:
     batch: int = 8                 # replay rows per step (replay_kl); X chunks per step (ntp_x)
     chunk_len: int = 512           # ntp_x: X is cut into chunks of this length
     grad_clip: float | None = 1.0
-    # LM mix: loss = distill + lm_mix * CE(windows of the store)
+    lr_schedule: str = 'const'     # const | cosine | linear (decay to 0 after warmup)
+    warmup: int = 0                # linear warmup steps from 0 to lr
+    # regularisers: loss = distill + lm_mix * CE(windows) + retain_kl * KL(original || student)(windows)
     lm_mix: float = 0.5
+    retain_kl: float = 0.0
     lm_batch: int = 4
     lm_len: int = 512
     retain_windows: int = 8        # fixed windows scored before / after (forgetting witness)
@@ -65,6 +81,8 @@ class SleepConfig:
 
     def __post_init__(self):
         assert self.method in METHODS, f'method {self.method!r} not in {METHODS}'
+        assert self.lr_schedule in ('const', 'cosine', 'linear'), self.lr_schedule
+        assert 0 <= self.warmup <= self.steps
         self.betas = tuple(self.betas)   # type: ignore[assignment]  # yaml gives a list
 
     def asdict(self) -> dict:
@@ -90,6 +108,20 @@ def _param_dtype(model) -> torch.dtype:
     return next(model.parameters()).dtype
 
 
+def lr_factor(step: int, steps: int, schedule: str, warmup: int) -> float:
+    '''Multiplier of the peak lr at `step` (0-based): linear warmup over
+    `warmup` steps, then const, or cosine / linear decay reaching 0 at
+    the last step.'''
+    if warmup and step < warmup:
+        return (step + 1) / warmup
+    if schedule == 'const' or steps - warmup <= 1:
+        return 1.0
+    t = (step - warmup) / (steps - 1 - warmup)          # 0 at the first post-warmup step, 1 at the last
+    if schedule == 'linear':
+        return 1.0 - t
+    return 0.5 * (1.0 + math.cos(math.pi * t))
+
+
 class Sleeper:
 
     def __init__(self, gen: Generator, store: TokenStore, cfg: SleepConfig,
@@ -104,6 +136,24 @@ class Sleeper:
         self.start_id: int = gen.start_id
         self.rng = np.random.default_rng(cfg.seed)
         self.autocast = (self.device.type == 'cuda')
+        self.original: torch.nn.Module | None = None   # frozen copy of the weights, for retain_kl
+
+    def _original(self) -> torch.nn.Module:
+        '''The subject's original weights, copied once (in the model's
+        serving dtype) the first time a retain term needs them; the
+        caller restores the model between items, so the copy stays valid.'''
+        if self.original is None:
+            self.original = copy.deepcopy(self.model).eval()
+            for p in self.original.parameters():
+                p.requires_grad_(False)
+        return self.original
+
+    def _retain_kl(self, win: torch.Tensor) -> torch.Tensor:
+        '''KL(original || student) averaged over the positions of win[:, :-1].'''
+        with torch.no_grad():
+            t = self._original()(win[:, :-1])
+        s_ = self._forward(win[:, :-1])
+        return self._kl(s_, t, torch.ones(win.shape[0], win.shape[1] - 1, dtype=torch.bool, device=self.device))
 
     # --- windows of the store (LM mix and retention witness) -----------
 
@@ -218,9 +268,13 @@ class Sleeper:
         opt = build_adamw(self.model, {'lr': cfg.lr, 'betas': list(cfg.betas),
                                        'weight_decay': cfg.weight_decay})
         witness: dict = {'method': cfg.method, 'x_len': int(x.shape[0]), 'config': cfg.asdict()}
+        if cfg.retain_kl > 0:
+            self._original()
         with torch.no_grad():
             if retain is not None:
                 witness['retain_before'] = float(self._lm_loss(retain))
+                if cfg.retain_kl > 0:
+                    witness['retain_kl_before'] = float(self._retain_kl(retain))
             if cfg.method == 'replay_kl':
                 assert s is not None and teacher is not None and valid is not None
                 witness['kl_before'] = self._replay_kl(s, teacher, valid)
@@ -230,6 +284,9 @@ class Sleeper:
         xin = torch.cat([bos, x[None]], dim=1)          # start + X: X's tokens are the targets
         losses = []
         for step in range(cfg.steps):
+            f = lr_factor(step, cfg.steps, cfg.lr_schedule, cfg.warmup)
+            for g in opt.param_groups:
+                g['lr'] = cfg.lr * f
             opt.zero_grad(set_to_none=True)
             if cfg.method == 'replay_kl':
                 assert s is not None and teacher is not None and valid is not None
@@ -246,8 +303,12 @@ class Sleeper:
                     chunks = torch.stack([xin[0, st:st + C] for st in starts])
                 distill = self._lm_loss(chunks)
             loss = distill
-            if cfg.lm_mix > 0:
-                loss = loss + cfg.lm_mix * self._lm_loss(self._windows(cfg.lm_batch, cfg.lm_len))
+            if cfg.lm_mix > 0 or cfg.retain_kl > 0:
+                win = self._windows(cfg.lm_batch, cfg.lm_len)
+                if cfg.lm_mix > 0:
+                    loss = loss + cfg.lm_mix * self._lm_loss(win)
+                if cfg.retain_kl > 0:
+                    loss = loss + cfg.retain_kl * self._retain_kl(win)
             loss.backward()
             if cfg.grad_clip:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), cfg.grad_clip)
@@ -258,6 +319,8 @@ class Sleeper:
         with torch.no_grad():
             if retain is not None:
                 witness['retain_after'] = float(self._lm_loss(retain))
+                if cfg.retain_kl > 0:
+                    witness['retain_kl_after'] = float(self._retain_kl(retain))
             if cfg.method == 'replay_kl':
                 assert s is not None and teacher is not None and valid is not None
                 witness['kl_after'] = self._replay_kl(s, teacher, valid)

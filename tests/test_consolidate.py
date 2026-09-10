@@ -10,8 +10,10 @@ import numpy as np
 import pytest
 import torch
 
+from infra.config import apply_overrides
 from infra.consolidate import (SleepConfig, Sleeper, bucket_means, item_ids, nll_positions,
                                sample_items, score_continuation)
+from infra.consolidate.sleep import lr_factor
 from infra.dataset.loader import TokenStore
 from infra.eval import EvalConfig, evaluate
 from infra.inference import Generator
@@ -187,3 +189,37 @@ def test_task_record(store_dir, tmp_path):
     res0 = json.loads((none / 'results.json').read_text())['consolidation']['subjects']['G']
     assert res0['items']['nll3'] == pytest.approx(items['nll3'], abs=1e-4)      # same items, same model
     assert 'nll2@48' not in res0['items'] and res0['witness']['method'] is None
+
+
+def test_deep_overrides():
+    raw = {'a': 1, 'tasks': [{'name': 't', 'args': {'sleep': {'lr': 1e-5}}}], 'model_args': {'x': 1}}
+    out = apply_overrides(raw, ['tasks.0.args.sleep.lr=1e-4', 'tasks.0.args.new.k=[1, 2]', 'model_args.y=true', 'a=2'])
+    assert out['tasks'][0]['args']['sleep']['lr'] == 1e-4 and out['tasks'][0]['args']['new']['k'] == [1, 2]
+    assert out['model_args'] == {'x': 1, 'y': True} and out['a'] == 2
+    assert raw['tasks'][0]['args']['sleep']['lr'] == 1e-5 and raw['a'] == 1       # untouched
+    for bad in ['tasks.x.args=1', 'tasks.3.args=1', 'a.b=1', 'noeq']:
+        with pytest.raises(ValueError):
+            apply_overrides(raw, [bad])
+
+
+def test_lr_factor():
+    assert [lr_factor(i, 4, 'const', 0) for i in range(4)] == [1, 1, 1, 1]
+    lin = [lr_factor(i, 5, 'linear', 0) for i in range(5)]
+    assert lin == pytest.approx([1, 0.75, 0.5, 0.25, 0])
+    cos = [lr_factor(i, 5, 'cosine', 2) for i in range(5)]
+    assert cos[0] == 0.5 and cos[1] == 1.0 and cos[2] == pytest.approx(1.0) and cos[4] == pytest.approx(0.0)
+    assert lr_factor(0, 1, 'cosine', 0) == 1.0
+
+
+def test_retain_kl_and_schedule(store):
+    g = _gen()
+    cfg = SleepConfig(n_samples=4, sample_len=10, sample_batch=4, steps=4, lr=1e-3, batch=4, lm_batch=2, lm_len=16,
+                      retain_windows=2, eval_chunk=4, lm_mix=0.0, retain_kl=1.0, lr_schedule='cosine', warmup=1)
+    sl = Sleeper(g, store, cfg)
+    w = sl.consolidate(torch.randint(2, VOCAB, (30,)))
+    assert w['retain_kl_before'] == pytest.approx(0.0, abs=1e-6) and w['retain_kl_after'] > 0
+    assert sl.original is not None and not any(p.requires_grad for p in sl.original.parameters())
+    # the frozen copy is the original: it scores like the restored model would
+    before = {k: v.clone() for k, v in sl.original.state_dict().items()}
+    sl.consolidate(torch.randint(2, VOCAB, (30,)))
+    assert all(torch.equal(before[k], v) for k, v in sl.original.state_dict().items())
