@@ -13,7 +13,10 @@
 #      12 h on the main run. This is the cheapest possible check of the
 #      whole hypothesis, so read it before submitting fwe15B.
 #
-#   sbatch -J lax2smoke -t 00:30:00 recipe/slurm/raven_lax2_340M.sbatch \
+# 00:50:00, not 00:30:00: the trainer stops deadline_margin_s (1200 s)
+# before SLURM_JOB_END_TIME, so a 30-minute allocation gives ~10 minutes
+# of training — not enough for 60 steps.
+#   sbatch -J lax2smoke -t 00:50:00 recipe/slurm/raven_lax2_340M.sbatch \
 #     recipe/train/lax2_340M_smoke.yaml
 # Not an experiment: no registry entry, delete the run dir afterwards.
 

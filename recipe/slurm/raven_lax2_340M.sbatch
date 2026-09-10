@@ -3,7 +3,7 @@
 # Raven, 1 node x 4xA100, the same layout LAX1 ran on.
 # Submit from the repo root; an optional argument picks the train recipe,
 # further key=value arguments override top-level TrainConfig fields:
-#   smoke FIRST: sbatch -J lax2smoke -t 00:30:00 \
+#   smoke FIRST: sbatch -J lax2smoke -t 00:50:00 \
 #                  recipe/slurm/raven_lax2_340M.sbatch \
 #                  recipe/train/lax2_340M_smoke.yaml
 #     Read the smoke's gate probe before spending 12 h: if beta is still
@@ -11,6 +11,11 @@
 #   main run:    sbatch recipe/slurm/raven_lax2_340M.sbatch
 # No pilot ladder: the mixer's width and depth are LAX1's, so the LAX1
 # ladder's lr 1.75e-3 carries over.
+#     NOTE the walltime: the trainer stops on its own clock
+#     (deadline_margin_s, default 1200 s before SLURM_JOB_END_TIME),
+#     so -t 00:30:00 leaves only ~10 min of training and cuts a
+#     60-step smoke short (job 30133340 stopped at step 38). Give a
+#     smoke 1200 s more than it needs, or pass deadline_margin_s=null.
 # Resubmitting the same script+config resumes from the latest recent
 # checkpoint (the run dir is <run_name>-<commit8>); a resubmit from a
 # newer checkout continues the original directory with run_dir=...

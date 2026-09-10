@@ -15,7 +15,10 @@
 #   The gate probe in the slow metrics: mem_len median/max should start
 #   spread over a wider range than LAX1's (widened A/dt init).
 #
-#   sbatch -J lax3smoke -t 00:30:00 recipe/slurm/raven_lax3_340M.sbatch \
+# 00:50:00, not 00:30:00: the trainer stops deadline_margin_s (1200 s)
+# before SLURM_JOB_END_TIME, so a 30-minute allocation gives ~10 minutes
+# of training and this smoke stopped at step 38/60 (job 30133340).
+#   sbatch -J lax3smoke -t 00:50:00 recipe/slurm/raven_lax3_340M.sbatch \
 #     recipe/train/lax3_340M_smoke.yaml
 # Not an experiment: no registry entry, delete the run dir afterwards.
 
