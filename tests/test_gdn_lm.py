@@ -135,6 +135,34 @@ def test_mixer_protocol():
 PAR = dict(layer_kinds=['gdn', 'parallel', 'gdn'], softmax_head_dim=16, softmax_rope=False)
 
 
+def test_decay_init_range_reaches_the_mixer():
+    """A_init_range / dt_init_range set the width of the timescale prior the
+    model starts from: the resting forgetting rate is A * softplus(dt_bias),
+    which at init is A * dt with A ~ U(A_init_range), dt ~ logU(dt_init_range)."""
+    import torch.nn.functional as F
+    narrow = build(A_init_range=(1.0, 2.0), dt_init_range=(1e-2, 2e-2))
+    wide = build(A_init_range=(0.5, 32.0), dt_init_range=(5e-4, 1.5e-1))
+
+    def rest_tau(m):
+        att = m.blocks[0].att
+        A = att.A_log.exp()[:, None]
+        b = att.dt_bias.view(att.head_count, att.key_head_dim)
+        return 1.0 / (A * F.softplus(b))
+
+    for m, (lo, hi) in ((narrow, (1.0, 2.0)), (wide, (0.5, 32.0))):
+        A = m.blocks[0].att.A_log.exp()
+        assert (A >= lo - 1e-4).all() and (A <= hi + 1e-4).all()
+    n, w = rest_tau(narrow).log10(), rest_tau(wide).log10()
+    assert w.std() > 2 * n.std(), (w.std().item(), n.std().item())
+    # and it survives the config round-trip (checkpoints carry model_args)
+    m2 = type(wide).from_config(wide.config)
+    assert m2.config['A_init_range'] == (0.5, 32.0)
+    assert m2.config['dt_init_range'] == (5e-4, 1.5e-1)
+    # the parallel branch's mixer gets it too
+    par = build(**PAR, A_init_range=(0.5, 32.0)).blocks[1].att
+    assert (par.la.A_log.exp() <= 32.0 + 1e-4).all()
+
+
 def test_layer_kinds_and_parallel_shapes():
     from infra.components.parallel_mixer import ParallelMixer
     m = build(**PAR)
