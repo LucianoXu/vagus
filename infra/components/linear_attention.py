@@ -158,9 +158,17 @@ def _compute_dtype(q) -> torch.dtype:
     return torch.float64 if q.dtype == torch.float64 else torch.float32
 
 
-def recurrent_scan(q, k, v, g, beta, S0, *, scale: float, delta: bool):
+def recurrent_scan(q, k, v, g, beta, S0, *, scale: float, delta: bool, w=None):
     '''Token-by-token recurrence. The definition; everything else must
-    match it.'''
+    match it.
+
+    w: (B, L, H, dk) write vectors, used in place of the delta rule's
+    beta_t k_t. The recurrence S <- (I - w_t k_t^T) S + w_t v_t^T is the
+    *asymmetric* delta rule (w no longer parallel to k), which Diagonal
+    KDN's Kalman gain produces; beta is ignored when w is given. The
+    chunkwise forms below do NOT accept it — the compact-WY factorisation
+    they use assumes the symmetric write — so an asymmetric write runs
+    this scan, at this scan's cost.'''
     B, L, H, dk = q.shape
     dv = v.shape[-1]
     dt = _compute_dtype(q)
@@ -173,10 +181,13 @@ def recurrent_scan(q, k, v, g, beta, S0, *, scale: float, delta: bool):
             S = S * (a[..., None] if a.dim() == 3 else a[..., None, None])   # per-channel rows / scalar
         kt, vt = k[:, t], v[:, t]
         if delta:
-            assert beta is not None
             kS = torch.einsum('bhk,bhkv->bhv', kt, S)            # what S returns for k_t
-            w = kt * beta[:, t].to(dt)[..., None]
-            S = S + torch.einsum('bhk,bhv->bhkv', w, vt - kS)
+            if w is None:
+                assert beta is not None
+                wt = kt * beta[:, t].to(dt)[..., None]
+            else:
+                wt = w[:, t].to(dt)
+            S = S + torch.einsum('bhk,bhv->bhkv', wt, vt - kS)
         else:
             S = S + torch.einsum('bhk,bhv->bhkv', kt, vt)
         outs.append(torch.einsum('bhk,bhkv->bhv', q[:, t], S))
@@ -639,7 +650,7 @@ class GatedDeltaNet(nn.Module, Mixer):
                 f = self._hi(f) + self._hi(self.dt_bias)
                 g = -self._hi(self.A_log).exp()[:, None] * F.softplus(f).view(
                     B, L, self.head_count, self.key_head_dim)
-        if self.delta:
+        if self.delta and hasattr(self, 'wb'):
             beta = self.wb(x) if raw_beta else torch.sigmoid(self._hi(self.wb(x)))
         return g, beta
 
@@ -686,7 +697,21 @@ class GatedDeltaNet(nn.Module, Mixer):
             on = on - {'gate'}
         return on
 
-    def _scan(self, q, k, v, g, beta, S0, *, fusions=frozenset()):
+    def _write(self, x, k, g, beta):
+        '''(beta, w) — the delta rule's write for this block. The family's
+        own write is the symmetric one, beta_t k_t, so w is None and the
+        chunkwise kernels apply; KalmanDeltaNet overrides this to put a
+        Kalman gain in beta's place (Isotropic: still a scalar per head,
+        so nothing downstream changes) or to return an explicit
+        asymmetric w (Diagonal).'''
+        return beta, None
+
+    def _scan(self, q, k, v, g, beta, S0, *, fusions=frozenset(), w=None):
+        if w is not None:
+            # asymmetric write: no chunkwise form (see recurrent_scan)
+            assert self.delta, 'an explicit write vector needs the delta rule'
+            return recurrent_scan(q, k, v, g, beta, S0, scale=self.scale,
+                                  delta=True, w=w)
         if self._pick_impl(q) == 'fla':
             return fla_scan(q, k, v, g, beta, S0, scale=self.scale, delta=self.delta,
                             chunk_size=self.chunk_size,
@@ -721,7 +746,8 @@ class GatedDeltaNet(nn.Module, Mixer):
         on = self._active_fusions(qp)
         q, k, v = self._heads(qp, kp, vp, l2norm='l2norm' not in on)
         g, beta = self._gates(x, raw_gate='gate' in on, raw_beta='beta' in on)
-        o, _ = self._scan(q, k, v, g, beta, None, fusions=on)
+        beta, w = self._write(x, k, g, beta)
+        o, _ = self._scan(q, k, v, g, beta, None, fusions=on, w=w)
         return self._output(o, x)
 
     @torch.no_grad()
@@ -799,9 +825,11 @@ class GatedDeltaNet(nn.Module, Mixer):
             vp = self.conv_v.direct_conv(vp)[:, -L:]
         q, k, v = self._heads(qp, kp, vp, conv=False)
         g, beta = self._gates(x)
+        beta, w = self._write(x, k, g, beta)
 
-        if L == 1:
-            o, S = recurrent_scan(q, k, v, g, beta, self.state, scale=self.scale, delta=self.delta)
+        if L == 1 or w is not None:
+            o, S = recurrent_scan(q, k, v, g, beta, self.state, scale=self.scale,
+                                  delta=self.delta, w=w)
         else:
             o, S = self._scan(q, k, v, g, beta, self.state)
         self.state.copy_(S)

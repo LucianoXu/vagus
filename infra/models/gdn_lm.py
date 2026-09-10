@@ -32,6 +32,7 @@ from torch import nn
 
 from ..components.attention import SoftmaxAttention
 from ..components.block import Block
+from ..components.kalman_delta import KalmanDeltaNet
 from ..components.linear_attention import GatedDeltaNet, chunk_scan_flops
 from ..components.mixer import Mixer
 from ..components.norm_layer import RMSNorm
@@ -40,6 +41,11 @@ from ..components.pos_embed import RoPE
 from .decodable import Decodable
 
 KINDS = ('gdn', 'softmax', 'parallel')
+# the linear mixer's write rule: the delta rule's own sigmoid beta, or a
+# Kalman gain in its place (see components/kalman_delta.py). 'kalman_iso'
+# keeps beta a scalar per head, so the chunkwise kernels still apply;
+# 'kalman_diag' is an asymmetric write and runs the token recurrence.
+WRITES = ('delta', 'kalman_iso', 'kalman_diag')
 
 
 class GDNLM(nn.Module, Decodable):
@@ -61,6 +67,8 @@ class GDNLM(nn.Module, Decodable):
             la_conv_impl: str = 'conv1d',
             la_disable_recompute: bool = False,
             gate_lower_bound: float | None = None,
+            write: str = 'delta',
+            kalman_args: dict | None = None,
             A_init_range: tuple[float, float] = (1.0, 16.0),
             dt_init_range: tuple[float, float] = (1e-3, 1e-1),
             layer_pattern: str = 'gdn',
@@ -86,6 +94,7 @@ class GDNLM(nn.Module, Decodable):
             la_fused=la_fused, la_conv_impl=la_conv_impl,
             la_disable_recompute=la_disable_recompute,
             gate_lower_bound=gate_lower_bound,
+            write=write, kalman_args=kalman_args,
             A_init_range=tuple(A_init_range), dt_init_range=tuple(dt_init_range),
             layer_pattern=layer_pattern, layer_kinds=layer_kinds,
             softmax_head_dim=softmax_head_dim, softmax_rope=softmax_rope,
@@ -118,9 +127,17 @@ class GDNLM(nn.Module, Decodable):
             assert dim % softmax_head_dim == 0
             self.rope = RoPE(dim, softmax_head_dim, context_len, base=rope_base)
 
+        assert write in WRITES, f'write must be one of {WRITES}, got {write!r}'
+        self.write = write
+
         def linear(width: int, out_proj: bool) -> GatedDeltaNet:
             assert width % value_head_dim == 0
-            return GatedDeltaNet(
+            cls, extra = GatedDeltaNet, {}
+            if write != 'delta':
+                cls = KalmanDeltaNet
+                extra = {'kalman': write.removeprefix('kalman_'), **(kalman_args or {})}
+            return cls(
+                **extra,
                 dim=dim, head_count=width // value_head_dim, key_head_dim=key_head_dim,
                 value_head_dim=value_head_dim, short_conv_size=short_conv_size,
                 gate=gate, delta=delta, gate_rank=gate_rank, chunk_size=chunk_size, impl=la_impl,

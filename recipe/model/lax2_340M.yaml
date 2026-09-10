@@ -1,0 +1,84 @@
+# LAX2-340M — LAX1 with the delta rule's write strength replaced by an
+# Isotropic Kalman gain (Kalman Delta Networks, arXiv:2609.07816). The
+# architecture is otherwise byte-identical to lax1_340M: same 24 x 1024,
+# 4 heads x (d_k 128, d_v 256), same FFN, same per-channel KDA decay,
+# same short conv, same tied embedding. The write rule IS the delta.
+#
+# Why this experiment. KDA's write strength is beta_t = sigmoid(w_beta .
+# x_t) — a function of the current token alone, blind to the state. On
+# our own trained LAX1-340M we measured what that costs (2026-09-10,
+# 46k tokens): beta is near-saturated (mean 0.80, median 0.90) and
+# carries no information about what the memory failed to predict —
+# corr(beta, |v - S^T k|/|v|) = -0.031, and the write gain on the top
+# 10% of tokens by surprise against the bottom 50% is 0.993. Write mass
+# is nearly uniform: the top 10% of tokens carry 15.0% of the total
+# beta*|r| against a uniform 10%. The layer has no mechanism to decide
+# whether a large residual should revise a tentative association or be
+# discounted because the association has been confirmed many times —
+# which is, almost verbatim, the gap KDN states as its motivation.
+#
+# The Kalman gain closes it with an uncertainty state the gate CAN see:
+#     a_t     = mean_i(alpha_ti^2)
+#     bhat_t  = a_t / c_{t-1} + omega_t
+#     beta_t  = bhat_t / (r_t + bhat_t |k_t|^2)
+#     c_t     = 1 / bhat_t + |k_t|^2 / r_t
+# c is a precision scalar per head. A key direction written repeatedly
+# and consistently drives c up and beta down (the association resists
+# revision); the decay pulls c back, restoring plasticity.
+#
+# Isotropic, not Diagonal, and that is a compute decision not a quality
+# one: beta_t stays ONE SCALAR PER HEAD, so the memory recurrence is the
+# delta rule we already run and every chunkwise kernel — fla's chunk_kda
+# included — applies unchanged. Diagonal KDN's gain is a vector not
+# parallel to k, i.e. an asymmetric write, and the compact-WY
+# factorisation the chunk kernels rest on does not cover it; on our path
+# it runs the token recurrence, which is fine for eval and unusable for
+# pretraining. `write: kalman_diag` builds and trains correctly if you
+# want it at toy scale; the open work is porting upstream's Triton
+# asymmetric kernel (kdn_ops/diag_kdn_chunk.py).
+#
+# Cost: +98,592 params (+0.029%) — the per-head omega / r projections
+# and the learned initial precision. The uncertainty scan is a prefix
+# product of 2x2 matrices over (B, L, H) scalars, negligible against the
+# d_k x d_v state scan. Throughput should be within noise of LAX1's; the
+# smoke is the receipt.
+#
+# What decides it, in order:
+#   1. loss_ce against lax1-340M-fwe15B-c9af2f44 (tail5 2.3956). KDN
+#      reports 15.40 -> 15.04 WikiText PPL over KDA at 1.3B/100B, so
+#      expect a small effect here, possibly inside our noise.
+#   2. The recall probe. KDN's own headline is RULER, and the mechanism
+#      is about protecting confirmed associations, so MQAR is where a
+#      real effect should show.
+#   3. The write-selectivity probe that motivated this — re-run the
+#      2026-09-10 measurement on the LAX2 checkpoint. The prediction is
+#      sharp and falsifiable: corr(beta, residual) should move off zero
+#      and the write-mass concentration should rise above 15%/10%. If
+#      beta is still flat and uninformative, the Kalman parameterisation
+#      did not buy what it claims and the arm stops here regardless of
+#      loss_ce.
+#
+# NOT a substitute for the LAX3 d_k experiment: KDN reallocates a fixed
+# 128-slot budget, it does not enlarge it. The two are orthogonal.
+
+model_name: GDNLM
+model_args:
+  vocab_size: 32000        # mistral32k tokenizer
+  dim: 1024
+  layer_count: 24
+  head_count: 4
+  key_head_dim: 128
+  value_head_dim: 256
+  ffn_hidden_dim: 2816
+  short_conv_size: 4
+  gate: vector             # KDA's per-channel decay; KDN keeps it exactly
+  gate_rank: 64
+  delta: true
+  write: kalman_iso        # <- the whole experiment
+  chunk_size: 64           # LAX1's; the HAX kernel sweep was on the hybrid
+  la_impl: auto
+  layer_pattern: gdn       # pure linear, as LAX1
+  context_len: 2048        # only binds softmax layers; pure GDN has no limit
+  rmsnorm_eps: 1.0e-6
+  tie_embedding: true
+  gate_proj_optimizer: adamw   # omega / r / gate matrices train under AdamW

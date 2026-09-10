@@ -1,0 +1,74 @@
+# LAX2-340M smoke — the fwe15B recipe cut to 60 steps (31M tokens). The
+# Kalman gain is the only new arithmetic in the layer, so this smoke has
+# two jobs beyond the usual throughput/memory check:
+#
+#   1. Numerical health of the uncertainty scan. It is a prefix product
+#      of 2x2 Mobius matrices, renormalised each doubling step, run in
+#      fp32 inside a bf16 autocast region — new territory on our stack.
+#      A NaN or an exploding grad_norm shows up in the first few steps.
+#   2. The gate probe (slow metrics) — beta should NOT be pinned near 1.
+#      On trained LAX1 it sits at mean 0.80 / median 0.90 with no
+#      dependence on the residual; if LAX2's beta looks the same at step
+#      60 the gain is not doing anything and there is no point spending
+#      12 h on the main run. This is the cheapest possible check of the
+#      whole hypothesis, so read it before submitting fwe15B.
+#
+#   sbatch -J lax2smoke -t 00:30:00 recipe/slurm/raven_lax2_340M.sbatch \
+#     recipe/train/lax2_340M_smoke.yaml
+# Not an experiment: no registry entry, delete the run dir afterwards.
+
+run_name: lax2-340M-smoke
+model_recipe: ../model/lax2_340M.yaml
+
+data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+data_shards: null          # all 20 shards (16.7B tokens); 15B => 0.9 epoch
+
+context_len: 2048
+# 4 GPUs, single node; global batch = 4 * 8 * 8 * 2048 = 0.5M tokens.
+# micro 8 / accum 8 (SAX1 ran 16 / 4): KDA at micro 16 OOMs on A100-40GB
+# at the first step (38 GB allocated — per-channel gates, conv/l2norm
+# intermediates and the kernel's saved chunk states on top of SAX1's
+# 40.1 GB-peak footprint; jobs 30066917/18). The loader assigns each
+# optimizer step the same global window set for 8x8 and 16x4 (rank-
+# interleaved slices of the shuffled order), so the SAX1 batch pairing
+# holds; only the micro-batch partition of each step differs.
+world_size: 4
+batch_size: 8              # per-rank micro-batch
+grad_accum_steps: 8
+global_batch_tokens: 524288
+train_tokens: 31_457_280       # 60 steps
+seed: 42
+
+optimizer_name: muon
+optimizer_args:
+  lr: 1.75e-3
+  momentum: 0.95
+  weight_decay: 0.1
+  lr_adjust: rms
+  ns_coeffs: polar_express
+  adamw:
+    lr: 1.75e-3
+    betas: [0.9, 0.95]
+    weight_decay: 0.1
+
+schedule_name: wsd
+schedule_args:
+  warmup: 0.5             # 150M tokens, same as SAX1/SAX2
+  decay: 0.15              # linear cooldown over the last 2.25B tokens (SAX2)
+  min_ratio: 0.0
+
+grad_clip: 1.0
+z_loss: 1e-4
+ce_impl: liger
+
+device: auto
+dtype: bfloat16
+compile: true
+tf32: true
+
+out_root: runs
+log_interval: 5
+slow_interval: 20
+permanent_ckpt_interval: null
+recent_ckpt_minutes: 1000
+peak_tflops: 312           # A100 bf16 dense; only feeds the MFU metric
