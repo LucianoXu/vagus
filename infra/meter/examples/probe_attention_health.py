@@ -98,7 +98,15 @@ def probe_branch(att: SoftmaxAttention, h: torch.Tensor, skip: int) -> dict:
     # the layer-wide scale term, and the ceiling it implies
     g_q = float(att.q_norm.gamma.float().pow(2).mean().sqrt()) if att.qk_norm else 1.0
     g_k = float(att.k_norm.gamma.float().pow(2).mean().sqrt()) if att.qk_norm else 1.0
+    # RMS(gamma) gives the TYPICAL scale, so observed/ceiling can exceed 1 when a
+    # head routes its q/k energy into the high-gamma channels. The hard bound uses
+    # max|gamma|; outlier-channel growth under qk-norm is what Qwen3-Next reported
+    # (a released Qwen3-0.6B k_norm gain reaches 96) and fixed with zero-centred
+    # gains plus weight decay, so track both.
+    m_q = float(att.q_norm.gamma.float().abs().max()) if att.qk_norm else 1.0
+    m_k = float(att.k_norm.gamma.float().abs().max()) if att.qk_norm else 1.0
     ceiling = math.sqrt(Dh) * g_q * g_k
+    hard = math.sqrt(Dh) * m_q * m_k
     # what the vectors actually are, as a check on the factorisation
     qn = float(q.pow(2).sum(-1).sqrt().mean())
     kn = float(k.pow(2).sum(-1).sqrt().mean())
@@ -118,13 +126,15 @@ def probe_branch(att: SoftmaxAttention, h: torch.Tensor, skip: int) -> dict:
             'gap': float((top2[..., 0] - top2[..., 1]).mean()),
             'gap_p99': float(torch.quantile((top2[..., 0] - top2[..., 1]).flatten(), 0.99)),
             'entropy': float(ent.mean()),
+            'ent_frac': float(ent.mean()) / math.log(L),
             'entropy_min': float(ent.min()),
             'sink': float(p[..., 0].mean()),
         })
         del s, p, top2, ent
 
-    out = {'g_q': g_q, 'g_k': g_k, 'ceiling': ceiling, 'q_norm': qn, 'k_norm': kn,
-           'heads': heads, 'Dh': Dh, 'H': H}
+    out = {'g_q': g_q, 'g_k': g_k, 'm_q': m_q, 'm_k': m_k, 'ceiling': ceiling,
+           'hard': hard, 'q_norm': qn, 'k_norm': kn, 'heads': heads, 'Dh': Dh, 'H': H,
+           'L': L, 'ent_uniform': math.log(L)}
     for rec in heads:
         rec['cos_max'] = rec['logit_max'] / ceiling if ceiling else float('nan')
 
@@ -165,18 +175,22 @@ def batch_from_store(data_dir: str, seq: int, batch: int, seed: int, device) -> 
 
 def report(name: str, layers: dict, verbose: bool) -> None:
     print(f'\n=== {name}')
-    print(f'{"layer":>5} {"g_q":>6} {"g_k":>6} {"ceil":>7} {"|q|":>7} {"|k|":>7} '
-          f'{"max":>7} {"cosmax":>7} {"gap":>7} {"gapp99":>7} {"ent":>6} {"entmin":>7} {"sink":>6}'
+    L0 = next(iter(layers.values()))
+    print(f'(entropy ceiling at L={L0["L"]}: {L0["ent_uniform"]:.2f} nats; '
+          f'entfr = mean row entropy / that ceiling)')
+    print(f'{"layer":>5} {"gRMS":>6} {"gmax":>6} {"ceil":>7} {"hard":>7} '
+          f'{"max":>7} {"cosmax":>7} {"gap":>7} {"gapp99":>7} {"ent":>6} {"entfr":>6} {"entmin":>7} {"sink":>6}'
           + (f' {"gate":>6} {"shut":>6}' if 'gate' in next(iter(layers.values())) else ''))
     for i, L in sorted(layers.items()):
         hs = L['heads']
-        row = (f'{i:5d} {L["g_q"]:6.3f} {L["g_k"]:6.3f} {L["ceiling"]:7.2f} '
-               f'{L["q_norm"]:7.2f} {L["k_norm"]:7.2f} '
+        row = (f'{i:5d} {L["g_q"]:6.3f} {max(L["m_q"], L["m_k"]):6.3f} {L["ceiling"]:7.2f} '
+               f'{L["hard"]:7.1f} '
                f'{max(h["logit_max"] for h in hs):7.2f} '
                f'{max(h["cos_max"] for h in hs):7.3f} '
                f'{sum(h["gap"] for h in hs)/len(hs):7.2f} '
                f'{max(h["gap_p99"] for h in hs):7.2f} '
                f'{sum(h["entropy"] for h in hs)/len(hs):6.2f} '
+               f'{sum(h["ent_frac"] for h in hs)/len(hs):6.3f} '
                f'{min(h["entropy_min"] for h in hs):7.3f} '
                f'{max(h["sink"] for h in hs):6.3f}')
         if 'gate' in L:
