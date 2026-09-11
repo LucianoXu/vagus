@@ -1,0 +1,53 @@
+# LAX1 vs LAX3 at the 15B endpoint — the decision read.
+#
+# Identical grid to lax13_step5000.yaml on purpose: the two records are
+# the same measurement at 2.62B and at 15B, so the pair says not only
+# which model recalls better but whether the gap grew or washed out with
+# training. The step-5000 read was in the predicted direction but sat on
+# the floor of the task (acc <= 0.021, and LAX1's L4096_p128 logprob of
+# -10.344 was indistinguishable from the -10.37 of a uniform 32k vocab),
+# so it could not decide anything. At 15B both models have real signal
+# here (the trio record has LAX1 well off chance at L1024_p32), and this
+# grid is the same cells at higher k.
+#
+# What it has to settle: LM loss has already washed out — LAX3 finished
+# at loss_ce tail5 2.3935 against LAX1's 2.3956, a 0.0021 nat gap after
+# starting at 0.047, and a fifth of the 0.020 nat by which LAX1 beat
+# SAX2. And the saturation curve came back negative: the two residual
+# curves are the same shape offset by a flat 0.031 with no divergence at
+# 128 or at 256, which falsified the "the memory saturates at d_k"
+# reading the whole d_k ladder was built on. So recall is the last place
+# the capacity hypothesis can still be true. If the logprob gain still
+# grows with the number of pairs and the copy rate still holds where
+# LAX1's collapses, d_k bought something that loss cannot see; if the
+# advantage is flat in k, the ladder stops and LAX2 stays on LAX1's
+# geometry.
+
+eval_name: lax13-final
+subjects:
+  - {ckpt: runs/lax1-340M-fwe15B-c9af2f44/model-final.pt, label: LAX1, tokenizer_id: mistral32k}
+  - {ckpt: runs/lax3-340M-fwe15B-2ed076d7/model-final.pt, label: LAX3, tokenizer_id: mistral32k}
+
+device: auto
+dtype: bfloat16
+seed: 0
+
+tasks:
+  - name: recall_probe
+    args:
+      data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+      lengths: [2048, 4096]
+      kv_pairs: [32, 64, 128]
+      n: 64
+      noise: text
+      batch_size: 2
+  - name: holdout
+    args:
+      data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+      n_seq: 128
+      context_len: [2048]
+      batch_size: 2
+      metrics: [nll]
+
+out_root: runs/eval
+registry_dir: registry/eval
