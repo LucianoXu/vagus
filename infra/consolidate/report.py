@@ -32,7 +32,8 @@ def row(name, label, L, r):
     cell = (f"{sl.get('method', '?'):9s} lr={sl.get('lr', 0):<7g} mix={sl.get('lm_mix', 0):<4g} "
             f"rk={sl.get('retain_kl', 0):<4g} {sl.get('lr_schedule', 'const'):6s} w{sl.get('warmup', 0):<2d} "
             f"s{sl.get('steps', 0):<3d} hops={','.join(f'{h:g}' for h in sl.get('hops', [0.0])):12s} "
-            f"{sl.get('degrade', '-')[:8]:8s} {sl.get('teacher', '-'):5s}")
+            f"{sl.get('degrade', '-')[:8]:8s} {sl.get('teacher', '-'):5s} "
+            f"{sl.get('mode', 'onehop'):14s} lam={sl.get('lam', 0):<4g} {sl.get('mem_param', '-'):4s} mlr={sl.get('mem_lr', 0):<6g}")
     kept = []
     for b in [k[5:] for k in it if k.startswith('nll3_b')]:
         den = sc[f'nll3_{b}'] - sc[f'nll1_{b}@{L}']
@@ -45,7 +46,12 @@ def row(name, label, L, r):
         rk = f"{np.mean([c['retain_kl_after'] - c['retain_kl_before'] for c in cons]):+.4f}"
     kl = f"{sc[f'kl_before@{L}']:.2f}->{sc[f'kl_after@{L}']:.2f}" if f'kl_before@{L}' in sc else ''
     hops = ''
-    if cons and len(cons[0].get('hops', [])) > 1:
+    if cons and 'trajectory' in cons[0]:
+        t = cons[0]['trajectory']
+        pen = np.mean([[r['penalty'] for r in c['trajectory']] for c in cons], axis=0)
+        dr = np.mean([[r['drift'] for r in c['trajectory']] for c in cons], axis=0)
+        hops = ' pen ' + '>'.join(f'{v:.2f}' for v in pen) + ' drift ' + '>'.join(f'{v:.3f}' for v in dr)
+    elif cons and len(cons[0].get('hops', [])) > 1:
         hops = ' hops ' + ' '.join(f"{h['level']:g}:{np.mean([c['hops'][i]['kl_before'] for c in cons]):.2f}->"
                                    f"{np.mean([c['hops'][i]['kl_after'] for c in cons]):.2f}"
                                    for i, h in enumerate(cons[0]['hops']))

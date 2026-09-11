@@ -759,7 +759,7 @@ class GatedDeltaNet(nn.Module, Mixer):
         on = self._active_fusions(qp)
         S0 = None
         if cache is not None:
-            S0 = cache['state'].detach()
+            S0 = cache['state']                # a leaf that requires grad trains the memory itself
             assert S0.shape == (B, self.head_count, self.key_head_dim, self.value_head_dim), S0.shape
             if self.short_conv_size is not None and 'qp_cache' in cache:
                 qp = torch.cat([cache['qp_cache'].detach().to(qp.dtype), qp], dim=1)

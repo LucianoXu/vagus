@@ -37,6 +37,28 @@
 #   surprising episodes, made a sampling weight. On LAX1 the high
 #   residuals sit at section breaks, topic changes and rare names.
 #
+# Joint modes (mode != 'onehop'): the student's memory is a variable
+#   too. (w', m') starts at the teacher point (w, m) and is pushed by a
+#   *predictive* penalty  lam * KL( S(w',m') || S(w',m0) )  — how much
+#   the residual memory still changes the prediction (the norm of m is
+#   a gauge the per-head RMSNorm readout cannot see, so |m' - m0| would
+#   be spent on nothing) — while an anchor term keeps the prediction
+#   itself in place. The path from (w, m) to (w*, ~m0) is then chosen by
+#   gradient descent, not by a hand-made degradation (memory.py).
+#     joint_fixed     anchor = the frozen teacher: KL(T || S(w',m'))
+#     joint_reanchor  anchor = the student's own prediction one step
+#                     earlier (a proximal step in KL geometry — at the
+#                     current point the KL is second order and its
+#                     gradient zero, so the anchor must lag): the
+#                     chain that a fully online scheme needs; its cost
+#                     is read off the drift KL(T || S(w',m')).
+#   mem_param 'rows' releases per key channel, m'_l = m_l * sigmoid(g_l)
+#   with g a (H, dk) vector per layer — the geometry of the gate's own
+#   forgetting, well conditioned under the readout's scale gauge, and
+#   the learned g is the release order; 'free' trains every entry.
+#   At the end the memory is cleared as before; the witness carries the
+#   trajectory of penalty / drift / blank-student KL.
+#
 # ntp_x — the baseline consolidation must beat: the same optimiser
 #   budget spent on next-token loss over X itself (the context read
 #   with no memory involved), same LM mix. If replay_kl cannot beat
@@ -106,6 +128,14 @@ class SleepConfig:
     hops: tuple[float, ...] = (0.0,)
     degrade: str = 'scale'         # memory.DEGRADATIONS
     teacher: str = 'fixed'         # fixed | chain
+    # joint modes: the memory as a variable (see the header)
+    mode: str = 'onehop'           # onehop | joint_fixed | joint_reanchor
+    lam: float = 1.0               # weight of the predictive penalty KL(S(w',m') || S(w',m0))
+    mem_param: str = 'rows'        # rows | free
+    mem_lr: float = 0.2            # Adam lr of the memory parameters (rows: on the logit g; free: on entries)
+    mem_init: float = 6.0          # rows: g init, sigmoid(6) = 0.9975
+    probe_every: int = 16          # steps between trajectory probes (penalty / drift / blank KL)
+    layer_probe: bool = False      # per-layer read KL at the end (24 x replay-set forwards)
     seed: int = 0
     eval_chunk: int = 8            # rows per no-grad pass when scoring the replay set
 
@@ -121,6 +151,12 @@ class SleepConfig:
         assert self.replay_from in ('end', 'uniform', 'surprise'), self.replay_from
         assert self.replay_from == 'end' or self.hops == (0.0,), 'positional replay is one-hop only'
         assert self.replay_bin >= 1                    # surprise_power < 0 favours the least surprising bins
+        assert self.mode in ('onehop', 'joint_fixed', 'joint_reanchor'), self.mode
+        assert self.mem_param in ('rows', 'free'), self.mem_param
+        if self.mode != 'onehop':
+            assert self.method == 'replay_kl' and self.hops == (0.0,) and self.replay_from == 'end', \
+                'joint modes: replay_kl, one hop, end replay'
+            assert self.lam >= 0 and self.mem_lr >= 0 and self.probe_every >= 1
         self.betas = tuple(self.betas)   # type: ignore[assignment]  # yaml gives a list
 
     def asdict(self) -> dict:
@@ -158,6 +194,46 @@ def lr_factor(step: int, steps: int, schedule: str, warmup: int) -> float:
     if schedule == 'linear':
         return 1.0 - t
     return 0.5 * (1.0 + math.cos(math.pi * t))
+
+
+class MemoryParam:
+    '''The student's memory as trainable parameters over an exported
+    (batch-1) state m. rows: S'_l = S_l * sigmoid(g_l), g_l (1, H, dk, 1);
+    free: S'_l itself. The short-conv caches and the pending token are
+    carried through unchanged.'''
+
+    def __init__(self, m: dict, how: str, init: float):
+        self.how = how
+        self.pending = m['pending']
+        self.extras = [{k: v for k, v in b['att'].items() if k != 'state'} for b in m['cache']['blocks']]
+        self.base = [b['att']['state'].detach().clone() for b in m['cache']['blocks']]
+        if how == 'rows':
+            self.params = [torch.full((*S.shape[:3], 1), init, dtype=S.dtype, device=S.device, requires_grad=True)
+                           for S in self.base]
+        else:
+            self.params = [S.clone().requires_grad_(True) for S in self.base]
+
+    def states(self) -> list[torch.Tensor]:
+        if self.how == 'rows':
+            return [S * torch.sigmoid(g) for S, g in zip(self.base, self.params)]
+        return list(self.params)
+
+    def state(self) -> dict:
+        return {'pending': self.pending,
+                'cache': {'blocks': [{'att': {'state': S, **ex}} for S, ex in zip(self.states(), self.extras)]}}
+
+    def profile(self) -> dict:
+        '''Per-layer summary of what was released.'''
+        with torch.no_grad():
+            if self.how == 'rows':
+                keep = [torch.sigmoid(g) for g in self.params]
+                return {'keep_mean': [float(k.mean()) for k in keep],
+                        'keep_frac_below_half': [float((k < 0.5).float().mean()) for k in keep],
+                        # weighted by the row norms the memory actually holds
+                        'keep_weighted': [float((k[..., 0] * S.norm(dim=-1)).sum() / S.norm(dim=-1).sum().clamp(min=1e-9))
+                                          for k, S in zip(keep, self.base)]}
+            return {'rel_change': [float((P - S).norm() / S.norm().clamp(min=1e-9)) for P, S in zip(self.params, self.base)],
+                    'norm_ratio': [float(P.norm() / S.norm().clamp(min=1e-9)) for P, S in zip(self.params, self.base)]}
 
 
 class Sleeper:
@@ -429,6 +505,16 @@ class Sleeper:
                 witness['kl_before'] = self._replay_kl(s, teacher, valid)
                 witness['replay_valid_frac'] = float(valid.float().mean())
 
+        if cfg.mode != 'onehop':
+            assert m is not None and s is not None and teacher is not None and valid is not None
+            self._joint(m, s, teacher, valid, retain, opt, witness)
+            del opt
+            for p in self.model.parameters():
+                p.requires_grad_(False)
+                p.grad = None
+            self.model.to(orig_dtype)
+            return witness
+
         # the hop plan: (student memory level, steps); ntp_x is one hop at level 0
         total = cfg.steps * len(xs)
         levels = list(cfg.hops) if cfg.method == 'replay_kl' else [0.0]
@@ -516,6 +602,105 @@ class Sleeper:
             p.grad = None
         self.model.to(orig_dtype)
         return witness
+
+    def _joint(self, m: dict, s: torch.Tensor, teacher: torch.Tensor, valid: torch.Tensor,
+               retain: torch.Tensor | None, opt, witness: dict) -> None:
+        '''The joint modes (see the header). Trains the model and the
+        memory parameters in place; fills the witness.'''
+        cfg = self.cfg
+        mp = MemoryParam(m, cfg.mem_param, cfg.mem_init)
+        opt.add_param_group({'params': mp.params, 'lr': cfg.mem_lr, 'weight_decay': 0.0, 'name': 'memory'})
+        K = s.shape[0]
+        batches = [torch.from_numpy(self.rng.choice(K, size=min(cfg.batch, K), replace=False)).to(self.device)
+                   for _ in range(cfg.steps)]
+
+        def probe(step: int) -> dict:
+            with torch.no_grad():
+                mem = mp.state()
+                row = {'step': step,
+                       'penalty': self._pair_kl(s, mem, None),          # KL(S(w',m') || S(w',m0))
+                       'drift': self._replay_kl(s, teacher, valid, mem),   # KL(T || S(w',m'))
+                       'blank': self._replay_kl(s, teacher, valid)}        # KL(T || S(w',m0))
+            return row
+
+        traj = [probe(0)]
+        anchor_next = teacher[batches[0]]                      # step 0: the teacher is the current point
+        losses, penalties = [], []
+        for step in range(cfg.steps):
+            f = lr_factor(step, cfg.steps, cfg.lr_schedule, cfg.warmup)
+            for g in opt.param_groups:
+                g['lr'] = (cfg.mem_lr if g.get('name') == 'memory' else cfg.lr) * f
+            opt.zero_grad(set_to_none=True)
+            idx = batches[step]
+            mem = mp.state()
+            s_mem = self._student_logits(s[idx], mem)
+            s_blank = self._student_logits(s[idx], None)
+            anchor = teacher[idx] if cfg.mode == 'joint_fixed' else anchor_next
+            distill = self._kl(s_mem, anchor, valid[idx])
+            penalty = self._kl(s_blank, s_mem, valid[idx])     # KL(S(w',m') || S(w',m0)), both sides live
+            loss = distill + cfg.lam * penalty
+            if cfg.lm_mix > 0 or cfg.retain_kl > 0:
+                win = self._windows(cfg.lm_batch, cfg.lm_len)
+                if cfg.lm_mix > 0:
+                    loss = loss + cfg.lm_mix * self._lm_loss(win)
+                if cfg.retain_kl > 0:
+                    loss = loss + cfg.retain_kl * self._retain_kl(win)
+            loss.backward()
+            if cfg.grad_clip:
+                torch.nn.utils.clip_grad_norm_(list(self.model.parameters()) + mp.params, cfg.grad_clip)
+            if cfg.mode == 'joint_reanchor' and step + 1 < cfg.steps:
+                # the anchor of the next step is this point's prediction on the next batch
+                with torch.no_grad():
+                    anchor_next = self._student_logits(s[batches[step + 1]], mp.state())
+            opt.step()
+            losses.append(float(distill.detach()))
+            penalties.append(float(penalty.detach()))
+            if (step + 1) % cfg.probe_every == 0 and step + 1 < cfg.steps:
+                traj.append(probe(step + 1))
+        traj.append(probe(cfg.steps))
+        witness['distill_loss'] = losses
+        witness['penalty_loss'] = penalties
+        witness['trajectory'] = traj
+        witness['kl_after'] = traj[-1]['blank']
+        witness['penalty_after'] = traj[-1]['penalty']
+        witness['drift_after'] = traj[-1]['drift']
+        witness['release'] = mp.profile()
+        witness['hops'] = [{'level': 'joint', 'steps': cfg.steps, 'kl_before': traj[0]['blank'],
+                            'kl_after': traj[-1]['blank']}]
+        if cfg.layer_probe:
+            witness['layer_read_kl'] = self._layer_probe(s, mp)
+        with torch.no_grad():
+            if retain is not None:
+                witness['retain_after'] = float(self._lm_loss(retain))
+                if cfg.retain_kl > 0:
+                    witness['retain_kl_after'] = float(self._retain_kl(retain))
+
+    @torch.no_grad()
+    def _pair_kl(self, s: torch.Tensor, mem_p: dict | None, mem_q: dict | None) -> float:
+        '''KL( S(w', mem_p) || S(w', mem_q) ) over the valid positions of the replay set.'''
+        valid = self._valid(s)
+        tot, cnt = 0.0, 0
+        for b0 in range(0, s.shape[0], self.cfg.eval_chunk):
+            sl = slice(b0, b0 + self.cfg.eval_chunk)
+            n = int(valid[sl].sum())
+            if n == 0:
+                continue
+            tot += float(self._kl(self._student_logits(s[sl], mem_q), self._student_logits(s[sl], mem_p),
+                                  valid[sl])) * n
+            cnt += n
+        return tot / max(cnt, 1)
+
+    @torch.no_grad()
+    def _layer_probe(self, s: torch.Tensor, mp: MemoryParam) -> list[float]:
+        '''Per layer, KL( S(w',m') || S(w', m' with that layer blank) ): what each
+        layer's residual memory still contributes to the prediction.'''
+        full = mp.state()
+        out = []
+        for l in range(len(mp.base)):
+            blk = copy.deepcopy(full['cache']['blocks'])
+            blk[l]['att']['state'] = torch.zeros_like(blk[l]['att']['state'])
+            out.append(self._pair_kl(s, full, {'pending': full['pending'], 'cache': {'blocks': blk}}))
+        return out
 
     def decode_replay(self, s: torch.Tensor, n: int = 2) -> list[str]:
         '''The first n replay rows as text, for the record.'''

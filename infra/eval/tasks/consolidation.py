@@ -108,6 +108,8 @@ def run(ctx: EvalCtx, data_dir: str, shards: list[str] | None = None, n_items: i
                 ctx.log(f'  L={L} item {i}: nll1={per[f"nll1@{L}"][i]:.4f} nll2={float(nll2.mean()):.4f} '
                         f'nll3={per["nll3"][i]:.4f}' + (f' kl {w["kl_before"]:.3f}->{w["kl_after"]:.3f}'
                                                          if 'kl_before' in w else '') +
+                        (f' pen {w["trajectory"][0]["penalty"]:.3f}->{w["penalty_after"]:.3f} drift {w["drift_after"]:.3f}'
+                         if 'penalty_after' in w else '') +
                         (f' retain {w["retain_before"]:.3f}->{w["retain_after"]:.3f}' if 'retain_before' in w else ''))
         del snapshot
         result.witness['sleep'] = cfg.asdict()

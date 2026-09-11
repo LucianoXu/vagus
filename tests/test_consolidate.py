@@ -401,3 +401,79 @@ def test_surprise_profile_and_positional_replay(store):
     assert w['replay'][0]['draws'] and len(w['distill_loss']) == 2
     with pytest.raises(AssertionError):
         SleepConfig(replay_from='surprise', hops=[0.5, 0.0])
+
+
+# --- joint modes: the memory as a variable ------------------------------
+
+from infra.consolidate.sleep import MemoryParam   # noqa: E402
+
+
+def test_initial_state_is_differentiable():
+    g = _gen()
+    x = torch.randint(2, VOCAB, (2, 20))
+    g.reset(2, max_len=40)
+    g.prefill_ids(x)
+    m = g.export_state()
+    caches = m['cache']['blocks']
+    for c in caches:
+        c['att']['state'] = c['att']['state'].clone().requires_grad_(True)
+    out = g.model(torch.randint(2, VOCAB, (2, 7)), caches=caches)
+    out.float().logsumexp(-1).mean().backward()
+    assert all(c['att']['state'].grad is not None and c['att']['state'].grad.abs().sum() > 0 for c in caches)
+
+
+def test_memory_param():
+    g = _gen()
+    g.reset(1, max_len=32)
+    g.prefill_ids(torch.randint(2, VOCAB, (1, 20)))
+    m = g.export_state()
+    rows = MemoryParam(m, 'rows', 6.0)
+    assert len(rows.params) == 2 and rows.params[0].shape == (1, 2, 16, 1)
+    st = rows.state()
+    assert torch.allclose(st['cache']['blocks'][0]['att']['state'], m['cache']['blocks'][0]['att']['state'], atol=1e-2)
+    assert 'qp_cache' in st['cache']['blocks'][0]['att'] and torch.equal(st['pending'], m['pending'])
+    prof = rows.profile()
+    assert len(prof['keep_mean']) == 2 and abs(prof['keep_mean'][0] - torch.sigmoid(torch.tensor(6.0)).item()) < 1e-5
+    free = MemoryParam(m, 'free', 0.0)
+    assert torch.equal(free.states()[1], m['cache']['blocks'][1]['att']['state']) and free.params[1].requires_grad
+    assert free.profile()['rel_change'] == [0.0, 0.0]
+
+
+@pytest.mark.parametrize('mode', ['joint_fixed', 'joint_reanchor'])
+@pytest.mark.parametrize('how', ['rows', 'free'])
+def test_joint_modes(store, mode, how):
+    g = _gen()
+    before = {k: v.clone() for k, v in g.model.state_dict().items()}
+    cfg = SleepConfig(mode=mode, mem_param=how, mem_lr=0.5 if how == 'rows' else 1e-2, lam=1.0,
+                      n_samples=6, sample_len=10, sample_batch=6, steps=8, lr=1e-3, batch=4,
+                      lm_batch=2, lm_len=16, retain_windows=2, eval_chunk=3, lm_mix=0.0, retain_kl=0.5,
+                      probe_every=4, layer_probe=True)
+    sl = Sleeper(g, store, cfg)
+    w = sl.consolidate(torch.randint(2, VOCAB, (30,)))
+    assert [r['step'] for r in w['trajectory']] == [0, 4, 8]
+    t0, t1 = w['trajectory'][0], w['trajectory'][-1]
+    assert t0['drift'] == pytest.approx(0.0, abs=1e-4)                   # the student starts at the teacher
+    assert t0['penalty'] > 0 and t0['blank'] > 0
+    assert w['kl_after'] == t1['blank'] and w['penalty_after'] == t1['penalty'] and 'drift_after' in w
+    assert len(w['distill_loss']) == 8 and len(w['penalty_loss']) == 8
+    assert len(w['layer_read_kl']) == 2 and all(v >= 0 for v in w['layer_read_kl'])
+    prof = w['release']
+    if how == 'rows':
+        assert all(k < torch.sigmoid(torch.tensor(6.0)).item() for k in prof['keep_mean'])   # something was released
+    else:
+        assert all(v > 0 for v in prof['rel_change'])
+    assert any(not torch.equal(before[k], v) for k, v in g.model.state_dict().items())       # w moved too
+    assert next(g.model.parameters()).dtype == torch.float32
+    assert not any(p.requires_grad for p in g.model.parameters())
+    assert w['hops'][0]['level'] == 'joint'
+
+
+def test_joint_validation():
+    with pytest.raises(AssertionError):
+        SleepConfig(mode='joint_fixed', hops=[0.5, 0.0])
+    with pytest.raises(AssertionError):
+        SleepConfig(mode='joint_fixed', replay_from='surprise')
+    with pytest.raises(AssertionError):
+        SleepConfig(mode='joint_fixed', method='ntp_x')
+    with pytest.raises(AssertionError):
+        SleepConfig(mode='nope')
