@@ -33,7 +33,8 @@ def row(name, label, L, r):
             f"rk={sl.get('retain_kl', 0):<4g} {sl.get('lr_schedule', 'const'):6s} w{sl.get('warmup', 0):<2d} "
             f"s{sl.get('steps', 0):<3d} hops={','.join(f'{h:g}' for h in sl.get('hops', [0.0])):12s} "
             f"{sl.get('degrade', '-')[:8]:8s} {sl.get('teacher', '-'):5s} "
-            f"{sl.get('mode', 'onehop'):14s} lam={sl.get('lam', 0):<4g} {sl.get('mem_param', '-'):4s} mlr={sl.get('mem_lr', 0):<6g}")
+            f"{sl.get('mode', 'onehop'):14s} lam={sl.get('lam', 0):<4g} {sl.get('mem_param', '-'):4s} mlr={sl.get('mem_lr', 0):<6g} "
+            f"ref={sl.get('penalty_ref', '-')[:4]:4s} ema={sl.get('anchor_ema', 0):<4g}")
     kept = []
     for b in [k[5:] for k in it if k.startswith('nll3_b')]:
         den = sc[f'nll3_{b}'] - sc[f'nll1_{b}@{L}']

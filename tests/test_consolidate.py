@@ -477,3 +477,27 @@ def test_joint_validation():
         SleepConfig(mode='joint_fixed', method='ntp_x')
     with pytest.raises(AssertionError):
         SleepConfig(mode='nope')
+
+
+def test_joint_penalty_ref_original_and_ema_anchor(store):
+    g = _gen()
+    cfg = SleepConfig(mode='joint_fixed', mem_param='rows', mem_lr=0.5, lam=1.0, penalty_ref='original',
+                      n_samples=6, sample_len=10, sample_batch=6, steps=6, lr=1e-3, batch=4,
+                      lm_batch=2, lm_len=16, retain_windows=2, eval_chunk=3, lm_mix=0.0, retain_kl=0.5, probe_every=3)
+    sl = Sleeper(g, store, cfg)
+    w = sl.consolidate(torch.randint(2, VOCAB, (30,)))
+    assert len(w['trajectory']) == 3 and len(w['penalty_loss']) == 6
+    assert all(k < torch.sigmoid(torch.tensor(6.0)).item() for k in w['release']['keep_mean'])
+    # the original copy is untouched by the sleep
+    o = sl._original()
+    assert not any(p.requires_grad for p in o.parameters())
+    g2 = _gen()
+    cfg2 = SleepConfig(mode='joint_reanchor', anchor_ema=0.9, mem_param='free', mem_lr=1e-2, lam=1.0,
+                       n_samples=6, sample_len=10, sample_batch=6, steps=6, lr=1e-3, batch=4,
+                       lm_batch=2, lm_len=16, retain_windows=2, eval_chunk=3, lm_mix=0.0, retain_kl=0.0, probe_every=3)
+    w2 = Sleeper(g2, store, cfg2).consolidate(torch.randint(2, VOCAB, (30,)))
+    assert len(w2['trajectory']) == 3 and w2['drift_after'] >= 0
+    with pytest.raises(AssertionError):
+        SleepConfig(mode='joint_fixed', penalty_ref='nope')
+    with pytest.raises(AssertionError):
+        SleepConfig(mode='joint_reanchor', anchor_ema=1.0)

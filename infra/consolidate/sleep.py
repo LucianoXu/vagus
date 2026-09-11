@@ -56,6 +56,17 @@
 #   with g a (H, dk) vector per layer — the geometry of the gate's own
 #   forgetting, well conditioned under the readout's scale gauge, and
 #   the learned g is the release order; 'free' trains every entry.
+#   penalty_ref 'student' judges emptiness with the live weights,
+#   KL(S(w',m') || S(w',m0)) — a redundancy condition w' alone can
+#   satisfy (the first sweep: the memory never moved, w' made the two
+#   branches agree, one hop in disguise); 'original' judges it with the
+#   frozen original weights, KL(S(w0,m') || S(w0,m0)), gradient to m'
+#   only, so the memory is drained by a term w' cannot touch and the
+#   anchor forces w' to absorb what it loses.
+#   anchor_ema > 0 replaces the one-step-lag anchor of joint_reanchor by
+#   an EMA copy of (w', m') with that decay: a long-horizon anchor
+#   between lag-1 (0) and the frozen teacher (1); lag-1 under Adam
+#   integrated the penalty's bias into 0.28 nat of drift.
 #   At the end the memory is cleared as before; the witness carries the
 #   trajectory of penalty / drift / blank-student KL.
 #
@@ -134,6 +145,8 @@ class SleepConfig:
     mem_param: str = 'rows'        # rows | free
     mem_lr: float = 0.2            # Adam lr of the memory parameters (rows: on the logit g; free: on entries)
     mem_init: float = 6.0          # rows: g init, sigmoid(6) = 0.9975
+    penalty_ref: str = 'student'   # student | original: whose weights judge the memory's emptiness
+    anchor_ema: float = 0.0        # joint_reanchor: EMA decay of the anchor copy (0 = one-step lag)
     probe_every: int = 16          # steps between trajectory probes (penalty / drift / blank KL)
     layer_probe: bool = False      # per-layer read KL at the end (24 x replay-set forwards)
     seed: int = 0
@@ -157,6 +170,8 @@ class SleepConfig:
             assert self.method == 'replay_kl' and self.hops == (0.0,) and self.replay_from == 'end', \
                 'joint modes: replay_kl, one hop, end replay'
             assert self.lam >= 0 and self.mem_lr >= 0 and self.probe_every >= 1
+            assert self.penalty_ref in ('student', 'original'), self.penalty_ref
+            assert 0.0 <= self.anchor_ema < 1.0, self.anchor_ema
         self.betas = tuple(self.betas)   # type: ignore[assignment]  # yaml gives a list
 
     def asdict(self) -> dict:
@@ -411,21 +426,25 @@ class Sleeper:
         bos = torch.full((s.shape[0], 1), self.start_id, dtype=torch.int64, device=self.device)
         return torch.cat([bos, s[:, :-1]], dim=1)
 
-    def _student_logits(self, s: torch.Tensor, mem: dict | None) -> torch.Tensor:
-        '''Logits predicting s (b, N) from the student: a fresh stream
-        (start_id + s) when mem is None, else the stream continuing
-        from mem's pending token with mem's matrix states as entry
-        states (the differentiable forward).'''
+    def _student_logits(self, s: torch.Tensor, mem: dict | None,
+                        model: torch.nn.Module | None = None) -> torch.Tensor:
+        '''Logits predicting s (b, N) from the student (or `model`): a
+        fresh stream (start_id + s) when mem is None, else the stream
+        continuing from mem's pending token with mem's matrix states as
+        entry states (the differentiable forward).'''
+        model = self.model if model is None else model
         if mem is None:
-            return self._forward(self._student_input(s))
-        b = s.shape[0]
-        pending = mem['pending'].expand(b)
-        block = torch.cat([pending[:, None], s[:, :-1]], dim=1)
-        caches = _expand(mem['cache'], b)['blocks']
+            block = self._student_input(s)
+            caches = None
+        else:
+            b = s.shape[0]
+            pending = mem['pending'].expand(b)
+            block = torch.cat([pending[:, None], s[:, :-1]], dim=1)
+            caches = _expand(mem['cache'], b)['blocks']
         if self.autocast:
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                return self.model(block, caches=caches)
-        return self.model(block, caches=caches)
+                return model(block, caches=caches)
+        return model(block, caches=caches)
 
     def _kl(self, student_logits: torch.Tensor, teacher_logits: torch.Tensor,
             valid: torch.Tensor) -> torch.Tensor:
@@ -613,6 +632,28 @@ class Sleeper:
         K = s.shape[0]
         batches = [torch.from_numpy(self.rng.choice(K, size=min(cfg.batch, K), replace=False)).to(self.device)
                    for _ in range(cfg.steps)]
+        orig = self._original() if cfg.penalty_ref == 'original' else None
+        blank0 = None
+        if orig is not None:
+            # S(w0, m0) on the whole replay set, fixed for the sleep
+            with torch.no_grad():
+                blank0 = torch.cat([self._student_logits(s[b0:b0 + cfg.eval_chunk], None, orig)
+                                    for b0 in range(0, K, cfg.eval_chunk)])
+        ema_model = ema_params = None
+        if cfg.mode == 'joint_reanchor' and cfg.anchor_ema > 0:
+            ema_model = copy.deepcopy(self.model).eval()
+            for p in ema_model.parameters():
+                p.requires_grad_(False)
+            ema_params = [p.detach().clone() for p in mp.params]
+
+        def ema_state() -> dict:
+            assert ema_params is not None
+            saved = mp.params
+            mp.params = ema_params
+            try:
+                return mp.state()
+            finally:
+                mp.params = saved
 
         def probe(step: int) -> dict:
             with torch.no_grad():
@@ -637,7 +678,12 @@ class Sleeper:
             s_blank = self._student_logits(s[idx], None)
             anchor = teacher[idx] if cfg.mode == 'joint_fixed' else anchor_next
             distill = self._kl(s_mem, anchor, valid[idx])
-            penalty = self._kl(s_blank, s_mem, valid[idx])     # KL(S(w',m') || S(w',m0)), both sides live
+            if orig is None:
+                penalty = self._kl(s_blank, s_mem, valid[idx])     # KL(S(w',m') || S(w',m0)), both sides live
+            else:
+                assert blank0 is not None
+                o_mem = self._student_logits(s[idx], mem, orig)     # frozen w0 reads the live memory
+                penalty = self._kl(blank0[idx], o_mem, valid[idx])  # KL(S(w0,m') || S(w0,m0)), grad to m' only
             loss = distill + cfg.lam * penalty
             if cfg.lm_mix > 0 or cfg.retain_kl > 0:
                 win = self._windows(cfg.lm_batch, cfg.lm_len)
@@ -648,11 +694,21 @@ class Sleeper:
             loss.backward()
             if cfg.grad_clip:
                 torch.nn.utils.clip_grad_norm_(list(self.model.parameters()) + mp.params, cfg.grad_clip)
-            if cfg.mode == 'joint_reanchor' and step + 1 < cfg.steps:
-                # the anchor of the next step is this point's prediction on the next batch
+            if cfg.mode == 'joint_reanchor' and ema_model is None and step + 1 < cfg.steps:
+                # one-step lag: this point's prediction (before the update) on the next batch
                 with torch.no_grad():
                     anchor_next = self._student_logits(s[batches[step + 1]], mp.state())
             opt.step()
+            if cfg.mode == 'joint_reanchor' and step + 1 < cfg.steps:
+                with torch.no_grad():
+                    if ema_model is not None:
+                        assert ema_params is not None
+                        d = cfg.anchor_ema
+                        for pe, p in zip(ema_model.parameters(), self.model.parameters()):
+                            pe.mul_(d).add_(p.detach(), alpha=1 - d)
+                        for pe, p in zip(ema_params, mp.params):
+                            pe.mul_(d).add_(p.detach(), alpha=1 - d)
+                        anchor_next = self._student_logits(s[batches[step + 1]], ema_state(), ema_model)
             losses.append(float(distill.detach()))
             penalties.append(float(penalty.detach()))
             if (step + 1) % cfg.probe_every == 0 and step + 1 < cfg.steps:
@@ -665,6 +721,7 @@ class Sleeper:
         witness['penalty_after'] = traj[-1]['penalty']
         witness['drift_after'] = traj[-1]['drift']
         witness['release'] = mp.profile()
+        del ema_model, ema_params, blank0
         witness['hops'] = [{'level': 'joint', 'steps': cfg.steps, 'kl_before': traj[0]['blank'],
                             'kl_after': traj[-1]['blank']}]
         if cfg.layer_probe:
