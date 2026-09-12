@@ -195,6 +195,45 @@ def recurrent_scan(q, k, v, g, beta, S0, *, scale: float, delta: bool, w=None):
     return o.to(q.dtype), S
 
 
+def residual_scan(k, v, g, beta, S0, *, delta: bool, w=None):
+    '''The delta rule's per-token residual, |v_t - S_{t-1}^T k_t| /
+    |v_t| with S_{t-1} already decayed — what the memory did not
+    predict about the value it is about to store (the write is beta_t
+    times this residual). (B, L, H) fp32. Without the delta rule the
+    residual is v_t itself (ratio 1). Same recurrence as recurrent_scan,
+    and it takes the same optional explicit write vector w.
+
+    This is the diagnostic behind the capacity reading: run it along a
+    stream from a blank state and the residual falls while the memory
+    still has room, then plateaus once it is full. On LAX1-340M it falls
+    0.92 -> 0.715 over positions 1-128 = d_k and is flat to 2048.'''
+    B, L, H, dk = k.shape
+    dv = v.shape[-1]
+    dt = _compute_dtype(k)
+    k, v = k.to(dt), v.to(dt)
+    S = torch.zeros(B, H, dk, dv, device=k.device, dtype=dt) if S0 is None else S0.to(dt)
+    out = []
+    for t in range(L):
+        if g is not None:
+            a = g[:, t].to(dt).exp()
+            S = S * (a[..., None] if a.dim() == 3 else a[..., None, None])
+        kt, vt = k[:, t], v[:, t]
+        if delta:
+            kS = torch.einsum('bhk,bhkv->bhv', kt, S)
+            r = vt - kS
+            out.append(r.norm(dim=-1) / vt.norm(dim=-1).clamp(min=1e-6))
+            if w is None:
+                assert beta is not None
+                wt = kt * beta[:, t].to(dt)[..., None]
+            else:
+                wt = w[:, t].to(dt)
+            S = S + torch.einsum('bhk,bhv->bhkv', wt, r)
+        else:
+            out.append(torch.ones(B, H, device=k.device, dtype=dt))
+            S = S + torch.einsum('bhk,bhv->bhkv', kt, vt)
+    return torch.stack(out, dim=1).float() if L else k.new_zeros(B, 0, H, dtype=torch.float32)
+
+
 def chunk_scan(q, k, v, g, beta, S0, *, scale: float, delta: bool, chunk_size: int = 64):
     '''Chunkwise form of recurrent_scan (WY representation of the
     intra-chunk delta-rule product), O(L) sequential steps of size C.
@@ -749,6 +788,17 @@ class GatedDeltaNet(nn.Module, Mixer):
         beta, w = self._write(x, k, g, beta)
         o, _ = self._scan(q, k, v, g, beta, None, fusions=on, w=w)
         return self._output(o, x)
+
+    @torch.no_grad()
+    def residuals(self, x) -> torch.Tensor:
+        '''(B, L, H) delta-rule residual ratios along a fresh stream x
+        (B, L, dim) — the layer's surprise at each token. Torch path;
+        no gradient.'''
+        qp, kp, vp = self.wq(x), self.wk(x), self.wv(x)
+        _, k, v = self._heads(qp, kp, vp)
+        g, beta = self._gates(x)
+        beta, w = self._write(x, k, g, beta)
+        return residual_scan(k, v, g, beta, None, delta=self.delta, w=w)
 
     @torch.no_grad()
     def gate_stats(self, x) -> dict:

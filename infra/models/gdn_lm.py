@@ -194,6 +194,24 @@ class GDNLM(nn.Module, Decodable):
             return x
         return self.head(x)
 
+    @torch.no_grad()
+    def surprise(self, tokens) -> torch.Tensor:
+        '''(B, L, layers, H) delta-rule residual ratios of every linear
+        mixer along a fresh stream (see GatedDeltaNet.residuals): what the
+        memory failed to predict at each token. Two uses: the priority
+        signal a prioritised replay samples from, and — averaged over a
+        batch and bucketed by position — the capacity reading, since the
+        curve falls while the memory has room and plateaus once it is
+        full. All-GDN layouts only.'''
+        x = self.embedding(tokens)
+        out = []
+        for blk in self.blocks:
+            att = self._linear_of(blk.att)
+            assert att is not None and att is blk.att, 'surprise: all-GDN layouts only'
+            out.append(att.residuals(blk.rmsnorm1(x)))
+            x = blk(x)
+        return torch.stack(out, dim=2)
+
     # --- the mixers by role -----------------------------------------------
 
     @staticmethod
