@@ -1,0 +1,46 @@
+{
+ "run": {
+  "name": "lax3-340M-fwe15B-2ed076d7",
+  "purpose": "LAX3 = the memory-geometry arm of the linear series: LAX1's pure KDA model with the recurrent state rebalanced from 4 heads x (d_k 128, d_v 256) to 2 x (256 x 512), plus a widened decay init. H*d_v = 1024 and H*d_k = 512 are both held, so every weight matrix keeps LAX1's shape and the heads are simply reinterpreted as half as many, twice as wide: 343.73M params vs LAX1's 343.77M (-0.01%), no FFN compensation. Motivated by a measurement on the trained LAX1 checkpoint (2026-09-10): the delta-rule state's TOKEN capacity is d_k, not d_k*d_v and not H*d_k, and LAX1's per-token residual |v - S^T k|/|v| falls 0.92 -> 0.715 over positions 1-128 and is then flat to 2048 \u2014 92% of what the memory ever learns about a stream it has learned by position 128 = d_k. LAX3 doubles that budget at equal parameters. Batch-paired vs lax1-340M-fwe15B-c9af2f44 (same seed / data order / global batch / optimizer recipe / WSD schedule; the memory geometry and the decay init are the only variables).",
+  "code_commit": "2ed076d7",
+  "created": "2026-09-10T17:49:52+02:00",
+  "finished": "2026-09-12T01:17:13+02:00",
+  "elapsed": "23:40:46 + 06:16:20 (walltime deadline at step 22,708 / 11.906B tokens; link 2 resumed cleanly from recent.pt \u2014 no work redone. 15B at 142.5k tok/s needs ~29.2 h against a 24 h allocation, so the run was queued as two links up front with the chain guard ported into raven_lax3_340M.sbatch)",
+  "slurm_jobs": {
+   "smoke": 30133340,
+   "walltime_hit": 30133343,
+   "completed": 30136172
+  },
+  "hardware": "1 node x 4x A100-SXM4-40GB (MPCDF Raven, partition gpu)",
+  "torch": "2.13.0+cu130",
+  "kernels": "fla-core 0.5.2 (chunk_kda), triton 3.7.1; regional torch.compile of the blocks"
+ },
+ "recipe": "recipe/train/lax3_340M_fwe15B.yaml + recipe/model/lax3_340M.yaml at the commit \u2014 LAX1's training recipe verbatim (Muon polar-express + AdamW, shared lr 1.75e-3 via rms adjust, WSD warmup 0.01 / decay 0.15 / floor 0, z-loss 1e-4, wd 0.1, grad clip 1.0, micro 8 x accum 8 on 4 GPUs = 0.5M tokens/step, ctx 2048). No pilot ladder: LAX3 changes neither width nor depth, so the SAX1 law and the LAX1 pilot ladder carry over. Model deltas vs lax1_340M.yaml: head_count 4->2, key_head_dim 128->256, value_head_dim 256->512, A_init_range (1,16)->(0.5,32), dt_init_range (1e-3,1e-1)->(5e-4,1.5e-1). A_init_range / dt_init_range are new GDNLM arguments added in 7e43664.",
+ "data": "same store as the SAX / LAX1 runs (fineweb-edu-100BT-mistral32k, 140 shards, 110.8B tokens, home-GPFS layout; source revision 87f09149, tokenizer mistral32k sha256 fc4f0bd7); identical batch sequence to LAX1 by construction. 15B = 0.14 epoch.",
+ "results": {
+  "steps": 28610,
+  "tokens_seen": 14999879680,
+  "final_loss": 2.4023,
+  "final_loss_ema": 2.3989,
+  "loss_tail5": 2.3943,
+  "loss_ce_tail5": 2.3935,
+  "loss_z_final": 0.0008,
+  "median_tokens_per_s": 142486,
+  "mfu_median": 0.252,
+  "mfu_note": "Same accounting caveat as LAX1's entry. The comparable number is throughput: 142.5k tok/s vs LAX1's 150.8k, i.e. LAX3 is 5.5% slower per token \u2014 consistent with +2.7% total matmul FLOPs (the scan is 1.77x per layer but only 4.2% of this model) plus kernel overhead at d_k 256. max_mem_gb 29.5 vs LAX1's 29.8 despite 2x the recurrent state, so micro 8 was never at risk.",
+  "max_mem_gb": 29.5,
+  "verdict": "loss_ce_tail5 2.3935 vs paired LAX1 2.3956. The runs share a batch sequence, so the honest statistic is the per-step paired difference, not either tail mean (tail5 alone is noisy: LAX3 tail5 2.3935 / tail20 2.4018, sd over the last 50 points 0.025). Paired over the cooldown: -0.0024 nat, SE 0.0001 (46 sigma). REAL, CERTAIN, AND NEGLIGIBLE: for scale, softmax -> KDA was -0.0197 nat and KDA -> hybrid (HAX1 2.3820) -0.0136, so doubling the memory's token capacity buys about one eighth of either. The more interesting shape is that the advantage DECAYS MONOTONICALLY as the weights learn \u2014 paired delta by window: 0-2k -0.0343, 2k-8k -0.0061, 8k-16k -0.0045, 16k-24318 -0.0030, cooldown -0.0024. Extra in-context memory capacity is largely substitutable by learned weights, and by convergence almost all of it has been substituted. This was the predicted outcome: loss_ce was never the deciding read for this arm. The reads that decide it \u2014 the MQAR recall probe, the residual-vs-position saturation curve (the falsifiable prediction is that LAX1's plateau at ~128 tokens moves out toward ~256), and the trained gate spectrum against LAX1 \u2014 are not in this record.",
+  "health": "zero instability events across 28,610 steps: gnorm max 0.25 post-warmup (median 0.10, clip 1.0 never fired), z-term 0.0008 final, no NaN in either link's logs. Gates: beta_mean rose 0.42 -> 0.84 and held, reproducing on LAX3 the beta saturation measured on the trained LAX1 checkpoint \u2014 the state-blind write strength saturates regardless of how much state there is to write into, which is the gap the KDN mixer (commit 741b34c) addresses. alpha_mean settled 0.69-0.78; mem_len median 5.5-12.6 tokens. NOTE that gdn/mem_len_max is useless as reported: it is a max over channels of 1/(1-alpha), heavy-tailed, and it hit the 1e6 clamp mid-run (LAX1's ended at 176,602 against LAX3's 13,662 despite LAX3's WIDER init). The trained decay spectrum has to be read off the checkpoint, not from this scalar. pnorm/embedding 432.9 final (range 122.9-482.0). Cooldown cliff 0.110 vs LAX1's 0.159.",
+  "trunk_asset": "stable-phase full-state ckpts 05000/10000/15000/20000 (decay began at step 24318) \u2014 cooldown-branch trunk, paired with LAX1's and SAX2's at the same steps"
+ },
+ "decision_note": "The d_k ladder does not continue on LM loss alone: -0.0024 nat for 2x the state and 5.5% of the throughput is not a trade worth repeating at 1.3B. Whether the arm is worth anything at all now rests entirely on recall. Run, in order: (1) the residual-vs-position saturation curve on both checkpoints \u2014 the sharp falsifiable prediction, and the cheapest; (2) the MQAR recall probe from trio-340M-f97202d6 on the LAX1/LAX3 pair; (3) the trained gate spectrum, which also tells us whether the widened A/dt init left a wider trained spread and whether the head axis still carries it with only 2 heads. If the saturation plateau does NOT move out toward ~256, the rank bound is not what binds in practice and the whole capacity line stops here. The head-count confound (4 -> 2) has a cheap tiebreaker if needed: the same recipe at 4 x (128 x 256) with the widened init alone.",
+ "archive": {
+  "primary": "selene:/data/vagus/runs/lax3-340M-fwe15B-2ed076d7/  (SHA256SUMS inside; 18,729,375,072 bytes over 15 files, pushed from raven 2026-09-12 at 35 MB/s, sha256sum -c verified 15/15 OK on selene)",
+  "contents": "ckpt-{05000,10000,15000,20000,25000,28610}.pt (full training state), model-final.pt (slim weights+args), tb/ (two event files, one per walltime link), config.yaml, meta.json, slurm logs (30133343 + 30136172, .out and .err)",
+  "transient": [
+   "raven:/u/yinxu/work/vagus/runs/lax3-340M-fwe15B-2ed076d7/ (home GPFS working copy, 46 GB incl. recent*.pt; GPFS du reports ~2x apparent size)",
+   "raven:/u/yinxu/work/vagus/runs/slurm-lax3smoke-30133340.* (smoke job, not archived)"
+  ]
+ },
+ "evals": []
+}
