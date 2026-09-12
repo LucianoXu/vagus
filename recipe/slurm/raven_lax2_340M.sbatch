@@ -21,11 +21,20 @@
 # on two links. Queue the continuation up front with the same run_dir=;
 # a link whose run is already complete exits at once instead of holding
 # the node:
-#   J1=$(sbatch --parsable recipe/slurm/raven_lax2_340M.sbatch)
+#   D=runs/lax2-340M-fwe15B-$(git rev-parse --short=8 HEAD)
+#   J1=$(sbatch --parsable recipe/slurm/raven_lax2_340M.sbatch \
+#          recipe/train/lax2_340M_fwe15B.yaml run_dir=$D)
 #   J2=$(sbatch --parsable --dependency=afterany:$J1 \
 #          recipe/slurm/raven_lax2_340M.sbatch \
-#          recipe/train/lax2_340M_fwe15B.yaml \
-#          run_dir=runs/lax2-340M-fwe15B-<commit8>)
+#          recipe/train/lax2_340M_fwe15B.yaml run_dir=$D)
+# PIN run_dir ON LINK 1 TOO, as above. Without it link 1 derives
+# <run_name>-<commit8> from HEAD when it STARTS, so any pull between
+# submitting the chain and link 1 starting leaves the continuation
+# pointing at a directory that does not exist — and because the chain
+# guard only looks for model-final.pt there, it does not exit: it
+# starts a second 15B run from scratch on a fresh node. Hit on LAX2
+# (link 1 landed in -eca6d197 while link 2 was pinned to -42c9de3e);
+# caught before link 2 ran.
 # Resubmitting the same script+config resumes from the latest recent
 # checkpoint (the run dir is <run_name>-<commit8>); a resubmit from a
 # newer checkout continues the original directory with run_dir=...
