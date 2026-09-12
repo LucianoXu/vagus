@@ -1,0 +1,36 @@
+# The capacity reading on the LAX pair: how far into a stream each model's
+# recurrent memory is still absorbing anything.
+#
+# LAX3 doubled the delta-rule state's token capacity (d_k 128 -> 256) at
+# identical parameters, on the hypothesis that d_k is what limits a linear
+# memory — read off LAX1's residual curve going flat at position ~128 = d_k.
+# This eval is the falsification test, and the number to read is frac@p (the
+# share of each subject's OWN total fall completed by position p), not the
+# plateau level: d_v differs between the two (256 vs 512) and the residual is
+# normalised by |v_t|, so levels are not comparable across the pair.
+#
+# If d_k binds, LAX3 should still be falling at 128 and finish near 256.
+#
+#   .venv/bin/python -m infra.eval.main recipe/eval/saturation_lax.yaml
+# Runs on a laptop (MPS) in a couple of minutes; no SLURM needed.
+
+eval_name: saturation-lax
+subjects:
+  - {ckpt: runs/gen-eval/lax1-model-final.pt, label: LAX1, run_meta: runs/cmp/lax1/meta.json}
+  - {ckpt: runs/gen-eval/lax3-model-final.pt, label: LAX3, run_meta: runs/cmp/lax3/meta.json}
+
+device: auto
+dtype: float32          # the residual is a ratio of norms; keep the scan in fp32
+seed: 0
+
+tasks:
+  - name: saturation
+    args:
+      data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+      n_seqs: 32
+      length: 2048
+      batch_size: 8
+      tail_from: 1024
+
+out_root: runs/eval
+registry_dir: registry/eval
