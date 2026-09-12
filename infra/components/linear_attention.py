@@ -754,17 +754,35 @@ class GatedDeltaNet(nn.Module, Mixer):
     def gate_stats(self, x) -> dict:
         '''Health probe on a small input (a sequence or two): per-head mean
         decay a, effective memory length 1/(1-a), mean write strength b,
-        and the RMS of the state after the sequence. fp32 torch path.'''
+        and the RMS of the state after the sequence. fp32 torch path.
+
+        Goes through _write, like forward and decode_step: a subclass may
+        put something other than sigmoid(w_beta . x) in beta's place, and
+        for KalmanDeltaNet _gates alone returns beta=None (the Kalman gain
+        needs the keys, so it is formed in _write). Reading the gates
+        without the hook asserted inside chunk_scan_vec and killed the LAX2
+        smoke at its first slow-metric step (job 30199344).'''
         q, k, v = self._heads(self.wq(x), self.wk(x), self.wv(x))
         g, beta = self._gates(x)
-        _, S = chunk_scan(q, k, v, g, beta, None, scale=self.scale, delta=self.delta,
-                          chunk_size=self.chunk_size)
+        beta, w = self._write(x, k, g, beta)
+        if w is None:
+            _, S = chunk_scan(q, k, v, g, beta, None, scale=self.scale, delta=self.delta,
+                              chunk_size=self.chunk_size)
+        else:
+            _, S = recurrent_scan(q, k, v, g, beta, None, scale=self.scale,
+                                  delta=self.delta, w=w)
         out = {'state_rms': S.pow(2).mean().sqrt()}
         if g is not None:
             a = g.exp().mean(dim=(0, 1)).flatten()            # per head, or per (head, channel)
             out['alpha'] = a
             out['mem_len'] = 1.0 / (1.0 - a).clamp(min=1e-6)
-        if beta is not None:
+        # write strength is |w_t| per head. For the symmetric write
+        # w = beta k with |k| = 1, so this IS beta and the metric keeps its
+        # meaning across the family; an asymmetric Kalman gain has no beta
+        # but the same quantity is defined.
+        if w is not None:
+            out['beta'] = w.norm(dim=-1).mean(dim=(0, 1))
+        elif beta is not None:
             out['beta'] = beta.mean(dim=(0, 1))
         return out
 

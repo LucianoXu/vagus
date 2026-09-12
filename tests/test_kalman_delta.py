@@ -181,6 +181,25 @@ def test_model_builds_trains_and_round_trips(write):
     assert [p.shape for p in m2.parameters()] == [p.shape for p in m.parameters()]
 
 
+@pytest.mark.parametrize('write', ['delta', 'kalman_iso', 'kalman_diag'])
+def test_slow_metric_probe_runs_for_every_write(write):
+    """The trainer's slow metrics call GatedDeltaNet.gate_stats, which reads
+    the gates directly. It has to go through _write like forward does: for a
+    Kalman mixer _gates alone returns beta=None, and reading the gates
+    without the hook asserted inside chunk_scan_vec and killed the LAX2
+    smoke at its first slow-metric step (job 30199344)."""
+    from infra.train.metrics import MetricCtx
+    m = build_model('GDNLM', {**ARGS, 'write': write})
+    ctx = MetricCtx(model=m, last_batch=torch.randint(0, 101, (2, 16)))
+    out = m.metric_hooks()['slow'][0](ctx)
+    for key in ('gdn/alpha_mean', 'gdn/mem_len_median', 'gdn/mem_len_max',
+                'gdn/beta_mean', 'gdn/state_rms_max'):
+        assert key in out, (write, key, sorted(out))
+        assert torch.isfinite(torch.tensor(out[key])), (write, key, out[key])
+    # the write-strength metric keeps its meaning: |w| = beta when w = beta k
+    assert 0.0 < out['gdn/beta_mean'] < 2.0, out['gdn/beta_mean']
+
+
 def test_noise_projections_route_to_adamw():
     '''The skinny gate / noise matrices must land in the AdamW group, as wb
     does for the plain delta rule — Muon on a d x H matrix is the wrong
