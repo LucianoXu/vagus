@@ -59,6 +59,7 @@
 # channel starts at omega = omega_min + softplus(0).
 
 import math
+from functools import partial
 
 import torch
 import torch.nn.functional as F
@@ -74,7 +75,7 @@ PRECISION_FLOOR = 0.1
 PRECISION_INIT = 1.0
 
 
-def mobius_scan(A, B, C, D, x0, *, impl: str = 'parallel'):
+def mobius_scan(A, B, C, D, x0, *, impl: str = 'parallel', block: int | None = 256):
     '''x_t = (A_t x_{t-1} + B_t) / (C_t x_{t-1} + D_t) along dim 1.
 
     A..D: (B, L, *rest) non-negative, x0: (B, *rest); returns (B, L, *rest).
@@ -83,8 +84,25 @@ def mobius_scan(A, B, C, D, x0, *, impl: str = 'parallel'):
     scan is a prefix product — associative, log depth. Scaling a matrix
     leaves the map alone, which is what makes the renormalisation below
     free; with every entry non-negative there is no cancellation to lose.
-    'recurrent' is the definition, kept as the test oracle.'''
+    'recurrent' is the definition, kept as the test oracle.
+
+    block caps the width of one prefix product. The doubling loop holds a
+    (B, block, *rest, 2, 2) tensor per step and autograd would keep every
+    step: for Diagonal KDN, where *rest is (H, dk), that is 5.8 GB per
+    layer at the 340M coordinate — 163 GB over 24 layers, measured, which
+    is what OOMed the first LAX4 smoke. Blocks compose because a Mobius
+    map does, so the scan runs the parallel form inside a block and
+    carries the scalar across blocks. None disables the split.'''
     L = A.shape[1]
+    if impl == 'parallel' and block is not None and L > block:
+        out, x = [], x0
+        for lo in range(0, L, block):
+            hi = min(lo + block, L)
+            seg = mobius_scan(A[:, lo:hi], B[:, lo:hi], C[:, lo:hi], D[:, lo:hi],
+                              x, impl='parallel', block=None)
+            out.append(seg)
+            x = seg[:, -1]
+        return torch.cat(out, dim=1)
     if impl == 'recurrent':
         x, out = x0, []
         for t in range(L):
@@ -222,14 +240,15 @@ class KalmanDeltaNet(GatedDeltaNet):
         entry = self._entry_gain
         if entry is None:
             entry = self._entry_precision(B, x.device, alpha.dtype)
-        if self.kalman == 'iso':
-            beta, final = kalman_gain_iso(kf, alpha, omega, r, entry,
-                                          info_scale=self.info_scale, impl=self.gain_impl)
-            w = None
+        fn = kalman_gain_iso if self.kalman == 'iso' else kalman_gain_diag
+        run = partial(fn, info_scale=self.info_scale, impl=self.gain_impl)
+        if torch.is_grad_enabled() and alpha.requires_grad:
+            # recompute the uncertainty scan in backward rather than hold it
+            gain, final = torch.utils.checkpoint.checkpoint(
+                run, kf, alpha, omega, r, entry, use_reentrant=False)
         else:
-            w, final = kalman_gain_diag(kf, alpha, omega, r, entry,
-                                        info_scale=self.info_scale, impl=self.gain_impl)
-            beta = None
+            gain, final = run(kf, alpha, omega, r, entry)
+        beta, w = (gain, None) if self.kalman == 'iso' else (None, gain)
         if self._entry_gain is not None:
             self.gain_state.copy_(final)
         return beta, w
