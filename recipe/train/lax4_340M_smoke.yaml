@@ -1,0 +1,75 @@
+# LAX4-340M smoke — and unlike the LAX2 smoke this one can actually fail.
+# The Diagonal write is asymmetric, so it runs the torch chunkwise form
+# with a gradient-checkpointed chunk body instead of an fla kernel. Two
+# things it has to establish before 15B is worth booking:
+#
+#   1. max_mem_gb. Without the checkpoint the chunk tensor E, which is
+#      (B, H, C, C, d_k), costs 170 GB at this coordinate over the whole
+#      backward graph — measured, not estimated. The checkpoint should
+#      cap it near one chunk (~67 MB per einsum at micro 8, chunk 64).
+#      If it reports anywhere near 40 GB the checkpoint is not engaged.
+#   2. tokens_per_s against LAX1's 150.8k and LAX2's 128.2k. A torch
+#      chunk loop with 32 checkpoint regions per layer is a lot of
+#      launch overhead; the arithmetic is only about 2x the scan.
+#
+#   sbatch -J lax4smoke -t 00:50:00 recipe/slurm/raven_lax4_340M.sbatch \
+#     recipe/train/lax4_340M_smoke.yaml
+# Fallbacks, in order: chunk_size 32 in the model recipe (the peak is
+# O(C^2)), then batch_size 4 / grad_accum_steps 16.
+# Not an experiment: no registry entry, delete the run dir afterwards.
+
+run_name: lax4-340M-smoke
+model_recipe: ../model/lax4_340M.yaml
+
+data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+data_shards: null          # all 20 shards (16.7B tokens); 15B => 0.9 epoch
+
+context_len: 2048
+# 4 GPUs, single node; global batch = 4 * 8 * 8 * 2048 = 0.5M tokens.
+# micro 8 / accum 8 (SAX1 ran 16 / 4): KDA at micro 16 OOMs on A100-40GB
+# at the first step (38 GB allocated — per-channel gates, conv/l2norm
+# intermediates and the kernel's saved chunk states on top of SAX1's
+# 40.1 GB-peak footprint; jobs 30066917/18). The loader assigns each
+# optimizer step the same global window set for 8x8 and 16x4 (rank-
+# interleaved slices of the shuffled order), so the SAX1 batch pairing
+# holds; only the micro-batch partition of each step differs.
+world_size: 4
+batch_size: 8              # per-rank micro-batch
+grad_accum_steps: 8
+global_batch_tokens: 524288
+train_tokens: 31_457_280       # 60 steps
+seed: 42
+
+optimizer_name: muon
+optimizer_args:
+  lr: 1.75e-3
+  momentum: 0.95
+  weight_decay: 0.1
+  lr_adjust: rms
+  ns_coeffs: polar_express
+  adamw:
+    lr: 1.75e-3
+    betas: [0.9, 0.95]
+    weight_decay: 0.1
+
+schedule_name: wsd
+schedule_args:
+  warmup: 0.5             # 150M tokens, same as SAX1/SAX2
+  decay: 0.15              # linear cooldown over the last 2.25B tokens (SAX2)
+  min_ratio: 0.0
+
+grad_clip: 1.0
+z_loss: 1e-4
+ce_impl: liger
+
+device: auto
+dtype: bfloat16
+compile: true
+tf32: true
+
+out_root: runs
+log_interval: 5
+slow_interval: 20
+permanent_ckpt_interval: null
+recent_ckpt_minutes: 1000
+peak_tflops: 312           # A100 bf16 dense; only feeds the MFU metric

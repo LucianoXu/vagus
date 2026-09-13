@@ -165,10 +165,10 @@ def recurrent_scan(q, k, v, g, beta, S0, *, scale: float, delta: bool, w=None):
     w: (B, L, H, dk) write vectors, used in place of the delta rule's
     beta_t k_t. The recurrence S <- (I - w_t k_t^T) S + w_t v_t^T is the
     *asymmetric* delta rule (w no longer parallel to k), which Diagonal
-    KDN's Kalman gain produces; beta is ignored when w is given. The
-    chunkwise forms below do NOT accept it — the compact-WY factorisation
-    they use assumes the symmetric write — so an asymmetric write runs
-    this scan, at this scan's cost.'''
+    KDN's Kalman gain produces; beta is ignored when w is given.
+    chunk_scan_vec takes w too: the WY factorisation puts k in the reading
+    slot and w in the writing slot and never needed them parallel (an
+    earlier comment here claimed it did — it was wrong).'''
     B, L, H, dk = q.shape
     dv = v.shape[-1]
     dt = _compute_dtype(q)
@@ -309,7 +309,8 @@ def chunk_scan(q, k, v, g, beta, S0, *, scale: float, delta: bool, chunk_size: i
     return o.to(out_dtype), S
 
 
-def chunk_scan_vec(q, k, v, g, beta, S0, *, scale: float, delta: bool, chunk_size: int = 64):
+def chunk_scan_vec(q, k, v, g, beta, S0, *, scale: float, delta: bool, chunk_size: int = 64,
+                   w=None):
     '''Chunkwise form for a per-channel gate g: (B, L, H, dk) (KDA).
 
     With Diag decays the scalar trick (pull G out of the Householder
@@ -325,7 +326,19 @@ def chunk_scan_vec(q, k, v, g, beta, S0, *, scale: float, delta: bool, chunk_siz
         S_C = G_C S_0 + (K * G_C/G_j)^T u~
     The scalar chunk_scan is this with gamma broadcast over channels.
     The pairwise gated products cost C * C * dk per chunk, so the chunk
-    loop builds them one chunk at a time.'''
+    loop builds them one chunk at a time.
+
+    w: (B, L, H, dk) explicit write vectors, in place of the delta rule's
+    beta_t k_t. The factorisation does NOT require w parallel to k — the
+    two appear in different slots. Writing the chunk as a sum of rank-1
+    updates, S_i = S_{i-1} + w_i r_i^T with r_i = v_i - S_{i-1}^T k_i,
+        (I + M) R = V - K S_0,    M_ij = <k_i, w_j>_g   (j < i)
+        S_C = G_C S_0 + sum_j (w_j G_C/G_j) r_j^T
+        o_i = (q_i G_i) S_0 + sum_{j<=i} <q_i, w_j>_g r_j
+    so k occupies the reading slot and w the writing slot, and a Kalman
+    gain drops straight in. The symmetric branch below is kept verbatim
+    rather than folded into this: it solves for beta*r instead of r, which
+    is the same system scaled row-wise, and the two are not bit-identical.'''
     B, L, H, dk = q.shape
     dv = v.shape[-1]
     C = chunk_size
@@ -343,40 +356,70 @@ def chunk_scan_vec(q, k, v, g, beta, S0, *, scale: float, delta: bool, chunk_siz
     def to_chunks(t, last):   # (B, N*C, H, d) -> (B, H, N, C, d)
         return t.view(B, N, C, H, last).permute(0, 3, 1, 2, 4)
 
+    if w is not None:
+        assert delta, 'an explicit write vector needs the delta rule'
+        w = F.pad(w.to(dt), (0, 0, 0, 0, 0, pad)) if pad else w.to(dt)
+        w = to_chunks(w, dk)
     q, k, v = to_chunks(q, dk), to_chunks(k, dk), to_chunks(v, dv)
     gamma = to_chunks(g, dk).cumsum(3)                                     # log G_i, (B, H, N, C, dk)
     tril = torch.ones(C, C, device=dev, dtype=torch.bool).tril()
     strict = tril.tril(-1)
     eye = torch.eye(C, device=dev, dtype=dt)
-    if delta:
+    if delta and w is None:
         assert beta is not None
         beta = beta.to(dt).view(B, N, C, H).permute(0, 3, 1, 2)          # (B, H, N, C)
     else:
-        beta = None                                                       # no erase, no W
+        beta = None                                                       # no erase, or w carries it
 
-    S = torch.zeros(B, H, dk, dv, device=dev, dtype=dt) if S0 is None else S0.to(dt)
-    outs = []
-    for n in range(N):
-        qn, kn, vn, gn = q[:, :, n], k[:, :, n], v[:, :, n], gamma[:, :, n]    # (B, H, C, .)
+    def chunk_body(qn, kn, vn, wn, bn, gn, S):
+        '''One chunk. Split out so it can be gradient-checkpointed: E is
+        (B, H, C, C, dk) and autograd would otherwise hold one per chunk
+        per layer — 170 GB at 340M/2048/micro-8, measured. Recomputing it
+        in backward costs one extra chunk forward and caps the peak at a
+        single chunk. The pairwise form is not avoidable by factorising
+        E = exp(gamma_i) exp(-gamma_j): the second factor overflows fp32
+        for the fast-decaying channels (the trained LAX1 spectrum reaches
+        log a = -3.6, i.e. exp(+228) over a 64-token chunk).'''
         # E_ijc = exp(gamma_i[c] - gamma_j[c]) on i >= j, 0 above (masked before exp)
         E = (gn[:, :, :, None, :] - gn[:, :, None, :, :]).masked_fill(
             ~tril[None, None, :, :, None], float('-inf')).exp()             # (B, H, C, C, dk)
-        Aqk = torch.einsum('bhijd,bhjd->bhij', qn[:, :, :, None, :] * E, kn)
         Gn = gn.exp()                                                       # G_i        (B, H, C, dk)
         Gend = (gn[:, :, -1:, :] - gn).exp()                                # G_C / G_j  (B, H, C, dk)
-        if beta is not None:                                                # delta
-            Akk = torch.einsum('bhijd,bhjd->bhij', kn[:, :, :, None, :] * E, kn)
-            bn = beta[:, :, n]                                              # (B, H, C)
-            M = (bn[..., None] * Akk) * strict
-            W = torch.linalg.solve_triangular(eye + M, bn[..., None] * kn * Gn,
-                                              upper=False, unitriangular=True)
-            U = torch.linalg.solve_triangular(eye + M, bn[..., None] * vn,
-                                              upper=False, unitriangular=True)
-            Ut = U - W @ S
+        gp = lambda a, b: torch.einsum('bhijd,bhjd->bhij', a[:, :, :, None, :] * E, b)
+        if wn is not None:                                                  # asymmetric write
+            M = gp(kn, wn) * strict                                         # <k_i, w_j>_g
+            Wm = torch.linalg.solve_triangular(eye + M, kn * Gn,
+                                               upper=False, unitriangular=True)
+            Um = torch.linalg.solve_triangular(eye + M, vn,
+                                               upper=False, unitriangular=True)
+            Ut = Um - Wm @ S                                                # = r
+            Aw, wend = gp(qn, wn), wn * Gend
+        elif bn is not None:                                                # delta, w = b k
+            M = (bn[..., None] * gp(kn, kn)) * strict
+            Wm = torch.linalg.solve_triangular(eye + M, bn[..., None] * kn * Gn,
+                                               upper=False, unitriangular=True)
+            Um = torch.linalg.solve_triangular(eye + M, bn[..., None] * vn,
+                                               upper=False, unitriangular=True)
+            Ut = Um - Wm @ S                                                # = b r
+            Aw, wend = gp(qn, kn), kn * Gend                                # b lives in Ut
         else:
-            Ut = vn
-        outs.append((qn * Gn) @ S + Aqk @ Ut)
-        S = Gn[:, :, -1, :, None] * S + (kn * Gend).transpose(-1, -2) @ Ut
+            Ut, Aw, wend = vn, gp(qn, kn), kn * Gend
+        return ((qn * Gn) @ S + Aw @ Ut,
+                Gn[:, :, -1, :, None] * S + wend.transpose(-1, -2) @ Ut)
+
+    S = torch.zeros(B, H, dk, dv, device=dev, dtype=dt) if S0 is None else S0.to(dt)
+    ckpt = torch.is_grad_enabled() and any(
+        t is not None and t.requires_grad for t in (q, k, v, w))
+    outs = []
+    for n in range(N):
+        args = (q[:, :, n], k[:, :, n], v[:, :, n],
+                None if w is None else w[:, :, n],
+                None if beta is None else beta[:, :, n], gamma[:, :, n], S)
+        if ckpt:
+            on, S = torch.utils.checkpoint.checkpoint(chunk_body, *args, use_reentrant=False)
+        else:
+            on, S = chunk_body(*args)
+        outs.append(on)
     o = torch.stack(outs, dim=2)                     # (B, H, N, C, dv)
     o = o.permute(0, 2, 3, 1, 4).reshape(B, N * C, H, dv)[:, :L]
     return o.to(out_dtype), S
@@ -747,10 +790,14 @@ class GatedDeltaNet(nn.Module, Mixer):
 
     def _scan(self, q, k, v, g, beta, S0, *, fusions=frozenset(), w=None):
         if w is not None:
-            # asymmetric write: no chunkwise form (see recurrent_scan)
+            # asymmetric write: no fla kernel takes one, but the torch
+            # chunkwise form does — k and w sit in different slots of the
+            # WY factorisation, so nothing there needed w parallel to k.
             assert self.delta, 'an explicit write vector needs the delta rule'
-            return recurrent_scan(q, k, v, g, beta, S0, scale=self.scale,
-                                  delta=True, w=w)
+            assert g is not None and g.dim() == 4, \
+                'the asymmetric chunk form is implemented for the vector gate'
+            return chunk_scan_vec(q, k, v, g, None, S0, scale=self.scale, delta=True,
+                                  chunk_size=self.chunk_size, w=w)
         if self._pick_impl(q) == 'fla':
             return fla_scan(q, k, v, g, beta, S0, scale=self.scale, delta=self.delta,
                             chunk_size=self.chunk_size,
@@ -895,11 +942,11 @@ class GatedDeltaNet(nn.Module, Mixer):
         g, beta = self._gates(x)
         beta, w = self._write(x, k, g, beta)
 
-        if L == 1 or w is not None:
+        if L == 1:
             o, S = recurrent_scan(q, k, v, g, beta, self.state, scale=self.scale,
                                   delta=self.delta, w=w)
         else:
-            o, S = self._scan(q, k, v, g, beta, self.state)
+            o, S = self._scan(q, k, v, g, beta, self.state, w=w)
         self.state.copy_(S)
         self.cache_len += L
         return self._output(o, x)

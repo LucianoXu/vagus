@@ -1,0 +1,78 @@
+# LAX4-340M — LAX1 with the delta rule's write replaced by a DIAGONAL
+# Kalman gain (Kalman Delta Networks, arXiv:2609.07816). Architecture
+# otherwise byte-identical to lax1_340M, as LAX2 was.
+#
+# Why this and not more of LAX2. At 15B, Isotropic KDN (LAX2) gave loss
+# parity (2.3948 vs 2.3956) and 3x WORSE associative recall, and the
+# write_selectivity read said why: its gate is still surprise-blind
+# (corr(w, rho) -0.018 against the plain delta rule's -0.032, write gain
+# 0.994 against 0.991). It bought a lower, more variable beta, not a
+# selective one.
+#
+# The isotropic precision cannot do better, and the reason is structural.
+# Its update is c_t = 1/bhat + s|k_t|^2/(dk r_t), and our keys are
+# L2-normalised — as are upstream's: their Triton boundary kernel emits
+# k_gain and k_memory as the SAME unit vector, differing only in dtype.
+# So |k_t|^2 = 1 at every token, c accumulates at a rate set by r_t alone
+# (an input projection), and the one state-aware quantity in the
+# isotropic approximation carries no information about WHICH keys were
+# written — only how many. Diagonal does not share this: its per-channel
+# information weight is s k_i^2 / r, and k_i^2 varies across channels
+# with content even at |k| = 1. It is the only variant that can track
+# which key directions the memory has already committed to.
+#
+# The paper's own numbers agree with that ordering. At 1.3B/100B,
+# real-world retrieval average: KDA 33.76, Isotropic 33.40 (loses),
+# Diagonal 34.86 (wins); Diagonal also takes the RULER 14-cell aggregate
+# at both scales. Diagonal is their headline and the variant we had not
+# tested.
+#
+# What it cost to make trainable. kappa is not parallel to k, so the
+# write is asymmetric. I had recorded that as "the compact-WY
+# factorisation assumes the symmetric write" — that was WRONG. The
+# factorisation puts k in the reading slot and w in the writing slot and
+# never needed them parallel: writing the chunk as S_i = S_{i-1} + w_i
+# r_i^T with r_i = v_i - S_{i-1}^T k_i gives (I + M) R = V - K S_0 with
+# M_ij = <k_i, w_j>_g, and everything else follows. chunk_scan_vec takes
+# w directly (verified against the token recurrence at 1e-15 in fp64).
+#
+# The real obstacle was memory, not algebra: E is (B, H, C, C, d_k) and
+# autograd held one per chunk per layer — 170 GB at this coordinate,
+# measured. The chunk body is now gradient-checkpointed, which caps the
+# peak at a single chunk for one extra chunk forward in backward. E
+# cannot be factorised away as exp(gamma_i) exp(-gamma_j): the second
+# factor overflows fp32 for the fast channels (the trained LAX1 spectrum
+# reaches log a = -3.6, i.e. exp(+228) over a 64-token chunk).
+#
+# So there is no fla kernel on this path and the smoke has to say whether
+# the torch chunk form is affordable at all. If it is not, the fallback
+# is a smaller chunk_size (the peak is O(C^2)) and then micro 4.
+#
+# What decides it, in the same order as LAX2:
+#   1. write_selectivity against LAX1 and LAX2. corr(w, rho) MUST move
+#      off -0.02. If the diagonal gain is as blind as the isotropic one,
+#      the whole KDN line is finished for us.
+#   2. the recall probe on the lax12/lax13 grid.
+#   3. loss_ce, last, and only as a guard against a regression.
+
+model_name: GDNLM
+model_args:
+  vocab_size: 32000        # mistral32k tokenizer
+  dim: 1024
+  layer_count: 24
+  head_count: 4
+  key_head_dim: 128
+  value_head_dim: 256
+  ffn_hidden_dim: 2816
+  short_conv_size: 4
+  gate: vector             # KDA's per-channel decay; KDN keeps it exactly
+  gate_rank: 64
+  delta: true
+  write: kalman_diag       # <- the whole experiment
+  chunk_size: 64           # LAX1's; the HAX kernel sweep was on the hybrid
+  la_impl: auto
+  layer_pattern: gdn       # pure linear, as LAX1
+  context_len: 2048        # only binds softmax layers; pure GDN has no limit
+  rmsnorm_eps: 1.0e-6
+  tie_embedding: true
+  gate_proj_optimizer: adamw   # omega / r / gate matrices train under AdamW

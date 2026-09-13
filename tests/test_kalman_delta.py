@@ -139,6 +139,55 @@ def test_write_shape_and_scan_route(kalman):
         assert beta is None and w.shape == (2, 12, 2, 8)
 
 
+def test_asymmetric_chunk_scan_matches_the_token_recurrence():
+    """The chunkwise form with an explicit, NON-parallel write vector against
+    recurrent_scan, which is the definition. This is what makes Diagonal KDN
+    trainable: the WY factorisation puts k in the reading slot and w in the
+    writing slot, so it never required w parallel to k."""
+    from infra.components.linear_attention import chunk_scan_vec, recurrent_scan
+    torch.manual_seed(0)
+    dt = torch.float64
+    B, L, H, dk, dv = 2, 37, 3, 8, 6                   # L not a multiple of C
+    q = torch.randn(B, L, H, dk, dtype=dt)
+    k = torch.randn(B, L, H, dk, dtype=dt)
+    k = k / k.norm(dim=-1, keepdim=True)
+    v = torch.randn(B, L, H, dv, dtype=dt)
+    w = torch.randn(B, L, H, dk, dtype=dt) * 0.4       # not parallel to k
+    g = -torch.rand(B, L, H, dk, dtype=dt) * 0.3       # log a, per channel
+    S0 = torch.randn(B, H, dk, dv, dtype=dt)
+    cos = (w * k).sum(-1) / (w.norm(dim=-1) * k.norm(dim=-1))
+    assert cos.abs().max() < 0.95, 'the write must actually be asymmetric'
+
+    o_ref, S_ref = recurrent_scan(q, k, v, g, None, S0, scale=0.5, delta=True, w=w)
+    for C in (4, 8, 16):
+        o, S = chunk_scan_vec(q, k, v, g, None, S0, scale=0.5, delta=True,
+                              chunk_size=C, w=w)
+        assert torch.allclose(o, o_ref, rtol=1e-10, atol=1e-10), C
+        assert torch.allclose(S, S_ref, rtol=1e-10, atol=1e-10), C
+
+
+def test_asymmetric_chunk_scan_reduces_to_the_symmetric_one():
+    """w = beta k must reproduce the delta-rule branch. The two solve the same
+    system scaled row-wise (for r vs beta*r), so they agree numerically without
+    being bit-identical."""
+    from infra.components.linear_attention import chunk_scan_vec
+    torch.manual_seed(1)
+    dt = torch.float64
+    B, L, H, dk, dv = 2, 24, 3, 8, 6
+    q = torch.randn(B, L, H, dk, dtype=dt)
+    k = torch.randn(B, L, H, dk, dtype=dt)
+    k = k / k.norm(dim=-1, keepdim=True)
+    v = torch.randn(B, L, H, dv, dtype=dt)
+    beta = torch.rand(B, L, H, dtype=dt)
+    g = -torch.rand(B, L, H, dk, dtype=dt) * 0.3
+    S0 = torch.randn(B, H, dk, dv, dtype=dt)
+    o_sym, S_sym = chunk_scan_vec(q, k, v, g, beta, S0, scale=0.5, delta=True, chunk_size=8)
+    o_asy, S_asy = chunk_scan_vec(q, k, v, g, None, S0, scale=0.5, delta=True,
+                                  chunk_size=8, w=beta[..., None] * k)
+    assert torch.allclose(o_sym, o_asy, rtol=1e-10, atol=1e-10)
+    assert torch.allclose(S_sym, S_asy, rtol=1e-10, atol=1e-10)
+
+
 @pytest.mark.parametrize('kalman', ['iso', 'diag'])
 def test_streaming_matches_stateless_forward(kalman):
     '''Prefill a block, then step token by token: the uncertainty state has

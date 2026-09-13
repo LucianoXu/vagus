@@ -33,13 +33,15 @@
 #       kappa_t = phat_t * k_t / (r_t + sum_i phat_ti k_ti^2)
 #       p_t     = phat_t / (1 + s k_t^2 / r_t * phat_t)
 #     kappa_t is a VECTOR and is not parallel to k_t, so the write
-#     (I - kappa k^T) S + kappa v^T is the asymmetric delta rule. The
-#     compact-WY factorisation the chunk kernels use assumes the
-#     symmetric write, so on our path Diagonal KDN runs the token
-#     recurrence: correct, and fast enough for eval and tests, but not
-#     for pretraining until an asymmetric chunk kernel exists. Upstream
-#     ships a Triton one (github.com/ngocbh/kalman-delta-networks,
-#     kdn_ops/diag_kdn_chunk.py); porting it is the open work.
+#     (I - kappa k^T) S + kappa v^T is the asymmetric delta rule. An
+#     earlier version of this comment said the compact-WY factorisation
+#     assumes a symmetric write and that Diagonal therefore had to run
+#     the token recurrence. That was wrong: WY puts k in the reading slot
+#     and w in the writing slot and never needed them parallel, so
+#     chunk_scan_vec takes w directly. There is still no fla kernel for
+#     it, and the chunk tensor E is (B, H, C, C, d_k), so the chunk body
+#     is gradient-checkpointed — without that autograd holds one E per
+#     chunk per layer, 170 GB at the 340M coordinate.
 #
 # Both uncertainty recurrences are Mobius maps x -> (A x + B) / (C x + D)
 # with A, B, C, D > 0, so a prefix product of 2x2 matrices computes them
