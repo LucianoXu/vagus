@@ -30,12 +30,11 @@
 # one: beta_t stays ONE SCALAR PER HEAD, so the memory recurrence is the
 # delta rule we already run and every chunkwise kernel — fla's chunk_kda
 # included — applies unchanged. Diagonal KDN's gain is a vector not
-# parallel to k, i.e. an asymmetric write, and the compact-WY
-# factorisation the chunk kernels rest on does not cover it; on our path
-# it runs the token recurrence, which is fine for eval and unusable for
-# pretraining. `write: kalman_diag` builds and trains correctly if you
-# want it at toy scale; the open work is porting upstream's Triton
-# asymmetric kernel (kdn_ops/diag_kdn_chunk.py).
+# parallel to k, i.e. an asymmetric write, which no fla kernel takes.
+# (This recipe originally said the compact-WY factorisation could not
+# cover an asymmetric write either, so Diagonal had to run the token
+# recurrence. That was wrong — WY puts k in the reading slot and w in the
+# writing slot; chunk_scan_vec takes w directly, and Diagonal is LAX4.)
 #
 # Cost: +98,592 params (+0.029%) — the per-head omega / r projections
 # and the learned initial precision. The uncertainty scan is a prefix
