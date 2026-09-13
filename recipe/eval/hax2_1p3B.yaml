@@ -1,0 +1,84 @@
+# HAX2-1.3B against HAX1-340M — the scale read on the axis the hybrid
+# exists for.
+#
+# HAX2 is alone at 1.3B, so there is no same-size pair to run. The
+# comparison that does exist is architectural continuity: HAX1 and HAX2
+# are the same parallel softmax+KDA design at 4x the parameters, 4x the
+# tokens and 2x the context, with the output gate added. Pairing them
+# here turns "HAX2 scores X" into a statement about what the extra scale
+# bought on each axis.
+#
+# What the 340M trio already established (registry/eval/trio-340M-f97202d6):
+# on MQAR recall the hybrid is the point of the design — HAX1 0.524 acc
+# at L1024_p32 against SAX2's 0.387 and LAX1's 0.276 — and the ordering
+# is the opposite of what LM loss says, where the three sit within 0.04
+# nat of each other. It also established the wall: at L4096, beyond
+# every 340M subject's training context, HAX1 fell to 0.013 and LAX1 to
+# 0.023. Recall collapsed outside the trained length even for the model
+# with no positional limit.
+#
+# The question this record has to answer: does that wall move with scale
+# and training length? HAX2 trained at ctx 4096, so the L4096 cells are
+# in-distribution for it and out-of-distribution for HAX1 — if the wall
+# is about training length, HAX2 should hold there and fall at 8192; if
+# it is about state capacity or about the softmax branches' NoPE
+# extrapolation, HAX2 should fall at 4096 too, and the hybrid's recall
+# advantage does not survive being scaled.
+#
+# Grid. Each pair costs ~4 tokens (key, colon, value, newline), so the
+# density of a cell is 4*pairs/L; the trio's workable range was 3-33%.
+#   L1024   p8 3%   p32 12%   p64 25%
+#   L4096   p8 0.8% p32  3%   p64  6%
+#   L8192   p8 0.4% p32  2%   p64  3%
+# L1024 overlaps the trio grid as a sanity anchor (same task, same seed,
+# same n — HAX1's numbers there should reproduce). L4096 is HAX2's
+# trained context. L8192 is 2x it: pure extrapolation, which only these
+# two models can run at all (NoPE softmax branches plus fixed-size KDA
+# state, so max_stream_len is None).
+#
+# holdout carries the LM-quality record at both context lengths, and
+# degeneration the generation-health one. Neither is the decision; they
+# are here so the record is self-contained and so the loss/recall
+# dissociation the trio found can be checked again at 1.3B.
+#
+# Cost: one A100. The recall grid is 9 cells x 64 teacher-forced
+# sequences, the longest 8192 tokens, on a 1.3B model and a 340M one.
+
+eval_name: hax2-1.3B
+subjects:
+  - {ckpt: runs/hax2-1.3B-fwe60B-ae617e8f/model-final.pt, label: HAX2-1.3B}
+  - {ckpt: runs/hax1-340M-fwe15B-1ab072f4/model-final.pt, label: HAX1-340M}
+
+device: auto
+dtype: bfloat16
+seed: 0
+
+tasks:
+  - name: recall_probe
+    args:
+      data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+      lengths: [1024, 4096, 8192]
+      kv_pairs: [8, 32, 64]
+      n: 64
+      noise: text
+      batch_size: 1
+  - name: holdout
+    args:
+      data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+      n_seq: 128
+      context_len: [2048, 4096]
+      batch_size: 1
+      metrics: [nll, entropy, top_p_support, rep_at_l]
+      top_p: 0.9
+      rep_l: [32, 128]
+  - name: degeneration
+    args:
+      data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+      n_prompts: 32
+      prompt_tokens: 32
+      new_tokens: 96
+      seeds: 5
+      batch_size: 8
+
+out_root: runs/eval
+registry_dir: registry/eval
