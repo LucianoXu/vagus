@@ -75,6 +75,7 @@ PRECISION_FLOOR = 0.1
 PRECISION_INIT = 1.0
 
 
+@torch._dynamo.disable
 def mobius_scan(A, B, C, D, x0, *, impl: str = 'parallel', block: int | None = 256):
     '''x_t = (A_t x_{t-1} + B_t) / (C_t x_{t-1} + D_t) along dim 1.
 
@@ -92,7 +93,14 @@ def mobius_scan(A, B, C, D, x0, *, impl: str = 'parallel', block: int | None = 2
     layer at the 340M coordinate — 163 GB over 24 layers, measured, which
     is what OOMed the first LAX4 smoke. Blocks compose because a Mobius
     map does, so the scan runs the parallel form inside a block and
-    carries the scalar across blocks. None disables the split.'''
+    carries the scalar across blocks. None disables the split.
+
+    Kept out of the compiled graph: inductor's tiling analysis trips over
+    the block loop's shape expressions and raises "Expected a number but
+    got Mul" from tiling_utils._analyze_memory_coalescing, which killed
+    the LAX4 smoke (job 30223939) once the OOM was out of the way. The
+    scan is a small part of the layer, so a graph break here is cheaper
+    than chasing the codegen bug.'''
     L = A.shape[1]
     if impl == 'parallel' and block is not None and L > block:
         out, x = [], x0
