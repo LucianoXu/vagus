@@ -1,0 +1,99 @@
+# LAX3-340M — LAX1 with the recurrent memory's key/value budget
+# rebalanced, and the decay's initial timescale prior widened. Same pure
+# KDA skeleton, same data/recipe, same parameter count, so the loss and
+# recall deltas are attributable to the memory geometry alone.
+#
+# Motivation, measured on the trained LAX1-340M checkpoint (2026-09-10;
+# scripts and numbers in the session record):
+#
+#   The delta-rule state is a d_k x d_v matrix, and its TOKEN capacity is
+#   d_k, not d_k * d_v: retrieval is S^T q = sum_i v_i (k_i . q), so p
+#   pairs are separable only while the p keys are linearly independent,
+#   and the keys live in d_k dimensions. d_v sets how much each stored
+#   item carries, never how many fit. Head count does not help either:
+#   every head is written at every token (beta is high and roughly
+#   uniform across heads — mean 0.80, and no head-partitioning was
+#   found), so H heads are H redundant views of the same token stream,
+#   not H times the tokens.
+#
+#   Measured consequence: the per-token delta-rule residual
+#   |v - S^T k| / |v| falls 0.92 -> 0.715 over positions 1-128 and is
+#   then FLAT to 2048 (0.698). 92% of everything the memory ever learns
+#   about a stream it has learned by position 128 = d_k. Past that it is
+#   writing into a full state that does not get better at predicting.
+#
+#   Second measurement: the decay's timescale spread. The trained model
+#   uses it and pushes past its own init — A = exp(A_log) spans
+#   0.88-59.7 against U(1, 16) at init, and the resting memory length
+#   spans 3.7 decades against the init's 3.2. Between-head variance of
+#   log10 tau grew 6x over init (13% -> 41% of total), so the model
+#   organises timescale BY HEAD. It is a continuum, not two banks
+#   (2-means separation 0.683, no higher than the log-uniform init's
+#   0.712) — which is why this recipe widens the prior rather than
+#   banding the heads.
+#
+# The change: 4 heads x (d_k 128, d_v 256)  ->  2 heads x (d_k 256, d_v 512).
+#
+#   H * d_v = 1024 is held (the mixer's output width, so w_v / w_gate /
+#   w_o keep their shapes) and H * d_k = 512 is held (so w_q / w_k keep
+#   theirs). Every weight matrix in the model is the same shape as
+#   LAX1's — the heads are simply reinterpreted as half as many, twice
+#   as wide. Params 343.73M vs LAX1's 343.77M (-0.01%), with no FFN
+#   fudge factor anywhere.
+#
+#   What it buys: token capacity 128 -> 256, recurrent state 2x
+#   (6.29 -> 12.58 MB bf16 per sequence).
+#   What it costs: the scan's matmul FLOPs go 1.77x, but the scan is
+#   only 4.2% of this model, so the total is 2.136 -> 2.193 GF/token =
+#   +2.7%. Memory is the real risk and it is not small here: the
+#   chunkwise algorithm materialises (B, L/C, H, d_k, d_v) per layer,
+#   1.61 -> 3.22 GB at micro 8 / ctx 2048 / chunk 64. LAX1 already OOMs
+#   at micro 16 (38 GB, jobs 30066917/18), so micro 8 has less headroom
+#   than the HAX runs do. The smoke is the gate; the fallbacks, in
+#   order, are batch_size 4 / grad_accum_steps 16 (same global batch,
+#   so the data pairing with LAX1 survives) and then chunk_size 128
+#   (the chunk-state activation is proportional to 1/C).
+#
+#   The honest confound: this halves the head count (4 -> 2), and the
+#   measurement above says heads are the unit of timescale
+#   specialisation. The trade is deliberate — heads buy redundant views,
+#   d_k buys tokens, and the saturation curve says tokens are what binds
+#   — but a null result has two possible causes, and the tiebreaker is
+#   cheap: the same recipe at head_count 4 / key_head_dim 128 /
+#   value_head_dim 256, i.e. the widened init alone.
+#
+# Widened decay init: A ~ U(0.5, 32) per head, dt ~ logU(5e-4, 1.5e-1)
+# per key channel, so the resting memory length starts spread over
+# tau in [0.21, 4000] tokens (4.28 decades) against LAX1's [0.63, 1000]
+# (3.2 decades). Sized to cover what LAX1 actually reached (resting tau
+# p1 0.28, p99 1349) with margin at both ends. A is widened more than dt
+# (1.2 -> 1.81 decades vs 2.0 -> 2.48) because A is the per-head knob and
+# the head axis is where the trained spread went. With d_k 256 there are
+# also 2x as many channels per head sampling the dt prior.
+#
+# Everything else is LAX1's exactly: 24 x 1024, pure KDA (no softmax
+# layers, no positional encoding), tied embedding, FFN 2816, vector gate
+# rank 64, delta rule, short conv 4, chunk_size 64.
+
+model_name: GDNLM
+model_args:
+  vocab_size: 32000        # mistral32k tokenizer
+  dim: 1024
+  layer_count: 24
+  head_count: 2            # was 4 — 2 heads x (256 x 512)
+  key_head_dim: 256        # was 128 — the token capacity of the state
+  value_head_dim: 512      # was 256 — H * d_v = 1024 holds the mixer width
+  ffn_hidden_dim: 2816     # same as SAX1 / LAX1
+  short_conv_size: 4       # causal depthwise conv on q/k/v (GDN ablation: essential)
+  gate: vector             # per-channel forget gate (KDA)
+  gate_rank: 64            # low-rank bottleneck of the vector gate projection
+  delta: true              # delta-rule write
+  A_init_range: [0.5, 32.0]        # was (1, 16); per head
+  dt_init_range: [5.0e-4, 1.5e-1]  # was (1e-3, 1e-1); per key channel, log-uniform
+  chunk_size: 64
+  la_impl: auto            # fla kernels on cuda/bf16, torch chunk reference elsewhere
+  layer_pattern: gdn       # pure; no hybrid layers
+  context_len: 2048        # only binds softmax layers; pure GDN has no limit
+  rmsnorm_eps: 1.0e-6
+  tie_embedding: true
+  gate_proj_optimizer: adamw   # the d x H gate matrices train under AdamW, not Muon

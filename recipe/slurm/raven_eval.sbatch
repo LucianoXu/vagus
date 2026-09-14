@@ -5,6 +5,8 @@
 # ~/work/vagus-mem-consolidate evaluates its own code and runs/.
 #   sbatch -J probe recipe/slurm/raven_eval.sbatch recipe/eval/consolidate_lax1_probe.yaml
 #   sbatch -J replay recipe/slurm/raven_eval.sbatch recipe/eval/consolidate_lax1_replay.yaml
+#   sbatch -J recall recipe/slurm/raven_eval.sbatch recipe/eval/lax13_step5000.yaml
+#   sbatch -J trio   recipe/slurm/raven_eval.sbatch recipe/eval/trio_340M.yaml
 #SBATCH --job-name=eval
 #SBATCH --partition=gpu1
 #SBATCH --nodes=1

@@ -149,6 +149,16 @@ class TrainConfig:
     slow_interval: int = 100             # steps: param-norm scalars
     permanent_ckpt_interval: int | None = None   # steps; None = only final
     recent_ckpt_minutes: float = 30.0
+    # Walltime: stop on the trainer's own clock. With SLURM_JOB_END_TIME
+    # in the environment (slurm >= 23.02), the loop stops this many
+    # seconds before the job's end, writes the recent checkpoint and
+    # exits 0 — no signal chain involved. The signal path (sbatch trap
+    # -> srun -> slurmstepd -> torchrun -> workers) proved unreliable on
+    # multi-node jobs: job 30099563's SIGTERM to srun became a step
+    # cancel and SIGKILL 30 s later (KillWait), before any rank had
+    # logged the stop. Keep this margin ABOVE the sbatch --signal margin
+    # (900 s) so the checkpoint is done before any signal arrives.
+    deadline_margin_s: float | None = 1200.0
     peak_tflops: float | None = None     # per-device; enables MFU logging
 
     @classmethod
@@ -465,6 +475,9 @@ def train(config: TrainConfig, teardown: bool = True):
 
     signal.signal(signal.SIGTERM, _stop_handler)
     signal.signal(signal.SIGUSR1, _stop_handler)
+    deadline: float | None = None
+    if config.deadline_margin_s is not None and os.environ.get('SLURM_JOB_END_TIME'):
+        deadline = float(os.environ['SLURM_JOB_END_TIME']) - config.deadline_margin_s
 
     torch.manual_seed(config.seed)          # same init on every rank
     np.random.seed(config.seed)
@@ -535,6 +548,9 @@ def train(config: TrainConfig, teardown: bool = True):
     log(f'plan: {steps_total:,} steps x {tokens_per_step:,} tokens/step '
         f'= {steps_total * tokens_per_step / 1e9:.2f}B tokens '
         f'({steps_total * tokens_per_step / store.total_tokens:.2f} epochs)')
+    if deadline is not None:
+        log(f'walltime deadline: stop at {datetime.fromtimestamp(deadline):%Y-%m-%d %H:%M:%S} '
+            f'({config.deadline_margin_s:.0f}s before SLURM_JOB_END_TIME)')
 
     if is_main and resume_from is None:
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -626,6 +642,7 @@ def train(config: TrainConfig, teardown: bool = True):
     batches = iter(loader)
     model.train()
     last_recent = time.time()
+    stopped_early = False   # set by a signal or the walltime deadline
     log('training...')
 
     try:
@@ -677,11 +694,16 @@ def train(config: TrainConfig, teardown: bool = True):
             # and the time-based recent checkpoint (any rank's clock) —
             # under FSDP the save itself is a collective, so every rank
             # must take the same branch
-            want_recent = time.time() - last_recent > config.recent_ckpt_minutes * 60
-            flags = torch.tensor([float(_STOP), float(want_recent)], device=device)
+            now = time.time()
+            want_recent = now - last_recent > config.recent_ckpt_minutes * 60
+            past_deadline = deadline is not None and now > deadline
+            flags = torch.tensor([float(_STOP), float(want_recent), float(past_deadline)],
+                                 device=device)
             if is_dist:
                 dist.all_reduce(flags, op=dist.ReduceOp.MAX)
-            stop, want_recent = bool(flags[0].item()), bool(flags[1].item())
+            stop = bool(flags[0].item()) or bool(flags[2].item())
+            want_recent = bool(flags[1].item())
+            stopped_early = stopped_early or stop
 
             monitor.observe(step, loss_acc / config.grad_accum_steps,
                             grad_norm, tokens_seen,
@@ -701,10 +723,11 @@ def train(config: TrainConfig, teardown: bool = True):
                 log(f'recent checkpoint at step {step:,}')
 
             if stop:
-                log(f'stop signal received at step {step:,}; checkpointing and exiting')
+                why = 'walltime deadline reached' if bool(flags[2].item()) else 'stop signal received'
+                log(f'{why} at step {step:,}; checkpointing and exiting')
                 break
 
-        kind = 'recent' if _STOP else 'permanent'
+        kind = 'recent' if stopped_early else 'permanent'
         p = save_checkpoint(run_dir, kind, step, tokens_seen,
                             model, optimizer, loader, config, is_fsdp, is_main)
         if is_main:

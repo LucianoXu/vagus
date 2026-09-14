@@ -1,0 +1,53 @@
+# LAX1 vs LAX2 at the 15B endpoint — does a Kalman write gain buy recall?
+#
+# Same grid as lax13_{step5000,final}.yaml so all three 340M linear arms
+# are one table. LAX2 is LAX1's model with the delta rule's
+# beta = sigmoid(w_beta . x_t) replaced by an Isotropic Kalman gain
+# (arXiv:2609.07816), +0.029% params, everything else byte-identical.
+#
+# Loss has already settled and separates nothing: LAX1 2.3956, LAX2
+# 2.3948, LAX3 2.3935 — all three inside 0.002 nat, against the 0.020 by
+# which LAX1 beat SAX2. So this probe and write_selectivity are the whole
+# verdict.
+#
+# One thing did move, and it is the reason to run this rather than call
+# it a wash: LAX2's write strength converged to 0.5415 where LAX1's went
+# to 0.8222. The Kalman gain does NOT saturate, which is what its form
+# predicts (the gain falls as accumulated evidence rises). But a lower
+# MEAN is not selectivity — a constant 0.54 would look the same. Whether
+# it tracks the residual is write_selectivity's corr(w, rho), and whether
+# any of it reaches behaviour is this probe.
+#
+# Prediction, and it is the one the whole KDN line rests on: a gate that
+# protects confirmed associations should help most where there is most to
+# protect, i.e. the gap should grow with kv_pairs. Flat in k means the
+# Kalman parameterisation bought a different beta and nothing else.
+
+eval_name: lax12-final
+subjects:
+  - {ckpt: runs/lax1-340M-fwe15B-c9af2f44/model-final.pt, label: LAX1, tokenizer_id: mistral32k}
+  - {ckpt: runs/lax2-340M-fwe15B-eca6d197/model-final.pt, label: LAX2, tokenizer_id: mistral32k}
+
+device: auto
+dtype: bfloat16
+seed: 0
+
+tasks:
+  - name: recall_probe
+    args:
+      data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+      lengths: [2048, 4096]
+      kv_pairs: [32, 64, 128]
+      n: 64
+      noise: text
+      batch_size: 2
+  - name: holdout
+    args:
+      data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+      n_seq: 128
+      context_len: [2048]
+      batch_size: 2
+      metrics: [nll]
+
+out_root: runs/eval
+registry_dir: registry/eval

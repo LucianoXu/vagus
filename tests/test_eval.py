@@ -211,3 +211,55 @@ def test_tokenizer_mismatch_refused(store_dir):
         meta = {'tokenizer': {'sha256': 'deadbeef'}}
     with pytest.raises(ValueError, match='tokenizer'):
         check_tokenizer(S(), store)
+
+
+# --- saturation: the capacity reading ------------------------------------
+
+PURE_GDN = dict(vocab_size=VOCAB, dim=64, layer_count=3, head_count=2, key_head_dim=16,
+                value_head_dim=32, gate_rank=8, chunk_size=8, la_impl='torch', context_len=48)
+
+
+def test_saturation_curve_shape_and_witness(store_dir, subjects, tmp_path_factory):
+    """The residual starts at 1 from a blank state (S = 0, so |v - 0| / |v|),
+    falls, and settles; frac@p is normalised by the subject's own total fall
+    so it compares across geometries, which the level does not."""
+    root = tmp_path_factory.mktemp('sat')
+    pure = _checkpoint(root / 'pure-gdn', 'GDNLM', PURE_GDN, tokens_seen=100, with_run_meta=False)
+    run_dir = evaluate(EvalConfig(
+        eval_name='sat',
+        subjects=[{'ckpt': str(pure / 'model-final.pt'), 'label': 'P'}],
+        tasks=[{'name': 'saturation', 'args': {
+            'data_dir': str(store_dir), 'n_seqs': 4, 'length': 128, 'batch_size': 2,
+            'edges': [1, 2, 4, 8, 16, 32, 64], 'marks': [16, 32, 64], 'tail_from': 64}}],
+        device='cpu', dtype='float32', seed=1, n_boot=10,
+        out_root=str(root / 'eval'), registry_dir=str(root / 'registry')))
+    res = json.loads((run_dir / 'results.json').read_text())['saturation']['subjects']['P']
+    sc, it, w = res['scalars'], res['items'], res['witness']
+    assert sc['start'] == 1.0                      # blank state: |v - 0| / |v|
+    assert set(k for k in sc if k.startswith('b')) == {f'b{lo}_{hi}' for lo, hi in
+                                                       ((1, 2), (2, 4), (4, 8), (8, 16), (16, 32), (32, 64), (64, 128))}
+    assert math.isclose(sc['total_fall'], sc['start'] - sc['plateau'], abs_tol=1e-12)
+    # an untrained model's curve does not fall, so no frac@ is reported and
+    # nothing NaN reaches the record
+    assert sc['total_fall'] < 0 and not [k for k in sc if k.startswith('frac@')]
+    assert all(v == v for v in sc.values()), 'no NaN in a versioned record'
+    assert w['rank_bound_d_k'] == 16 and w['length'] == 128 and w['n_seqs'] == 4
+    assert w['geometry'] == {'head_count': 2, 'key_head_dim': 16, 'value_head_dim': 32}
+    assert len(w['per_layer_plateau']) == 3
+    assert len(it['bucket_mean']) == 3 * len(w['buckets'])     # per (layer, bucket), layer-major
+
+
+def test_saturation_refuses_a_hybrid_model(store_dir, subjects, tmp_path_factory):
+    """surprise() is all-GDN only; the task must say so rather than
+    silently reporting a curve over the linear branches alone."""
+    root = tmp_path_factory.mktemp('sat-refuse')
+    _, b = subjects                      # GDN fixture carries a 'parallel' layer
+    with pytest.raises((AssertionError, RuntimeError)):
+        evaluate(EvalConfig(
+            eval_name='satx',
+            subjects=[{'ckpt': str(b / 'model-final.pt'), 'label': 'H'}],
+            tasks=[{'name': 'saturation', 'args': {
+                'data_dir': str(store_dir), 'n_seqs': 2, 'length': 64, 'batch_size': 2,
+                'edges': [1, 2, 4, 8, 16, 32], 'marks': [16], 'tail_from': 32}}],
+            device='cpu', dtype='float32', seed=1, n_boot=10,
+            out_root=str(root / 'eval'), registry_dir=str(root / 'registry')))

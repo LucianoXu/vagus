@@ -1,0 +1,91 @@
+# HAX2-1.3B, on its own.
+#
+# One subject, so nothing here is a comparison against another model.
+# Every reading has to carry its own reference, and each of the three
+# tasks does:
+#
+#   recall_probe   a grid, read as a curve. The number that matters is
+#                  where accuracy falls off along L and along k, not its
+#                  value in any one cell. Chance is a logprob of
+#                  log(1/32000) = -10.37.
+#   holdout        the same text scored at five context lengths. nll
+#                  falling with L is the model using the extra context;
+#                  where it stops falling is how much context it can
+#                  actually use.
+#   degeneration   the task scores the document's OWN continuation at the
+#                  same positions, so rep_excess is repetition above what
+#                  real text has at that length — an absolute reading.
+#
+# THE QUESTION. The 340M trio (registry/eval/trio-340M-f97202d6) found
+# recall collapses outside the trained context for every architecture,
+# including the ones with no positional limit: HAX1 went 0.524 acc at
+# L1024_p32 to 0.013 at L4096, LAX1 0.276 to 0.023. HAX2 trained at ctx
+# 4096 with NoPE softmax branches and a fixed-size KDA state, so it has
+# no positional limit either. Does its wall sit at its own trained
+# length, or further out, or is there no wall?
+#
+# GRID. Each pair costs 4 tokens (key, colon, value, newline) and the
+# task requires L >= 8k, so density is 4k/L and a cell at exactly L = 8k
+# is 100% pairs — a bare list, not pairs hidden in text. Keeping k <= 64
+# holds every cell at 25% or below:
+#
+#          k=8     k=32    k=64
+#   1024   3.1%   12.5%   25.0%     inside the trained context
+#   2048   1.6%    6.3%   12.5%     inside
+#   4096   0.8%    3.1%    6.3%     the trained context
+#   8192   0.4%    1.6%    3.1%     2x extrapolation
+#  16384   0.2%    0.8%    1.6%     4x extrapolation
+#
+# L is the wall axis and k is the capacity axis; reading them together
+# separates "it cannot reach that far" from "it cannot hold that many".
+#
+# NOT INCLUDED. saturation asserts an all-GDN model with surprise(), and
+# HAX2's parallel layers are not that. No second subject, by decision.
+#
+# ONE CAVEAT ON CROSS-READING. recall_probe draws every cell from one rng
+# stream in grid order, so changing the grid changes the items. These
+# numbers can be read against the 340M record as a distribution, not as
+# paired items. An exact HAX2-vs-HAX1 comparison needs both subjects
+# inside one record.
+#
+# Cost: one A100, well under the partition's 6 h. Forward-only except
+# degeneration, ~8M tokens scored; batch 1 because the scored logits are
+# B x L x 32000 and L reaches 16384.
+
+eval_name: hax2-1.3B
+subjects:
+  - {ckpt: runs/hax2-1.3B-fwe60B-ae617e8f/model-final.pt, label: HAX2-1.3B}
+
+device: auto
+dtype: bfloat16
+seed: 0
+
+tasks:
+  - name: recall_probe
+    args:
+      data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+      lengths: [1024, 2048, 4096, 8192, 16384]
+      kv_pairs: [8, 32, 64]
+      n: 64
+      noise: text
+      batch_size: 1
+  - name: holdout
+    args:
+      data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+      n_seq: 128
+      context_len: [1024, 2048, 4096, 8192]
+      batch_size: 1
+      metrics: [nll, entropy, top_p_support, rep_at_l]
+      top_p: 0.9
+      rep_l: [32, 128]
+  - name: degeneration
+    args:
+      data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+      n_prompts: 32
+      prompt_tokens: 32
+      new_tokens: 96
+      seeds: 5
+      batch_size: 8
+
+out_root: runs/eval
+registry_dir: registry/eval

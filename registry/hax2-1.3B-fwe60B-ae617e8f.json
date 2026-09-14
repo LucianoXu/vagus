@@ -1,0 +1,59 @@
+{
+  "run": {
+    "name": "hax2-1.3B-fwe60B-ae617e8f",
+    "purpose": "HAX2 = the second hybrid generation and the arsenal's first 1.3B model: HAX1's parallel softmax+KDA architecture scaled to 24 x 2048, plus a sigmoid output gate on every softmax branch (gated attention). No pilot arms by decision; the lr came from the fitted law raised 1.3x, and the launch gate was a 30-step smoke on the real 3-node layout.",
+    "code_commit": "ae617e8f",
+    "created": "2026-09-09T16:03+02:00",
+    "finished": "2026-09-13T13:47:06+02:00",
+    "elapsed": "3d 21.7h wall (queue waits included); ~91.7 h of 3-node allocation across 6 jobs",
+    "slurm_jobs": {
+      "chain": [
+        30099563,
+        30099987,
+        30099988,
+        30099989,
+        30152200,
+        30152201
+      ],
+      "completed": 30152201,
+      "surplus_cancelled": 30152202,
+      "note": "afterany chain, each link passing run_dir=; a link exits at once if model-final.pt is already present (chain guard, commit f97202d). Three links ended early and are explained under `incidents`."
+    },
+    "hardware": "3 nodes x 4x A100-SXM4-40GB (MPCDF Raven, partition gpu), HSDP: FSDP2 shard inside the node (shard_size 4), replicate across the 3 nodes; NCCL over IB with GPU Direct RDMA",
+    "torch": "2.13.0+cu130",
+    "kernels": "fla-core 0.5.2 (chunk_kda, chunk_size 32, fused gate, shift conv), SDPA for the softmax branches; regional torch.compile of the blocks; DCP checkpoints gathered to a single .pt on rank 0"
+  },
+  "recipe": "recipe/train/hax2_1.3B_fwe60B.yaml + recipe/model/hax2_1.3B.yaml at the commit. Model: 24 x 2048, FFN 5632, tied 32k embedding -> 1.32B params; layer_kinds = parallel at 0-indexed 4, 6, 9, 11, 14, 16, 19, 21 (HAX1's placement, depth unchanged), gdn elsewhere. Parallel block: half-width (1024) softmax branch (8 heads x 128, qk-norm, NoPE, NEW sigmoid output gate) beside a half-width KDA branch (4 heads x (128 x 256)), each RMSNormed, concatenated, one shared 2048 x 2048 output projection. Pure layers: KDA 8 heads x (128 x 256), vector gate rank 64, delta rule, conv 4. Training: world 12 = 3 x 4, shard 4, micro 2 x accum 22 x 4096 = 2,162,688 tokens/step (micro 4 and 3 both OOM at ctx 4096 on 40 GB; the loader gives each optimizer step the same global window set whatever the micro split), 27,743 steps; Muon polar-express + AdamW at a shared lr 2.25e-3 via rms adjust, WSD warmup 0.02 / decay 0.20 / floor 0, z-loss 1e-4, wd 0.1, clip 1.0, liger CE, fsdp bf16 compute / fp32 reduce / no reshard after forward.",
+  "lr_derivation": "The SAX1 fitted law adam_lr = 0.087571 * tokens^-0.3461 * hidden^-0.3448 * sqrt(tpb) gives 1.73e-3 at (60e9, 2048, 2,162,688); raised x1.3 to 2.25e-3 by decision, on the evidence that every 15B run at the law's value never fired the clip (gnorm median 0.10) and the 340M 1B ladders stayed clean to 3e-3. Vindicated: post-warmup gnorm max 0.293, median 0.110, clip never fired in 27,743 steps.",
+  "data": "same store as the 340M runs (fineweb-edu-100BT-mistral32k, 140 shards, 110.8B tokens); 60B = 0.54 epoch at ctx 4096",
+  "results": {
+    "steps": 27743,
+    "tokens_seen": 59999453184,
+    "final_loss": 2.0888,
+    "final_loss_ema": 2.0779,
+    "loss_tail5": 2.0791,
+    "loss_ce_tail5": 2.0787,
+    "loss_z_final": 0.0004,
+    "median_tokens_per_s": 189606,
+    "mfu_median": 0.428,
+    "max_mem_gb": 30.4,
+    "cooldown": "loss_ce 2.2254 at the decay start (step 22,194) -> 2.0787, a cliff of 0.147 (the 340M runs' 15% decays delivered 0.159-0.164 from a much higher plateau)",
+    "verdict": "First 1.3B of the arsenal; loss_ce 2.0787 at 60B tokens. Not comparable to the 340M trio's 2.3820 / 2.3956 / 2.4153 — different model size, context (4096 vs 2048) and budget — so this entry is the coordinate's own anchor, not a paired result. The paired comparison that does exist is architectural continuity: HAX1's parallel-hybrid design scaled 4x with only the output gate added, at 1.29x the law's lr and 4.1x the batch, ran with zero instability events.",
+    "health": "zero instability events across 27,743 steps: post-warmup gnorm max 0.293 (median 0.110), clip 1.0 never fired, z-term 0.0004 final. KDA gates: beta_mean 0.70 -> 0.82, alpha_mean 0.76-0.77 flat, mem_len median (probe) 10.4 -> 7.6, state_rms_max peak 1.09 mid-run and 0.288 after the cooldown. pnorm/embedding 373 -> 755 at the plateau, 643 after the decay.",
+    "attention_note": "attn_logit_max rose 8 -> 58 (peak 62) and was investigated mid-run at the user's prompting (2026-09-11, probe jobs 30159120 / 30159879 / 30219077, tool infra/meter/examples/probe_attention_health.py). The whole signal is ONE head, layer 4: at the end its cos_max is 2.36 and its max|gamma| 3.16, against 0.76-0.95 and 1.68-2.33 for every other layer. What the softmax actually does barely moved over the whole second half: mean row entropy fell from 0.52 to 0.50 of the uniform ceiling (log 4096 = 8.32 nats) between steps 10,000 and 27,743, and the mean top1-top2 gap stayed at 0.57-0.82 nats where saturation needs ~15. A matched-length control (both models probed at seq 2048) put HAX2 at 36% of training at the same entropy fraction as the COMPLETED HAX1 (0.521 vs 0.526), with LOWER qk-norm gains in 7 of 8 layers and 2-3x LOWER sinks (max 0.131 vs 0.373 — the output gate doing what arXiv:2505.06708 claims). HAX1 has the same layer-4 spike, stronger (cos_max 1.521). Reference thresholds: loss degrades near logit 1e3 and diverges near 1e4 (arXiv:2309.14322); Gemma 2 caps at 50, Kimi K2 runs at ~30 and clips at 100. Conclusion: healthy, no action taken. The growth is outlier-CHANNEL growth in one layer's qk-norm gain (layer 4 gamma RMS 1.333 -> 1.465 while its max|gamma| 2.119 -> 3.164), which is the mechanism Qwen3-Next reported and fixed with zero-centred gains plus weight decay.",
+    "trunk_asset": "permanent full-state ckpts 05000/10000/15000/20000 are pre-cooldown (decay began at step 22,194) and 25000 is inside it — cooldown-branch trunk. DCP-gathered, resumes only on 12 ranks (the loader fingerprint includes world_size)."
+  },
+  "incidents": [
+    "Job 30099563 ended at step 7,100 with exit 137: the sbatch trap's SIGTERM to srun became a step cancel plus SIGKILL after KillWait, so no rank saw the stop and no walltime checkpoint was written; the chain resumed from the regular 30-minute recent.pt, losing 7 steps. Fixed in commit 12e27f6 — the trainer now reads SLURM_JOB_END_TIME and stops by rank consensus 1200 s before the end, ahead of any signal. Validated twice later in this same run (jobs 30099989 and 30152200 both logged 'walltime deadline reached', wrote recent.pt, exited 0 with State=COMPLETED, and the next link resumed at the identical step: zero steps lost, ~2 min handover).",
+    "Job 30099987 died at step ~11,800 with 'CUDA error: unknown error' in the NCCL watchdog — a GPU fault on ravg1015. Job 30099988 was allocated the same nodes seconds later and failed at startup with 'Failed to get device handle for GPU 0', burning 30 minutes; SLURM then drained ravg1015 itself (load-sensor:dmesg_gpu_crash,tainted). Total cost ~1 h of compute plus queue. Measured checkpoint overhead is 22 s per recent write against an 11.4 s step, so the 30-minute interval is within a factor of two of the Young/Daly optimum under any plausible MTBF and was left unchanged."
+  ],
+  "decision_note": "HAX2 is the 1.3B anchor. Carry into HAX3: (1) replace attn_logit_max in the slow metrics with per-layer entropy fraction and p99 gap, and add max|gamma| — an extreme-value max over all layers, heads and positions is a misleading early-warning signal, as this run showed; (2) qk-norm with NO learnable gain (Marin 535B, Llama 4 Scout, nanochat and flash-linear-attention all do this), which removes the only unbounded term in the logit at zero parameter cost — the alternative, weight decay on the gains, requires first converting RMSNorm to the (1+w) zero-init form, since our ones-init gain would be decayed toward 0 rather than toward identity; (3) hyper-connections / mHC remain deferred, to be paired at 340M before any 1.3B use. Still unmeasured for the whole series: exact recall (MQAR-style / RULER-lite), which is the axis on which hybrid vs linear was supposed to be decided.",
+  "archive": {
+    "primary": "selene:/data/vagus/runs/hax2-1.3B-fwe60B-ae617e8f/  (SHA256SUMS inside; 70 GB, pushed from raven 2026-09-13 13:49-14:44, sha256sum -c verified 27/27)",
+    "contents": "ckpt-{05000,10000,15000,20000,25000,27743}.pt (full training state), model-final.pt (slim weights+args, fp32, 5.5 GB), slim-step10000-bf16.pt (eval artifact), tb/, config.yaml, meta.json, slurm logs for all six chain links",
+    "transient": [
+      "raven:/u/yinxu/work/vagus/runs/hax2-1.3B-fwe60B-ae617e8f/ (home GPFS working copy, incl. recent*.pt; 182 GB as du reports it, GPFS counting the 2x replication)",
+      "mbp:assets/2-areas/vagus/runs/cmp/hax2/ (tb + config/meta only)"
+    ]
+  }
+}

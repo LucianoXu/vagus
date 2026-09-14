@@ -51,7 +51,12 @@ echo "Job $SLURM_JOB_ID on $SLURM_JOB_NODELIST | master $MASTER_ADDR:$MASTER_POR
 
 srun --kill-on-bad-exit=1 recipe/slurm/torchrun_node.sh "$CONFIG" "$@" &
 PID=$!
-trap "echo 'walltime soon: forwarding SIGTERM to training'; kill -TERM $PID" USR1
+# The trainer stops on its own clock (TrainConfig.deadline_margin_s, from
+# SLURM_JOB_END_TIME) 1200 s before the end, so this trap should never
+# matter. It is a fallback only, and it signals the step's TASKS through
+# slurmstepd: SIGTERM to srun itself turned into a step cancel + SIGKILL
+# after KillWait (job 30099563, no rank ever saw the stop).
+trap "echo 'walltime soon: SIGTERM to the step tasks (fallback)'; scancel --signal=TERM ${SLURM_JOB_ID}.0" USR1
 wait $PID
 status=$?
 # A trapped signal interrupts `wait` with 128+sig while training is still

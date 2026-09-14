@@ -1,0 +1,65 @@
+# LAX1 vs LAX3 at MATCHED training — the recall read that decides whether
+# d_k 128 -> 256 buys what it was designed to buy.
+#
+# Both subjects are the step-5000 permanent checkpoint of their 15B run:
+# 2.62B tokens each, same seed, same global batch, same data order (both
+# runs draw from the same 140-shard store and the loader hands optimizer
+# step s the same global window set). So this is a paired comparison at
+# equal optimisation, not a comparison of a finished model against a
+# half-trained one.
+#
+# Why it is worth running before the 15B runs finish: the whole LAX3
+# hypothesis is about CAPACITY, and capacity is a structural property of
+# the state that does not need a converged model to show up. LAX3's loss
+# lead over LAX1 at matched tokens is real but small and narrowing
+# (-0.047 nat at 0.2B -> -0.008 at 1.6B), and — this is the point — LM
+# loss is not the quantity the hypothesis predicts. The trio eval already
+# showed the two dissociate: HAX1 beat LAX1 by 0.25 on MQAR recall while
+# the loss gap was a hundredth of a nat.
+#
+# The prediction, sharp enough to be wrong: LAX1's token capacity is
+# d_k = 128 and LAX3's is 256, so the gap should OPEN as kv_pairs rises
+# toward 128 and be small at 32. If LAX3's advantage is flat in k, the
+# rank bound is not what limits this probe and the d_k ladder stops.
+#
+# Grid. The task requires L >= 8k, and at exactly L = 8k the noise body
+# is 100% overwritten by pairs (body//4 slots, all of them taken) — the
+# cell stops being "pairs hidden in text" and becomes a bare list. So the
+# grid keeps every cell at a workable density:
+#   L2048_p32  6.7%   L2048_p64  14%   L2048_p128  33%
+#   L4096_p32  3.3%   L4096_p64   7%   L4096_p128  14%
+# 2048 is the trained context; 4096 is the extrapolation cell both
+# subjects can run (pure KDA, no positional limit). k = 128 sits exactly
+# on LAX1's d_k, which is where the two should separate.
+#
+# holdout is here for the record, so the paired loss at 2.62B is in the
+# registry next to the recall numbers rather than only in TensorBoard.
+
+eval_name: lax13-step5000
+subjects:
+  - {ckpt: runs/lax1-340M-fwe15B-c9af2f44/ckpt-00005000.pt, label: LAX1, tokenizer_id: mistral32k}
+  - {ckpt: runs/lax3-340M-fwe15B-2ed076d7/ckpt-00005000.pt, label: LAX3, tokenizer_id: mistral32k}
+
+device: auto
+dtype: bfloat16
+seed: 0
+
+tasks:
+  - name: recall_probe
+    args:
+      data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+      lengths: [2048, 4096]
+      kv_pairs: [32, 64, 128]
+      n: 64
+      noise: text
+      batch_size: 2
+  - name: holdout
+    args:
+      data_dir: data/tokenized/fineweb-edu-100BT-mistral32k
+      n_seq: 128
+      context_len: [2048]
+      batch_size: 2
+      metrics: [nll]
+
+out_root: runs/eval
+registry_dir: registry/eval
