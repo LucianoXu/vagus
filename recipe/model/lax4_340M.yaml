@@ -1,3 +1,16 @@
+# PARKED 2026-09-14, never trained past a smoke. It builds, it is correct
+# and it trains — the obstacles below were all solved — but it runs at
+# 28.9k tok/s against LAX1's 150,832 (5.2x, 15B = 6 days) because no fla
+# kernel takes an asymmetric write, and the prior collapsed when the
+# write-selectivity read turned out to be transient: LAX2's gate WAS
+# surprise-selective at 2.6B (corr(w, rho) +0.070, write gain 1.048) and
+# the LM objective had erased it by 15B (-0.018, 0.994). LAX1's plain
+# sigmoid beta drifts the same way. A richer gain faces the same gradient
+# pressure, so this arm is worth running only under an objective that
+# rewards selectivity — consolidation/replay, or a recall-weighted loss.
+# Config to resume with: batch_size=4 grad_accum_steps=16 (22.95 GB, and
+# the same speed as micro 8, which sat at 39.45 of 39.49).
+#
 # LAX4-340M — LAX1 with the delta rule's write replaced by a DIAGONAL
 # Kalman gain (Kalman Delta Networks, arXiv:2609.07816). Architecture
 # otherwise byte-identical to lax1_340M, as LAX2 was.
