@@ -3,13 +3,12 @@
 # stateless forward, and the module must be causal. CPU, fp32/fp64.
 
 import itertools
-import math
 
 import pytest
 import torch
 
 from infra.components.linear_attention import (
-    GATES, GatedDeltaNet, HAS_FLA, chunk_scan, chunk_scan_vec, read_linearity, recurrent_scan)
+    GATES, GatedDeltaNet, HAS_FLA, chunk_scan, chunk_scan_vec, recurrent_scan)
 
 FLAGS = list(itertools.product(GATES, [True, False]))   # (gate, delta)
 
@@ -149,7 +148,7 @@ def test_gate_init_and_stats(gate):
     assert (a0 > 0.19).all() and (a0 < 1.0).all()         # exp(-16 * 0.1) < a0 < exp(-1 * 1e-3)
     assert m.dt_bias.shape == ((16,) if gate == 'vector' else (2,)) and m.A_log.shape == (2,)
     st = m.gate_stats(torch.randn(1, 30, 32, dtype=torch.float64))
-    assert set(st) == {'state_rms', 'alpha', 'mem_len', 'beta', 'read_lin'}
+    assert set(st) == {'state_rms', 'alpha', 'mem_len', 'beta'}
     assert st['alpha'].shape == ((16,) if gate == 'vector' else (2,)) and (st['mem_len'] > 1).all()
     assert len(m.gate_projections) == (3 if gate == 'vector' else 2)
 
@@ -157,7 +156,7 @@ def test_gate_init_and_stats(gate):
 def test_legacy_bool_gate_and_none():
     assert make(gate=True).gate == 'scalar' and make(gate=False).gate == 'none'
     m = make(gate='none', delta=False)
-    assert set(m.gate_stats(torch.randn(1, 5, 32, dtype=torch.float64))) == {'state_rms', 'read_lin'}
+    assert set(m.gate_stats(torch.randn(1, 5, 32, dtype=torch.float64))) == {'state_rms'}
     assert len(m.gate_projections) == 0
 
 
@@ -276,80 +275,3 @@ def test_bounded_gate_is_vector_only():
         GatedDeltaNet(64, 2, 16, 32, gate='scalar', gate_lower_bound=-5.0)
     with pytest.raises(AssertionError):
         GatedDeltaNet(64, 2, 16, 32, gate='vector', gate_lower_bound=-9.0)
-
-
-# --- LAX5: unit values and a floored readout ------------------------------
-
-def test_read_linearity_limits():
-    o = torch.randn(3, 5, 2, 16, dtype=torch.float64)
-    assert read_linearity(o, 1e-12).abs().max() < 1e-4          # far above the floor: invariant
-    assert (1 - read_linearity(1e-6 * o, 1.0)).abs().max() < 1e-4  # far below: linear
-    lin = read_linearity(o, float(o.pow(2).mean()))
-    assert ((lin > 0.05) & (lin < 0.95)).all()
-
-
-def test_read_floor_needs_unit_values():
-    with pytest.raises(AssertionError):
-        GatedDeltaNet(32, 2, 8, 16, read_floor=0.3)
-    with pytest.raises(AssertionError):
-        GatedDeltaNet(32, 2, 8, 16, v_norm=True, read_floor=0.0)
-    m = make(v_norm=True, read_floor=0.3)
-    assert torch.allclose(m.read_eps(), torch.full((2,), 0.3 / (8 * 16)))
-    assert isinstance(m.log_tau, torch.nn.Parameter)
-    fixed = make(v_norm=True, read_floor=0.3, read_floor_learn=False)
-    assert 'log_tau' not in dict(fixed.named_parameters()) and 'log_tau' in fixed.state_dict()
-    assert make().read_eps() == 1e-6 and not hasattr(make(), 'log_tau')   # LAX1..4 unchanged
-    with pytest.raises(AssertionError):
-        GatedDeltaNet(32, 2, 8, 16, v_norm=True, read_floor=0.3, fused='norm_gate')
-
-
-def test_v_norm_gives_unit_values_and_streams():
-    m = make(v_norm=True, read_floor=0.3)
-    x = torch.randn(2, 23, 32, dtype=torch.float64)
-    _, _, v = m._heads(m.wq(x), m.wk(x), m.wv(x))
-    assert torch.allclose(v.norm(dim=-1), torch.ones(2, 23, 2, dtype=torch.float64), atol=1e-3)
-    ref = m(x)
-    m.reset_cache(2, None)
-    out = torch.cat([m.decode_step(x[:, :9])] +
-                    [m.decode_step(x[:, t:t + 1]) for t in range(9, 23)], dim=1)
-    assert torch.allclose(out, ref, atol=1e-10, rtol=1e-10)
-
-
-def test_floored_readout_lets_a_scaled_memory_read_weaker():
-    '''The point of LAX5: scale a loaded memory by 0.5 and read one more
-    token. At the default eps the gated output barely moves in norm (the
-    RMSNorm gauge); with a floor it weakens.'''
-    x = torch.randn(4, 41, 32, dtype=torch.float64)
-
-    def gain(m):
-        m.reset_cache(4, None)
-        m.decode_step(x[:, :40])
-        snap = m.export_cache()
-        full = m.decode_step(x[:, 40:])
-        m.load_cache({**snap, 'state': 0.5 * snap['state']}, None)
-        half = m.decode_step(x[:, 40:])
-        return float(half.norm() / full.norm())
-
-    plain = gain(make(v_norm=True))
-    floored = gain(make(v_norm=True, read_floor=10.0))
-    assert plain > 0.95 and floored < plain - 0.15, (plain, floored)
-
-
-def test_read_floor_is_per_head_and_learns():
-    '''Per-head tau really acts per head (a head with a huge floor reads
-    linearly, its neighbour does not), and the loss reaches log_tau.'''
-    m = make(v_norm=True, read_floor=1e-3).train()
-    x = torch.randn(2, 30, 32, dtype=torch.float64)
-    m(x).pow(2).sum().backward()
-    assert m.log_tau.grad is not None and m.log_tau.grad.abs().sum() > 0
-    with torch.no_grad():
-        m.log_tau[1] = math.log(1e4)
-    st = m.eval().gate_stats(x)
-    assert torch.allclose(st['tau'], torch.tensor([1e-3, 1e4], dtype=torch.float32), rtol=1e-5)
-    o = torch.randn(1, 5, 2, 16, dtype=torch.float64) * (8 * 16) ** -0.5
-    lin = read_linearity(o, m.read_eps())
-    assert (lin[..., 0] < 0.05).all() and (lin[..., 1] > 0.95).all()
-    # fixed floor matches the learnable one at init, bit for bit
-    a = make(v_norm=True, read_floor=0.3)
-    b = make(v_norm=True, read_floor=0.3, read_floor_learn=False)
-    assert torch.equal(a(x), b(x))

@@ -91,7 +91,7 @@ def test_metric_hook_and_flops():
     ctx = MetricCtx(model=m, last_batch=torch.randint(2, 101, (2, 30)))
     out = m.metric_hooks()['slow'][0](ctx)
     GATES = {'gdn/state_rms_max', 'gdn/alpha_mean', 'gdn/mem_len_median',
-             'gdn/mem_len_max', 'gdn/beta_mean', 'gdn/read_lin_mean'}
+             'gdn/mem_len_max', 'gdn/beta_mean'}
     assert set(out) == GATES | {'attn_logit_max'}
     assert 0 < out['gdn/alpha_mean'] < 1 and out['gdn/mem_len_max'] >= out['gdn/mem_len_median'] > 1
     assert m.metric_hooks()['slow'][0](MetricCtx(model=m)) == {}
@@ -100,7 +100,7 @@ def test_metric_hook_and_flops():
     assert m.attn_flops_per_token(2048) == 2 * 2 * per_head + 12 * 64 * 2048
     m0 = build(gate='none', delta=False)          # no WY solve: 4 dk dv + 2C (dk + dv)
     assert m0.attn_flops_per_token(2048) == 3 * 2 * 3 * (4 * 16 * 32 + 2 * 8 * (16 + 32))   # 3 layers x 2 heads
-    assert set(build(gate='none', delta=False).metric_hooks()['slow'][0](ctx)) == {'gdn/state_rms_max', 'gdn/read_lin_mean'}
+    assert set(build(gate='none', delta=False).metric_hooks()['slow'][0](ctx)) == {'gdn/state_rms_max'}
     assert set(build(gate='scalar').metric_hooks()['slow'][0](ctx)) == GATES
     assert set(build().metric_hooks()['slow'][0](ctx)) == GATES          # pure: no softmax probe
 
@@ -109,25 +109,6 @@ def test_config_roundtrip():
     m = build(layer_pattern='gdn,softmax', gate='scalar')
     m2 = type(m).from_config(m.config)
     assert m2.kinds == m.kinds and [p.shape for p in m2.parameters()] == [p.shape for p in m.parameters()]
-
-
-def test_read_floor_reaches_the_mixer():
-    '''LAX5's two knobs go through the config, and the slow probe reports
-    the readout's linearity: ~0 at the default eps, clearly above 0
-    with a floor. (An untrained model's reads are tiny, so even the
-    default eps is partly active at init — hence relative, not ~0.)'''
-    m = build(v_norm=True, read_floor=1.0)
-    m2 = type(m).from_config(m.config)
-    for blk in m2.blocks:
-        assert blk.att.v_norm and torch.allclose(blk.att.read_eps(), torch.full((2,), 1.0 / (16 * 32)))
-    assert all(id(blk.att.log_tau) in {id(p) for p in m.param_groups()['adamw_no_decay']}
-               for blk in m.blocks)
-    ctx = MetricCtx(model=m, last_batch=torch.randint(2, 101, (2, 30)))
-    probe = m.metric_hooks()['slow'][0](ctx)
-    assert probe['gdn/tau_min'] == pytest.approx(1.0) == probe['gdn/tau_max']
-    floored = probe['gdn/read_lin_mean']
-    plain = build().metric_hooks()['slow'][0](ctx)['gdn/read_lin_mean']
-    assert plain + 0.3 < floored < 1.0, (plain, floored)
 
 
 def test_mixer_protocol():
