@@ -119,9 +119,13 @@ def test_read_floor_reaches_the_mixer():
     m = build(v_norm=True, read_floor=1.0)
     m2 = type(m).from_config(m.config)
     for blk in m2.blocks:
-        assert blk.att.v_norm and blk.att.o_norm.eps == 1.0 / (16 * 32)
+        assert blk.att.v_norm and torch.allclose(blk.att.read_eps(), torch.full((2,), 1.0 / (16 * 32)))
+    assert all(id(blk.att.log_tau) in {id(p) for p in m.param_groups()['adamw_no_decay']}
+               for blk in m.blocks)
     ctx = MetricCtx(model=m, last_batch=torch.randint(2, 101, (2, 30)))
-    floored = m.metric_hooks()['slow'][0](ctx)['gdn/read_lin_mean']
+    probe = m.metric_hooks()['slow'][0](ctx)
+    assert probe['gdn/tau_min'] == pytest.approx(1.0) == probe['gdn/tau_max']
+    floored = probe['gdn/read_lin_mean']
     plain = build().metric_hooks()['slow'][0](ctx)['gdn/read_lin_mean']
     assert plain + 0.3 < floored < 1.0, (plain, floored)
 

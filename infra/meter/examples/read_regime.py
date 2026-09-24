@@ -61,7 +61,8 @@ def reads(model, tokens: torch.Tensor, warmup: int):
         dv = v.shape[-1]
         e_full = (att.scale ** 2 * v.pow(2).sum(-1) / dv)[:, warmup:]    # (B, L', H)
         unit = e_full.mean(dim=(0, 1))                                   # per head
-        eps = att.o_norm.eps
+        eps = att.read_eps()
+        eps = eps.to(unit) if torch.is_tensor(eps) else eps
         out.append(dict(
             e=(m / unit).reshape(-1, m.shape[-1]).cpu().numpy(),
             lin=read_linearity(o[:, warmup:], eps).reshape(-1, m.shape[-1]).cpu().numpy(),

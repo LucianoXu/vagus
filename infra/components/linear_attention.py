@@ -502,15 +502,18 @@ def fla_scan(q, k, v, g, beta, S0, *, scale: float, delta: bool, chunk_size: int
 # The mixer
 # ---------------------------------------------------------------------------
 
-def read_linearity(o, eps: float, c: float = 0.5) -> torch.Tensor:
+def read_linearity(o, eps: 'float | torch.Tensor', c: float = 0.5) -> torch.Tensor:
     '''(..., H) how much a readout RMSNorm(o) with this eps still passes a
     change of read magnitude: scale the read o (..., H, dv) by c and
     compare the normalised output's norm,
         gain = c sqrt((m + eps) / (c^2 m + eps)),   m = mean(o^2),
+    eps a scalar or one per head (H,),
     mapped to 0 (scale-invariant: the output does not weaken at all) ..
     1 (linear: it weakens by exactly c). A memory can only fade
     gracefully through a readout whose linearity is well above 0.'''
     m = o.to(torch.promote_types(o.dtype, torch.float32)).pow(2).mean(-1)
+    if torch.is_tensor(eps):
+        eps = eps.to(m)
     gain = c * torch.sqrt((m + eps) / (c * c * m + eps))
     return (1.0 - gain) / (1.0 - c)
 
@@ -579,13 +582,24 @@ class GatedDeltaNet(nn.Module, Mixer):
     values and beta <= 1 the read q^T S is bounded by construction, so
     its magnitude is a fixed-scale quantity the model cannot inflate.
     read_floor: tau, the RMSNorm eps of the head readout in units of a
-    full-strength unit-value read (needs v_norm). The readout becomes
-        o = r / sqrt(mean(r^2) + tau / (dk dv))
+    full-strength unit-value read (needs v_norm), one per head. The
+    readout becomes
+        o = r / sqrt(mean(r^2) + tau_h / (dk dv))
     normalising reads well above the floor as before and passing reads
     well below it through linearly — so a weaker memory reads as a
     weaker signal instead of as another confident direction. With the
     default eps (1e-6) the readout is scale-invariant at every read
     magnitude a trained model produces; see read_linearity.
+    read_floor_learn (default): tau_h = exp(log_tau_h), learned per head
+    from read_floor as its init (1-D, so AdamW without decay), and the
+    value each head settles at is itself the reading — whether that head
+    wants a weak read to read weak. False keeps tau fixed at read_floor.
+    A floor takes the torch norm path (fla's fused norm-gate takes one
+    scalar eps), so it excludes the 'norm_gate' fusion.
+    (Measured 2026-09-24, read_regime: LAX1's own eps 1e-6 is not inert —
+    its median read sits near the knee, mean linearity 0.39 — so the
+    'scale-invariant at every trained read' claim above holds only for
+    some layers.)
 
     out_proj=False drops wo: forward returns the gated, normalised head
     concat of width out_width = H dv, for a caller that owns the output
@@ -610,6 +624,7 @@ class GatedDeltaNet(nn.Module, Mixer):
             gate_lower_bound: float | None = None,
             v_norm: bool = False,
             read_floor: float | None = None,
+            read_floor_learn: bool = True,
             *,
             init_std: float = 0.02,
             layer_count: int | None = None,
@@ -647,6 +662,7 @@ class GatedDeltaNet(nn.Module, Mixer):
         self.gate_lower_bound = gate_lower_bound
         self.v_norm = v_norm
         self.read_floor = read_floor
+        self.read_floor_learn = read_floor_learn
         self.scale = key_head_dim ** -0.5
         self.out_proj = out_proj
         self.out_width = head_count * value_head_dim
@@ -664,6 +680,14 @@ class GatedDeltaNet(nn.Module, Mixer):
         # strength, mean((scale v)^2) = 1 / (dk dv) for |v| = 1.
         eps = 1e-6 if read_floor is None else read_floor / (dk * dv)
         self.o_norm = RMSNorm(dv, eps)
+        if read_floor is not None:
+            assert 'norm_gate' not in self.fusions, \
+                'the fused norm-gate kernel takes one scalar eps; a read floor is per head'
+            log_tau = torch.full((H,), math.log(read_floor))
+            if read_floor_learn:
+                self.log_tau = nn.Parameter(log_tau)
+            else:
+                self.register_buffer('log_tau', log_tau)
 
         if short_conv_size is not None:
             # the 'conv' fusion is the fla kernel; conv_impl chooses among
@@ -849,10 +873,21 @@ class GatedDeltaNet(nn.Module, Mixer):
         return chunk_scan(q, k, v, g, beta, S0, scale=self.scale, delta=self.delta,
                           chunk_size=self.chunk_size)
 
+    def read_eps(self) -> 'float | torch.Tensor':
+        '''The readout RMSNorm's eps: the scalar guard, or with a read floor
+        one per head, tau_h / (dk dv).'''
+        if self.read_floor is None:
+            return self.o_norm.eps
+        return self.log_tau.float().exp() / (self.key_head_dim * self.value_head_dim)
+
     def _output(self, o, x):
         B, L = x.shape[0], x.shape[1]
         gate = self.wg(x).view(B, L, self.head_count, self.value_head_dim)
-        if 'norm_gate' in self.fusions and HAS_FLA_NORM_GATE and o.is_cuda and \
+        if self.read_floor is not None:
+            h = o.float()
+            h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + self.read_eps()[:, None])
+            o = (h.to(gate.dtype) * self.o_norm.gamma * F.silu(gate)).reshape(B, L, -1)
+        elif 'norm_gate' in self.fusions and HAS_FLA_NORM_GATE and o.is_cuda and \
                 o.dtype in (torch.bfloat16, torch.float16):
             # one kernel for RMSNorm(o) * SiLU(gate) over the head dim
             assert rms_norm_gated is not None
@@ -907,7 +942,9 @@ class GatedDeltaNet(nn.Module, Mixer):
             o, S = recurrent_scan(q, k, v, g, beta, None, scale=self.scale,
                                   delta=self.delta, w=w)
         out = {'state_rms': S.pow(2).mean().sqrt(),
-               'read_lin': read_linearity(o, self.o_norm.eps).mean()}
+               'read_lin': read_linearity(o, self.read_eps()).mean()}
+        if self.read_floor is not None:
+            out['tau'] = self.log_tau.detach().float().exp()
         if g is not None:
             a = g.exp().mean(dim=(0, 1)).flatten()            # per head, or per (head, channel)
             out['alpha'] = a

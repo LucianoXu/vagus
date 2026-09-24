@@ -3,6 +3,7 @@
 # stateless forward, and the module must be causal. CPU, fp32/fp64.
 
 import itertools
+import math
 
 import pytest
 import torch
@@ -293,8 +294,13 @@ def test_read_floor_needs_unit_values():
     with pytest.raises(AssertionError):
         GatedDeltaNet(32, 2, 8, 16, v_norm=True, read_floor=0.0)
     m = make(v_norm=True, read_floor=0.3)
-    assert m.o_norm.eps == pytest.approx(0.3 / (8 * 16))
-    assert make().o_norm.eps == 1e-6                              # LAX1..4 unchanged
+    assert torch.allclose(m.read_eps(), torch.full((2,), 0.3 / (8 * 16)))
+    assert isinstance(m.log_tau, torch.nn.Parameter)
+    fixed = make(v_norm=True, read_floor=0.3, read_floor_learn=False)
+    assert 'log_tau' not in dict(fixed.named_parameters()) and 'log_tau' in fixed.state_dict()
+    assert make().read_eps() == 1e-6 and not hasattr(make(), 'log_tau')   # LAX1..4 unchanged
+    with pytest.raises(AssertionError):
+        GatedDeltaNet(32, 2, 8, 16, v_norm=True, read_floor=0.3, fused='norm_gate')
 
 
 def test_v_norm_gives_unit_values_and_streams():
@@ -327,3 +333,23 @@ def test_floored_readout_lets_a_scaled_memory_read_weaker():
     plain = gain(make(v_norm=True))
     floored = gain(make(v_norm=True, read_floor=10.0))
     assert plain > 0.95 and floored < plain - 0.15, (plain, floored)
+
+
+def test_read_floor_is_per_head_and_learns():
+    '''Per-head tau really acts per head (a head with a huge floor reads
+    linearly, its neighbour does not), and the loss reaches log_tau.'''
+    m = make(v_norm=True, read_floor=1e-3).train()
+    x = torch.randn(2, 30, 32, dtype=torch.float64)
+    m(x).pow(2).sum().backward()
+    assert m.log_tau.grad is not None and m.log_tau.grad.abs().sum() > 0
+    with torch.no_grad():
+        m.log_tau[1] = math.log(1e4)
+    st = m.eval().gate_stats(x)
+    assert torch.allclose(st['tau'], torch.tensor([1e-3, 1e4], dtype=torch.float32), rtol=1e-5)
+    o = torch.randn(1, 5, 2, 16, dtype=torch.float64) * (8 * 16) ** -0.5
+    lin = read_linearity(o, m.read_eps())
+    assert (lin[..., 0] < 0.05).all() and (lin[..., 1] > 0.95).all()
+    # fixed floor matches the learnable one at init, bit for bit
+    a = make(v_norm=True, read_floor=0.3)
+    b = make(v_norm=True, read_floor=0.3, read_floor_learn=False)
+    assert torch.equal(a(x), b(x))
