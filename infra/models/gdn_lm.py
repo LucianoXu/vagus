@@ -67,6 +67,8 @@ class GDNLM(nn.Module, Decodable):
             la_conv_impl: str = 'conv1d',
             la_disable_recompute: bool = False,
             gate_lower_bound: float | None = None,
+            v_norm: bool = False,
+            read_floor: float | None = None,
             write: str = 'delta',
             kalman_args: dict | None = None,
             A_init_range: tuple[float, float] = (1.0, 16.0),
@@ -94,6 +96,7 @@ class GDNLM(nn.Module, Decodable):
             la_fused=la_fused, la_conv_impl=la_conv_impl,
             la_disable_recompute=la_disable_recompute,
             gate_lower_bound=gate_lower_bound,
+            v_norm=v_norm, read_floor=read_floor,
             write=write, kalman_args=kalman_args,
             A_init_range=tuple(A_init_range), dt_init_range=tuple(dt_init_range),
             layer_pattern=layer_pattern, layer_kinds=layer_kinds,
@@ -144,6 +147,7 @@ class GDNLM(nn.Module, Decodable):
                 fused=la_fused, conv_impl=la_conv_impl,
                 disable_recompute=la_disable_recompute,
                 gate_lower_bound=gate_lower_bound,
+                v_norm=v_norm, read_floor=read_floor,
                 A_init_range=tuple(A_init_range), dt_init_range=tuple(dt_init_range),
                 init_std=0.02, layer_count=layer_count, out_proj=out_proj)
 
@@ -309,13 +313,14 @@ class GDNLM(nn.Module, Decodable):
         Gates, over every linear mixer (pure layers and parallel
         branches): mean decay a, the median / max effective memory length
         1/(1 - a) over heads (over channels for a vector gate), mean write
-        strength b, and the worst end-of-sequence state RMS. Softmax: the
+        strength b, the worst end-of-sequence state RMS, and the mean read
+        linearity of the head readout (0 = scale-invariant). Softmax: the
         global max pre-softmax logit (the quantity qk-norm / z-loss bound).'''
         tokens = ctx.last_batch
         if tokens is None:
             return {}
         x = self.embedding(tokens[:1])
-        alpha, mem, beta, srms = [], [], [], []
+        alpha, mem, beta, srms, rlin = [], [], [], [], []
         worst = None
         for blk in self.blocks:
             assert isinstance(blk, Block)
@@ -324,6 +329,7 @@ class GDNLM(nn.Module, Decodable):
             if la is not None:
                 st = la.gate_stats(h)
                 srms.append(float(st['state_rms']))
+                rlin.append(float(st['read_lin']))
                 if 'alpha' in st:
                     alpha.append(st['alpha']); mem.append(st['mem_len'])
                 if 'beta' in st:
@@ -337,6 +343,7 @@ class GDNLM(nn.Module, Decodable):
         out = {}
         if srms:
             out['gdn/state_rms_max'] = max(srms)
+            out['gdn/read_lin_mean'] = sum(rlin) / len(rlin)
         if alpha:
             a = torch.cat(alpha).float(); m = torch.cat(mem).float()
             out.update({'gdn/alpha_mean': float(a.mean()),
